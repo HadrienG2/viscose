@@ -1,4 +1,7 @@
+mod flags;
+
 use crossbeam::deque::{Injector, Steal, Stealer, Worker};
+use flags::AtomicFlags;
 use hwlocality::{
     cpu::{binding::CpuBindingFlags, cpuset::CpuSet},
     topology::Topology,
@@ -37,10 +40,12 @@ impl FlatPool {
             .iter_set()
             .zip(work_queues.into_iter())
             .enumerate()
-            .map(|(idx, (cpu, work_queue))| {
+            .map(|(my_idx, (cpu, work_queue))| {
                 let topology = topology.clone();
                 let shared = shared.clone();
                 std::thread::spawn(move || {
+                    // TODO: Modularize this big function into an OO struct
+
                     // Bind the worker to its assigned CPU
                     topology
                         .bind_cpu(
@@ -55,6 +60,8 @@ impl FlatPool {
                     // Process a task, irrespective of where we got it from
                     let process_task = |task: Task| {
                         // TODO: Do the work
+                        // TODO: Handle panics within the task + completion
+                        //       notifications
                         // TODO: If we spawn tasks here, do a Release fence, set
                         //       flag to notify others that we have work to
                         //       steal, then look for the closest neighboring
@@ -91,22 +98,20 @@ impl FlatPool {
                     };
 
                     // Access our personal shard of the shared state
-                    let my = &shared.workers[idx];
+                    let my = &shared.workers[my_idx];
 
                     // Last-resort work stealing strategy: try to steal
                     // everywhere at increasing distances from this worker,
                     // using CPU ID distance as a rough distance metric
-                    // TODO: Improve by tracking which workers have work to
-                    //       steal
                     let num_workers = shared.workers.len();
                     let try_steal_anywhere = |update_futex_from_nowhere: bool| {
                         // If we find a place to steal from, update our futex so
                         // we check there immediately next time.
                         let update_futex = |new_value: u32| {
                             if update_futex_from_nowhere {
-                                my.futex.compare_exchange_weak(
+                                my.futex.compare_exchange(
                                     WORK_NOWHERE,
-                                    idx,
+                                    new_value,
                                     Ordering::Relaxed,
                                     Ordering::Relaxed,
                                 )
@@ -114,15 +119,12 @@ impl FlatPool {
                         };
 
                         // Check other workers at increasing distances
-                        for distance in 1..=idx.max(num_workers - 1 - idx) {
-                            let prev_idx = idx.saturating_sub(distance);
-                            if distance <= idx && try_steal_worker(prev_idx) {
-                                update_futex(prev_idx);
-                                return true;
-                            }
-                            let next_idx = distance + idx;
-                            if next_idx < num_workers && try_steal_worker(next_idx) {
-                                update_futex(next_idx);
+                        for idx in shared
+                            .steal_flags
+                            .iter_set_around(my_idx, Ordering::Acquire)
+                        {
+                            if try_steal_worker(idx) {
+                                update_futex(idx);
                                 return true;
                             }
                         }
@@ -141,6 +143,7 @@ impl FlatPool {
                         while let Some(task) = work_queue.pop() {
                             process_task(task);
                         }
+                        shared.steal_flags.fetch_clear(my_idx, Ordering::Relaxed);
 
                         // We ran out of private work, check our futex to know
                         // where we should try to steal from next
@@ -169,14 +172,14 @@ impl FlatPool {
                                 // Try to steal from the recommended location
                                 let succeeded = match work_available {
                                     WORK_FROM_INJECTOR => try_steal_injector(),
-                                    worker_idx => try_steal_worker(worker_idx),
+                                    idx => try_steal_worker(idx),
                                 };
 
                                 // Once stealing starts to fail, the
                                 // recommandation has become outdated, so it's
                                 // time to remove it
                                 if !succeeded {
-                                    my.futex.compare_exchange_weak(
+                                    my.futex.compare_exchange(
                                         work_available,
                                         WORK_NOWHERE,
                                         Ordering::Relaxed,
@@ -193,6 +196,14 @@ impl FlatPool {
     }
 
     // TODO: Add scope() method and associated struct, steal from std::thread
+    // TODO: Make scope.join() wake up the sleeping thread closest to the
+    //       current thread, if any, with an appropriate futex recommendation.
+    //       Worker threads can remember which CPU they're pinned to and tell
+    //       the scope constructor, but to also handle threads external to the
+    //       thread pool we leave an Option at None and we query the current CPU
+    //       location with hwloc right before taking this decision.
+    // TODO: Catch worker thread panics and propagate them to the main thread
+    //       upon attempts to create tasks.
 }
 //
 impl Drop for FlatPool {
@@ -213,15 +224,20 @@ struct SharedState {
 
     /// Worker interfaces
     workers: Box<[WorkerInterface]>,
-    // TODO: AtomicUsize bitflags with one flag per worker to track which
-    //       workers could have work in their work queue:
-    //       - After pushing work, a worker sets the flag with Ordering::Release
-    //       - When a worker fails to pop work, it clears the flag with
-    //         Ordering::Relaxed
-    //       - Other workers query the flag with Ordering::Relaxed to assess
-    //         whether it's worth trying to steal from this particular worker,
-    //         if so they add an Ordering::Acquire fence to increase odds of
-    //         successful stealiing.
+
+    /// Per-worker truth that each worker _might_ have work ready to be stolen
+    /// inside of its work queue
+    ///
+    /// Set by the associated worker when pushing work, cleared by the worker
+    /// when it tries to pop work and the queue is empty. In an ideal world,
+    /// other workers could update it quicker by clearing it when they fail to
+    /// steal work, but this would race with the setting of the flag, and it's
+    /// better to have the flag set when it shouldn't be than to have it cleared
+    /// when it should be set.
+    ///
+    /// The flag is set with Release ordering, so if the readout of a set flag
+    /// is performed with Acquire ordering, the pushed work is observable.
+    steal_flags: AtomicFlags,
 }
 //
 impl SharedState {
@@ -242,6 +258,7 @@ impl SharedState {
         let result = Arc::new(Self {
             injector,
             workers: workers.into(),
+            steal_flags: AtomicFlags::new(num_workers),
         });
         (result, work_queues.into())
     }
@@ -317,7 +334,7 @@ mod tests {
     }
 
     /// Recursive parallel fibonacci based on FlatPool
-    fn fibonacci_flat(scope: FlatScope<'_, '_>, n: u64) -> u64 {
+    fn fibonacci_flat(scope: &Scope<'_, '_>, n: u64) -> u64 {
         if n > 1 {
             scope.join(
                 |scope| fibonacci_flat(scope, n - 1),
