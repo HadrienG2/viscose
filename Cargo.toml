@@ -1,0 +1,22 @@
+[package]
+name = "sched-local"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+atomic-wait = { version = "1.1.0", default-features = false }
+crossbeam = { version = "0.8.2", features = ["crossbeam-channel", "crossbeam-deque", "crossbeam-epoch", "crossbeam-queue"] }
+hwlocality = { version = "1.0.0", path = "../hwlocality" }
+
+[dev-dependencies]
+criterion = { version = "0.5.1", default-features = false }
+rayon = { version = "1.8.0", default-features = false }
+
+[lib]
+bench = false
+
+[[bench]]
+name = "benchmark"
+harness = false
