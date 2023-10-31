@@ -99,27 +99,32 @@ impl FlatPool {
             }
         }
 
-        // Schedule work execution
-        let me = std::thread::current();
-        let result = Mutex::new(None);
-        // SAFETY: This is fine because we wait for work completion below
-        unsafe {
-            let result = &result;
-            self.spawn_unchecked(move |scope| {
-                // Run the callable, use mutex poisoning to notify the caller
-                // about any panic during task execution
-                let _ = std::panic::catch_unwind(|| {
-                    let mut lock = result.lock().unwrap();
-                    *lock = Some(body(scope));
+        // From the point where the task is scheduled, until the point where it
+        // has signaled end of execution, panics should translate into aborts
+        let result = abort_on_panic(|| {
+            // Schedule work execution
+            let me = std::thread::current();
+            let result = Mutex::new(None);
+            // SAFETY: This is fine because we wait for work completion below
+            unsafe {
+                let result = &result;
+                self.spawn_unchecked(move |scope| {
+                    // Run the callable, use mutex poisoning to notify the caller
+                    // about any panic during task execution
+                    let _ = std::panic::catch_unwind(|| {
+                        let mut lock = result.lock().unwrap();
+                        *lock = Some(body(scope));
+                    });
+
+                    // Notify the caller that the task has been processed
+                    me.unpark();
                 });
+            }
 
-                // Notify the caller that the task has been processed
-                me.unpark();
-            });
-        }
-
-        // Wait for work completion and collect result
-        std::thread::park();
+            // Wait for work completion and collect result
+            std::thread::park();
+            result
+        });
         let result = result.lock().unwrap().take().unwrap();
         result
     }
@@ -133,9 +138,11 @@ impl FlatPool {
     ///
     /// The input callable is allowed to borrow variables from the surrounding
     /// scope, and it is the caller's responsibility to ensure that said scope
-    /// is not exited before the caller is done executing.
+    /// is not exited before the caller is done executing. This notably entails
+    /// that the caller is not allowed do panic, but should abort on panics.
     ///
     /// This function is guaranteed not to panic after scheduling the callable.
+    /// More precisely, panics will be transleted to aborts.
     unsafe fn spawn_unchecked(
         &self,
         f: impl for<'remote> FnOnce(&Scope<'remote>) + Send + UnwindSafe,
@@ -162,16 +169,8 @@ impl FlatPool {
         self.shared.injector.push(f);
 
         // Find the nearest available thread and recommend it to process this
-        // FIXME: Wake up the idle worker closest to the CPU which the
-        //        scheduling thread currently resides on, if any. Should
-        //        share code with Scope::join here...
-        // TODO: Make scope() wake up the sleeping thread closest to the current
-        //       thread, if any, with an appropriate futex recommendation. Worker
-        //       threads can remember which CPU they're pinned to and tell the scope
-        //       constructor, but to also handle threads external to the thread pool
-        //       we leave an Option at None and we query the current CPU location
-        //       with hwloc right before taking this decision.
-        self.recommend_schedule(best_worker_idx);
+        self.shared
+            .recommend_steal(best_worker_idx, WORK_FROM_INJECTOR);
     }
 }
 //
@@ -191,7 +190,7 @@ impl Drop for FlatPool {
 
         // Join all the worker thread
         for worker in self.workers.drain(..) {
-            worker.join();
+            worker.join().unwrap();
         }
     }
 }
@@ -241,6 +240,84 @@ impl SharedState {
             steal_flags: AtomicFlags::new(num_workers),
         });
         (result, work_queues.into())
+    }
+
+    /// Recommend that the work-less thread closest to a certain originating
+    /// locality steal a task from the specified location
+    ///
+    /// # Panics
+    ///
+    /// `task_location` must not be `WORK_OVER` nor `WORK_NOWHERE`, since these
+    /// are not actual task locations. The code will panic upon encountering.
+    /// these location values.
+    fn recommend_steal(&self, closest_worker: usize, task_location: u32) {
+        // Iterate over increasingly remote job-less neighbors
+        'search: for closest_asleep in self
+            .steal_flags
+            .iter_unset_around(closest_worker, Ordering::Relaxed)
+        {
+            // Update their futex recommendation as appropriate
+            let closest_futex = &self.workers[closest_asleep].futex;
+            let closest_asleep_u32 = closest_asleep as u32;
+            let mut futex_value = closest_futex.load(Ordering::Relaxed);
+            'compare_exchange: loop {
+                // Once it is determined that the current stealing
+                // recommendation is worse than stealing from us, call this
+                // macro to update the recommendation.
+                macro_rules! try_recommend {
+                    () => {
+                        match closest_futex.compare_exchange_weak(
+                            futex_value,
+                            task_location,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => {
+                                // Recommendation updated, wake up the thread if
+                                // needed and go away
+                                if futex_value == WORK_NOWHERE {
+                                    atomic_wait::wake_all(closest_futex);
+                                }
+                                break 'search;
+                            }
+                            Err(new_futex_value) => {
+                                futex_value = new_futex_value;
+                                continue 'compare_exchange;
+                            }
+                        }
+                    };
+                }
+
+                // Analyze current value of the neighbor's futex
+                match (futex_value, task_location) {
+                    // Never override the thread pool's stop signal
+                    (WORK_OVER, _) => break 'search,
+
+                    // Only actual task locations are accepted
+                    (_, WORK_OVER | WORK_NOWHERE) => unreachable!(),
+
+                    // If the neighbor currently has nothing to do, any location
+                    // is accepted. But any other worker is considered more
+                    // local than the injector.
+                    (WORK_NOWHERE, _) => try_recommend!(),
+                    (_, WORK_FROM_INJECTOR) => continue 'search,
+                    (WORK_FROM_INJECTOR, _) => try_recommend!(),
+
+                    // At this point, it is clear that both recommendation point
+                    // to actual worker indices. Accept new recommendation if it
+                    // is closer than the previous recommendation...
+                    (old_idx, new_idx)
+                        if (closest_asleep_u32.abs_diff(old_idx)
+                            > closest_asleep_u32.abs_diff(new_idx)) =>
+                    {
+                        try_recommend!()
+                    }
+
+                    // ...otherwise, leave the existing recommendation alone
+                    _ => continue 'search,
+                }
+            }
+        }
     }
 }
 
@@ -326,7 +403,6 @@ impl<'pool> Worker<'pool> {
             work_queue,
             work_incoming: Cell::new(true),
         };
-        // FIXME: Notify the pool if main() panics
         worker.main();
     }
 
@@ -357,7 +433,8 @@ impl<'pool> Worker<'pool> {
     fn process_task(&self, task: Task) {
         let scope = Scope::new(self);
         if std::panic::catch_unwind(|| task(&scope)).is_err() {
-            // FIXME: Handle panics in user-provided task
+            // FIXME: Handle panics in user-provided task without bringing down
+            //        the entire thread pool, if possible
             unimplemented!()
         }
     }
@@ -488,44 +565,49 @@ impl<'scope> Scope<'scope> {
         RemoteFn: for<'remote> FnOnce(&Scope<'remote>) -> RemoteResult + Send + UnwindSafe,
         RemoteResult: Send,
     {
-        // Spawn remote task
-        // SAFETY: This is safe because we will wait for remote work to complete
-        //         before exiting the scope of borrowed variables.
-        let remote_finished = AtomicBool::new(false);
-        let remote_result = Mutex::new(None);
-        unsafe {
-            let futex = self.0.futex;
-            let remote_finished = &remote_finished;
-            let remote_result = &remote_result;
-            self.spawn_unchecked(move |scope| {
-                // Run the callable, use mutex poisoning to notify the caller
-                // about any panic during task execution
-                let _ = std::panic::catch_unwind(|| {
-                    let mut result_lock = remote_result.lock().unwrap();
-                    *result_lock = Some(remote(scope));
-                });
+        // No unwinding panics allowed until the remote task has completed
+        let (local_result, remote_result) = abort_on_panic(|| {
+            // Spawn remote task
+            // SAFETY: This is safe because we will wait for remote work to
+            //         complete before exiting the scope of borrowed variables,
+            //         and panics are translated to aborts until the remote task
+            //         is done executing.
+            let remote_finished = AtomicBool::new(false);
+            let remote_result = Mutex::new(None);
+            unsafe {
+                let futex = self.0.futex;
+                let remote_finished = &remote_finished;
+                let remote_result = &remote_result;
+                self.spawn_unchecked(move |scope| {
+                    // Run the callable, use mutex poisoning to notify the
+                    // caller about any panic during task execution
+                    let _ = std::panic::catch_unwind(|| {
+                        let mut result_lock = remote_result.lock().unwrap();
+                        *result_lock = Some(remote(scope));
+                    });
 
-                // Notify the worker thread that the task has been processed
-                remote_finished.store(true, Ordering::Release);
-                // TODO: See if I can find a way to avoid calling wake when the
-                //       thread is awake without causing a race condition when
-                //       it's concurrently falling asleep.
-                atomic_wait::wake_all(futex);
-            })
-        };
+                    // Notify the worker thread that the task has been processed
+                    remote_finished.store(true, Ordering::Release);
+                    // TODO: See if I can find a way to avoid calling wake when
+                    //       the thread is awake without causing a race
+                    //       condition when it's concurrently falling asleep.
+                    atomic_wait::wake_all(futex);
+                })
+            };
 
-        // Run local task
-        let local_result = std::panic::catch_unwind(local);
+            // Run local task
+            let local_result = std::panic::catch_unwind(local);
 
-        // Execute thread pool work while waiting for remote work to complete
-        // FIXME: Handle panics here
-        while !remote_finished.load(Ordering::Relaxed) {
-            self.0.step();
-        }
-        atomic::fence(Ordering::Acquire);
-        let remote_result = remote_result.lock().unwrap().take().unwrap();
+            // Execute thread pool work while waiting for remote task
+            while !remote_finished.load(Ordering::Relaxed) {
+                self.0.step();
+            }
+            atomic::fence(Ordering::Acquire);
+            (local_result, remote_result)
+        });
 
         // Collect and return results
+        let remote_result = remote_result.lock().unwrap().take().unwrap();
         (local_result.unwrap(), remote_result)
     }
 
@@ -545,7 +627,9 @@ impl<'scope> Scope<'scope> {
     /// scope, and it is the caller's responsibility to ensure that said scope
     /// is not exited before the caller is done executing.
     ///
-    /// This function is guaranteed not to panic after scheduling the callable.
+    /// This entails in particular that all code including spawn_unchecked until
+    /// the point where the remote task has signaled completion should translate
+    /// unwinding panics to aborts.
     unsafe fn spawn_unchecked(
         &self,
         f: impl for<'remote> FnOnce(&Scope<'remote>) + Send + UnwindSafe,
@@ -570,72 +654,7 @@ impl<'scope> Scope<'scope> {
         if !shared.steal_flags.is_set(me, Ordering::Relaxed) {
             shared.steal_flags.fetch_set(me, Ordering::Relaxed);
         }
-        self.recommend_steal();
-    }
-
-    /// Find the closest thread that's looking for work and recommend it to
-    /// steal from us
-    ///
-    /// # Safety
-    ///
-    /// This function must not panic
-    fn recommend_steal(&self) {
-        // Iterate over increasingly remote neighbors without work
-        let shared = &self.0.shared;
-        let me = self.0.idx;
-        let me_u32 = me as u32;
-        'search: for closest_asleep in shared.steal_flags.iter_unset_around(me, Ordering::Relaxed) {
-            // Update their futex recommendation as appropriate
-            let closest_futex = &shared.workers[closest_asleep].futex;
-            let closest_asleep_u32 = closest_asleep as u32;
-            let mut futex_value = closest_futex.load(Ordering::Relaxed);
-            'compare_exchange: loop {
-                // Once it is determined that the current stealing
-                // recommendation is worse than stealing from us, call this
-                // macro to update the recommendation.
-                macro_rules! try_recommend {
-                    () => {
-                        match closest_futex.compare_exchange_weak(
-                            futex_value,
-                            me_u32,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        ) {
-                            Ok(_) => {
-                                // Recommendation updated, wake up the thread if
-                                // needed and go away
-                                if futex_value == WORK_NOWHERE {
-                                    atomic_wait::wake_all(closest_futex);
-                                }
-                                break 'search;
-                            }
-                            Err(new_futex_value) => {
-                                futex_value = new_futex_value;
-                                continue 'compare_exchange;
-                            }
-                        }
-                    };
-                }
-
-                // Analyze current value of the neighbor's futex
-                match futex_value {
-                    // Never override the thread pool's stop signal
-                    WORK_OVER => break 'search,
-
-                    // Handle recommendations worse than stealing from us
-                    WORK_NOWHERE | WORK_FROM_INJECTOR => try_recommend!(),
-                    far_idx
-                        if (closest_asleep_u32.abs_diff(far_idx)
-                            > closest_asleep_u32.abs_diff(me_u32)) =>
-                    {
-                        try_recommend!()
-                    }
-
-                    // Leave better recommendations alone
-                    _closer_idx => continue 'search,
-                }
-            }
-        }
+        self.0.shared.recommend_steal(me, me as u32);
     }
 }
 //
@@ -652,6 +671,14 @@ impl<'scope> Scope<'scope> {
 /// The callable is run by a particular worker thread and receives a Scope that
 /// allows it to interact with said thread.
 type Task = Box<dyn for<'scope> FnOnce(&Scope<'scope>) + Send + UnwindSafe>;
+
+/// Translate unwinding panics to aborts
+pub fn abort_on_panic<R>(f: impl FnOnce() -> R) -> R {
+    match std::panic::catch_unwind(AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(_) => std::process::abort(),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -692,7 +719,9 @@ mod tests {
     fn fibonacci() {
         let flat = FlatPool::new();
         flat.scope(|scope| {
-            assert_eq!(fibonacci_flat(scope, 32), fibonacci_ref(32));
+            for i in 0..32 {
+                assert_eq!(fibonacci_flat(scope, i), fibonacci_ref(i));
+            }
         });
     }
 }

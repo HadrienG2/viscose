@@ -165,3 +165,5 @@ type Word = usize;
 
 /// Atomic version of Word
 type AtomicWord = AtomicUsize;
+
+// TODO: Add proptests
