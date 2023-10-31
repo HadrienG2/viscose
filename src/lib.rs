@@ -1,27 +1,37 @@
 mod flags;
 
-use crossbeam::deque::{Injector, Steal, Stealer, Worker};
+use crossbeam::deque::{self, Injector, Steal, Stealer};
 use flags::AtomicFlags;
 use hwlocality::{
+    bitmap::BitmapIndex,
     cpu::{binding::CpuBindingFlags, cpuset::CpuSet},
     topology::Topology,
 };
 use std::{
+    cell::Cell,
+    collections::HashMap,
+    panic::{AssertUnwindSafe, UnwindSafe},
     sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
+        atomic::{self, AtomicBool, AtomicU32, Ordering},
+        Arc, Mutex,
     },
     thread::JoinHandle,
 };
 
 /// Simple flat pinned thread pool, used to check hypothesis that pinning and
 /// avoidance of TLS alone won't let us significantly outperform rayon
-struct FlatPool {
+pub struct FlatPool {
     /// Shared state
     shared: Arc<SharedState>,
 
+    /// Hwloc topology
+    topology: Arc<Topology>,
+
+    /// Mapping from OS CPU to worker thread index
+    cpu_to_worker: HashMap<BitmapIndex, usize>,
+
     /// Worker threads
-    workers: Box<[JoinHandle<()>]>,
+    workers: Vec<JoinHandle<()>>,
 }
 //
 impl FlatPool {
@@ -29,181 +39,146 @@ impl FlatPool {
     pub fn new() -> Self {
         // Probe the hwloc topology
         let topology = Arc::new(Topology::new().unwrap());
+        let cpuset = topology.cpuset();
 
         // Set up the shared state and work queues
-        let (shared, work_queues) =
-            SharedState::with_work_queues(topology.cpuset().weight().unwrap());
+        let (shared, work_queues) = SharedState::with_work_queues(cpuset.weight().unwrap());
 
         // Start worker threads
-        let workers = topology
-            .cpuset()
+        let workers = cpuset
             .iter_set()
-            .zip(work_queues.into_iter())
+            .zip(work_queues.into_vec())
             .enumerate()
-            .map(|(my_idx, (cpu, work_queue))| {
+            .map(|(worker_idx, (cpu, work_queue))| {
                 let topology = topology.clone();
                 let shared = shared.clone();
                 std::thread::spawn(move || {
-                    // TODO: Modularize this big function into an OO struct
-
-                    // Bind the worker to its assigned CPU
+                    // Pin the worker thread to its assigned CPU
                     topology
                         .bind_cpu(
                             &CpuSet::from(cpu),
-                            CpuBindingFlags::ASSUME_SINGLE_THREAD | CpuBindingFlags::STRICT,
+                            CpuBindingFlags::THREAD | CpuBindingFlags::STRICT,
                         )
                         .unwrap();
 
                     // We won't need the hwloc topology again after this
                     std::mem::drop(topology);
 
-                    // Process a task, irrespective of where we got it from
-                    let process_task = |task: Task| {
-                        // TODO: Do the work
-                        // TODO: Handle panics within the task + completion
-                        //       notifications
-                        // TODO: If we spawn tasks here, do a Release fence, set
-                        //       flag to notify others that we have work to
-                        //       steal, then look for the closest neighboring
-                        //       sleeping thread, make ourselves its
-                        //       recommendation if we're closer than the
-                        //       previous recommendation using a futex CAS, and
-                        //       wake it up.
-                        unimplemented!()
-                    };
-
-                    // Try to steal and execute a task from another worker,
-                    // return truth that this operation was successful
-                    let try_steal_worker = |idx: usize| loop {
-                        match shared.workers[idx].stealer.steal() {
-                            Steal::Success(task) => {
-                                process_task(task);
-                                return true;
-                            }
-                            Steal::Empty => return false,
-                            Steal::Retry => continue,
-                        }
-                    };
-
-                    // Try to steal and execute a task from the global injector
-                    let try_steal_injector = || loop {
-                        match shared.injector.steal() {
-                            Steal::Success(task) => {
-                                process_task(task);
-                                return true;
-                            }
-                            Steal::Empty => return false,
-                            Steal::Retry => continue,
-                        }
-                    };
-
-                    // Access our personal shard of the shared state
-                    let my = &shared.workers[my_idx];
-
-                    // Last-resort work stealing strategy: try to steal
-                    // everywhere at increasing distances from this worker,
-                    // using CPU ID distance as a rough distance metric
-                    let num_workers = shared.workers.len();
-                    let try_steal_anywhere = |update_futex_from_nowhere: bool| {
-                        // If we find a place to steal from, update our futex so
-                        // we check there immediately next time.
-                        let update_futex = |new_value: u32| {
-                            if update_futex_from_nowhere {
-                                my.futex.compare_exchange(
-                                    WORK_NOWHERE,
-                                    new_value,
-                                    Ordering::Relaxed,
-                                    Ordering::Relaxed,
-                                )
-                            }
-                        };
-
-                        // Check other workers at increasing distances
-                        for idx in shared
-                            .steal_flags
-                            .iter_set_around(my_idx, Ordering::Acquire)
-                        {
-                            if try_steal_worker(idx) {
-                                update_futex(idx);
-                                return true;
-                            }
-                        }
-
-                        // Check global injector
-                        let robbed_injector = try_steal_injector();
-                        if robbed_injector {
-                            update_futex(WORK_FROM_INJECTOR);
-                        }
-                        robbed_injector
-                    };
-
-                    // Main worker loop
-                    'main: loop {
-                        // Process all work from our private work queue
-                        while let Some(task) = work_queue.pop() {
-                            process_task(task);
-                        }
-                        shared.steal_flags.fetch_clear(my_idx, Ordering::Relaxed);
-
-                        // We ran out of private work, check our futex to know
-                        // where we should try to steal from next
-                        match my.futex.load(Ordering::Acquire) {
-                            // Thread pool is shutting down, so if we can't find
-                            // a task to steal now, we won't ever find one
-                            WORK_OVER => {
-                                if !try_steal_anywhere(false) {
-                                    break 'main;
-                                }
-                            }
-
-                            // No particular recommandation, look around in
-                            // order of decreasing locality and go to sleep if
-                            // we don't find any work anywhere
-                            WORK_NOWHERE => {
-                                if !try_steal_anywhere(true) {
-                                    // TODO: Add a grace period of spinning if
-                                    //       it can be proven beneficial
-                                    atomic_wait::wait(&my.futex, WORK_NOWHERE);
-                                }
-                            }
-
-                            // There is a recommandation to steal somewhere
-                            work_available => {
-                                // Try to steal from the recommended location
-                                let succeeded = match work_available {
-                                    WORK_FROM_INJECTOR => try_steal_injector(),
-                                    idx => try_steal_worker(idx),
-                                };
-
-                                // Once stealing starts to fail, the
-                                // recommandation has become outdated, so it's
-                                // time to remove it
-                                if !succeeded {
-                                    my.futex.compare_exchange(
-                                        work_available,
-                                        WORK_NOWHERE,
-                                        Ordering::Relaxed,
-                                        Ordering::Relaxed,
-                                    )
-                                }
-                            }
-                        }
-                    }
+                    // Start processing work
+                    Worker::run(&shared, worker_idx, work_queue);
                 })
             })
             .collect();
-        Self { shared, workers }
+
+        // Record the mapping from OS CPU to worker thread index
+        let cpu_to_worker = cpuset
+            .iter_set()
+            .enumerate()
+            .map(|(idx, cpu)| (cpu, idx))
+            .collect();
+
+        // Put it all together
+        Self {
+            shared,
+            topology,
+            cpu_to_worker,
+            workers,
+        }
     }
 
-    // TODO: Add scope() method and associated struct, steal from std::thread
-    // TODO: Make scope.join() wake up the sleeping thread closest to the
-    //       current thread, if any, with an appropriate futex recommendation.
-    //       Worker threads can remember which CPU they're pinned to and tell
-    //       the scope constructor, but to also handle threads external to the
-    //       thread pool we leave an Option at None and we query the current CPU
-    //       location with hwloc right before taking this decision.
-    // TODO: Catch worker thread panics and propagate them to the main thread
-    //       upon attempts to create tasks.
+    /// Synchronously execute work inside of the thread pool
+    pub fn scope<Body, Res>(&self, body: Body) -> Res
+    where
+        Body: for<'scope> FnOnce(&Scope<'scope>) -> Res + Send + UnwindSafe,
+        Res: Send,
+    {
+        // Propagate worker thread panics
+        for worker in &self.workers {
+            if worker.is_finished() {
+                panic!("a worker thread has panicked");
+            }
+        }
+
+        // Schedule work execution
+        let me = std::thread::current();
+        let result = Mutex::new(None);
+        // SAFETY: This is fine because we wait for work completion below
+        unsafe {
+            let result = &result;
+            self.spawn_unchecked(move |scope| {
+                // Run the callable, use mutex poisoning to notify the caller
+                // about any panic during task execution
+                let _ = std::panic::catch_unwind(|| {
+                    let mut lock = result.lock().unwrap();
+                    *lock = Some(body(scope));
+                });
+
+                // Notify the caller that the task has been processed
+                me.unpark();
+            });
+        }
+
+        // Wait for work completion and collect result
+        std::thread::park();
+        let result = result.lock().unwrap().take().unwrap();
+        result
+    }
+
+    /// Schedule work for execution on the thread pool, without lifetime checks
+    ///
+    /// The closest worker thread is hinted to pick this work up, but it may be
+    /// picked up by any other worker thread in the pool.
+    ///
+    /// # Safety
+    ///
+    /// The input callable is allowed to borrow variables from the surrounding
+    /// scope, and it is the caller's responsibility to ensure that said scope
+    /// is not exited before the caller is done executing.
+    ///
+    /// This function is guaranteed not to panic after scheduling the callable.
+    unsafe fn spawn_unchecked(
+        &self,
+        f: impl for<'remote> FnOnce(&Scope<'remote>) + Send + UnwindSafe,
+    ) {
+        // Determine the caller's current CPU location to decide which worker
+        // thread would be best placed for processing this task
+        let caller_cpu = self
+            .topology
+            .last_cpu_location(CpuBindingFlags::THREAD)
+            .unwrap();
+        let best_worker_idx = self.cpu_to_worker[&caller_cpu.first_set().unwrap()];
+
+        // Schedule the work to be executed
+        let f = Box::new(f);
+        // SAFETY: Per safety precondition, the caller promises that it will
+        //         keep any state borrowed by f live until f is done executing,
+        //         and therefore casting f to 'static is unobservable.
+        let f = unsafe {
+            std::mem::transmute::<
+                Box<dyn for<'remote> FnOnce(&Scope<'remote>) + Send + UnwindSafe>,
+                Box<dyn for<'remote> FnOnce(&Scope<'remote>) + Send + UnwindSafe + 'static>,
+            >(Box::new(f))
+        };
+        self.shared.injector.push(f);
+
+        // Find the nearest available thread and recommend it to process this
+        // FIXME: Wake up the idle worker closest to the CPU which the
+        //        scheduling thread currently resides on, if any. Should
+        //        share code with Scope::join here...
+        // TODO: Make scope() wake up the sleeping thread closest to the current
+        //       thread, if any, with an appropriate futex recommendation. Worker
+        //       threads can remember which CPU they're pinned to and tell the scope
+        //       constructor, but to also handle threads external to the thread pool
+        //       we leave an Option at None and we query the current CPU location
+        //       with hwloc right before taking this decision.
+        self.recommend_schedule(best_worker_idx);
+    }
+}
+//
+impl Default for FlatPool {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 //
 impl Drop for FlatPool {
@@ -212,6 +187,11 @@ impl Drop for FlatPool {
         for worker in self.shared.workers.iter() {
             worker.futex.store(WORK_OVER, Ordering::Release);
             atomic_wait::wake_all(&worker.futex);
+        }
+
+        // Join all the worker thread
+        for worker in self.workers.drain(..) {
+            worker.join();
         }
     }
 }
@@ -242,7 +222,7 @@ struct SharedState {
 //
 impl SharedState {
     /// Set up the shared state
-    fn with_work_queues(num_workers: usize) -> (Arc<Self>, Box<[Worker<Task>]>) {
+    fn with_work_queues(num_workers: usize) -> (Arc<Self>, Box<[deque::Worker<Task>]>) {
         assert!(
             num_workers < usize::try_from(WORK_SPECIAL_START).unwrap(),
             "unsupported number of worker threads"
@@ -307,8 +287,8 @@ const WORK_SPECIAL_START: u32 = u32::MAX - 2;
 //
 impl WorkerInterface {
     /// Set up a worker's work queue and external interface
-    fn with_work_queue() -> (Self, Worker<Task>) {
-        let worker = Worker::new_lifo();
+    fn with_work_queue() -> (Self, deque::Worker<Task>) {
+        let worker = deque::Worker::new_lifo();
         let interface = Self {
             stealer: worker.stealer(),
             futex: AtomicU32::new(WORK_NOWHERE),
@@ -316,6 +296,362 @@ impl WorkerInterface {
         (interface, worker)
     }
 }
+
+/// Worker thread
+struct Worker<'pool> {
+    /// Access to the shared state
+    shared: &'pool SharedState,
+
+    /// Index of this thread in the shared state tables
+    idx: usize,
+
+    /// Quick access to this thread's futex
+    futex: &'pool AtomicU32,
+
+    /// Work queue
+    work_queue: deque::Worker<Task>,
+
+    /// Truth that there might still be work coming from other worker threads or
+    /// from thread pool clients.
+    work_incoming: Cell<bool>,
+}
+//
+impl<'pool> Worker<'pool> {
+    /// Set up and run the worker
+    pub fn run(shared: &'pool SharedState, idx: usize, work_queue: deque::Worker<Task>) {
+        let worker = Self {
+            shared,
+            idx,
+            futex: &shared.workers[idx].futex,
+            work_queue,
+            work_incoming: Cell::new(true),
+        };
+        // FIXME: Notify the pool if main() panics
+        worker.main();
+    }
+
+    /// Main worker loop
+    fn main(&self) {
+        while self.work_incoming.get() {
+            self.step();
+        }
+    }
+
+    /// Single step of the main worker loop
+    fn step(&self) {
+        // Process all work from our private work queue
+        while let Some(task) = self.work_queue.pop() {
+            self.process_task(task);
+        }
+
+        // Signal that there's no work to steal from us for now
+        self.shared
+            .steal_flags
+            .fetch_clear(self.idx, Ordering::Relaxed);
+
+        // Look for work elsewhere using our trusty futex as a guide
+        self.look_for_work();
+    }
+
+    /// Process one incoming task
+    fn process_task(&self, task: Task) {
+        let scope = Scope::new(self);
+        if std::panic::catch_unwind(|| task(&scope)).is_err() {
+            // FIXME: Handle panics in user-provided task
+            unimplemented!()
+        }
+    }
+
+    /// Look for work using our futex as a guide
+    fn look_for_work(&self) {
+        match self.futex.load(Ordering::Acquire) {
+            // Thread pool is shutting down, so if we can't find
+            // a task to steal now, we won't ever find one
+            WORK_OVER => {
+                if self.steal_from_anyone().is_none() {
+                    self.work_incoming.set(false);
+                }
+            }
+
+            // No particular work stealing recommandation, check all
+            // possibilities and go to sleep if we don't find any work anywhere
+            WORK_NOWHERE => {
+                if let Some(location) = self.steal_from_anyone() {
+                    // Record any place where we found work so we can try to
+                    // steal from there right away next time.
+                    let _ = self.futex.compare_exchange(
+                        WORK_NOWHERE,
+                        location,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                } else {
+                    // No work found, go to sleep
+                    atomic_wait::wait(self.futex, WORK_NOWHERE);
+                }
+            }
+
+            // There is a recommandation to steal work from somewhere
+            work_location => {
+                // Try to steal from the current recommended location
+                let succeeded = match work_location {
+                    WORK_FROM_INJECTOR => self.steal_from_injector(),
+                    idx => self.steal_from_worker(idx as usize),
+                };
+
+                // Once stealing starts to fail, the recommandation becomes
+                // outdated, so discard it: we'll try exhaustive search next.
+                if !succeeded {
+                    let _ = self.futex.compare_exchange(
+                        work_location,
+                        WORK_NOWHERE,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Try to steal work from one worker, identified by index in shared tables
+    ///
+    /// Return truth that a task was successfully stolen and run.
+    fn steal_from_worker(&self, idx: usize) -> bool {
+        self.steal(|| self.shared.workers[idx].stealer.steal())
+    }
+
+    /// Try to steal work from the global task injector
+    ///
+    /// Return truth that a task was successfully stolen and run.
+    fn steal_from_injector(&self) -> bool {
+        self.steal(|| self.shared.injector.steal())
+    }
+
+    /// Try to steal work from all possible sources
+    ///
+    /// Return from which source work was stolen (if any), using the conventions
+    /// of `self.futex`, so that `self.futex` can be updated if appropriate.
+    fn steal_from_anyone(&self) -> Option<u32> {
+        // Try to steal from other workers at increasing distances
+        for idx in self
+            .shared
+            .steal_flags
+            .iter_set_around(self.idx, Ordering::Acquire)
+        {
+            if self.steal_from_worker(idx) {
+                return Some(idx as u32);
+            }
+        }
+
+        // Try to steal from the global injector
+        self.steal_from_injector().then_some(WORK_FROM_INJECTOR)
+    }
+
+    /// Try to steal work using the specified procedure
+    ///
+    /// Return truth that a task was successfully stolen and run.
+    fn steal(&self, mut attempt: impl FnMut() -> Steal<Task>) -> bool {
+        loop {
+            match attempt() {
+                Steal::Success(task) => {
+                    self.process_task(task);
+                    return true;
+                }
+                Steal::Empty => return false,
+                Steal::Retry => continue,
+            }
+        }
+    }
+}
+
+/// Scope for executing parallel work
+///
+/// This is a token which attests that work is executing within the context of a
+/// worker thread in the thread pool, and can be used to schedule work on said
+/// thread pool.
+pub struct Scope<'scope>(AssertUnwindSafe<&'scope Worker<'scope>>);
+//
+impl<'scope> Scope<'scope> {
+    /// Provide an opportunity for fork-join parallelism
+    ///
+    /// Run the `local` task, while leaving the `remote` task available for
+    /// other worker threads to steal. If no other thread takes over the job, do
+    /// it ourselves. Wait for both tasks to be complete before moving on, while
+    /// participating to thread pool execution in meantime.
+    pub fn join<LocalFn, LocalResult, RemoteFn, RemoteResult>(
+        &self,
+        local: LocalFn,
+        remote: RemoteFn,
+    ) -> (LocalResult, RemoteResult)
+    where
+        LocalFn: FnOnce() -> LocalResult + UnwindSafe,
+        RemoteFn: for<'remote> FnOnce(&Scope<'remote>) -> RemoteResult + Send + UnwindSafe,
+        RemoteResult: Send,
+    {
+        // Spawn remote task
+        // SAFETY: This is safe because we will wait for remote work to complete
+        //         before exiting the scope of borrowed variables.
+        let remote_finished = AtomicBool::new(false);
+        let remote_result = Mutex::new(None);
+        unsafe {
+            let futex = self.0.futex;
+            let remote_finished = &remote_finished;
+            let remote_result = &remote_result;
+            self.spawn_unchecked(move |scope| {
+                // Run the callable, use mutex poisoning to notify the caller
+                // about any panic during task execution
+                let _ = std::panic::catch_unwind(|| {
+                    let mut result_lock = remote_result.lock().unwrap();
+                    *result_lock = Some(remote(scope));
+                });
+
+                // Notify the worker thread that the task has been processed
+                remote_finished.store(true, Ordering::Release);
+                // TODO: See if I can find a way to avoid calling wake when the
+                //       thread is awake without causing a race condition when
+                //       it's concurrently falling asleep.
+                atomic_wait::wake_all(futex);
+            })
+        };
+
+        // Run local task
+        let local_result = std::panic::catch_unwind(local);
+
+        // Execute thread pool work while waiting for remote work to complete
+        // FIXME: Handle panics here
+        while !remote_finished.load(Ordering::Relaxed) {
+            self.0.step();
+        }
+        atomic::fence(Ordering::Acquire);
+        let remote_result = remote_result.lock().unwrap().take().unwrap();
+
+        // Collect and return results
+        (local_result.unwrap(), remote_result)
+    }
+
+    /// Set up a scope associated with a particular worker thread
+    fn new(worker: &'scope Worker<'scope>) -> Self {
+        Self(AssertUnwindSafe(worker))
+    }
+
+    /// Schedule work for execution on the thread pool, without lifetime checks
+    ///
+    /// The work is scheduled on the active worker's thread work queue, but it
+    /// may be picked up by any other worker thread in the thread pool.
+    ///
+    /// # Safety
+    ///
+    /// The input callable is allowed to borrow variables from the surrounding
+    /// scope, and it is the caller's responsibility to ensure that said scope
+    /// is not exited before the caller is done executing.
+    ///
+    /// This function is guaranteed not to panic after scheduling the callable.
+    unsafe fn spawn_unchecked(
+        &self,
+        f: impl for<'remote> FnOnce(&Scope<'remote>) + Send + UnwindSafe,
+    ) {
+        // Schedule the work to be executed
+        let f = Box::new(f);
+        // SAFETY: Per safety precondition, the caller promises that it will
+        //         keep any state borrowed by f live until f is done executing,
+        //         and therefore casting f to 'static is unobservable.
+        let f = unsafe {
+            std::mem::transmute::<
+                Box<dyn for<'remote> FnOnce(&Scope<'remote>) + Send + UnwindSafe>,
+                Box<dyn for<'remote> FnOnce(&Scope<'remote>) + Send + UnwindSafe + 'static>,
+            >(Box::new(f))
+        };
+        self.0.work_queue.push(f);
+
+        // Notify others that we have work available for stealing.
+        atomic::fence(Ordering::Release);
+        let shared = &self.0.shared;
+        let me = self.0.idx;
+        if !shared.steal_flags.is_set(me, Ordering::Relaxed) {
+            shared.steal_flags.fetch_set(me, Ordering::Relaxed);
+        }
+        self.recommend_steal();
+    }
+
+    /// Find the closest thread that's looking for work and recommend it to
+    /// steal from us
+    ///
+    /// # Safety
+    ///
+    /// This function must not panic
+    fn recommend_steal(&self) {
+        // Iterate over increasingly remote neighbors without work
+        let shared = &self.0.shared;
+        let me = self.0.idx;
+        let me_u32 = me as u32;
+        'search: for closest_asleep in shared.steal_flags.iter_unset_around(me, Ordering::Relaxed) {
+            // Update their futex recommendation as appropriate
+            let closest_futex = &shared.workers[closest_asleep].futex;
+            let closest_asleep_u32 = closest_asleep as u32;
+            let mut futex_value = closest_futex.load(Ordering::Relaxed);
+            'compare_exchange: loop {
+                // Once it is determined that the current stealing
+                // recommendation is worse than stealing from us, call this
+                // macro to update the recommendation.
+                macro_rules! try_recommend {
+                    () => {
+                        match closest_futex.compare_exchange_weak(
+                            futex_value,
+                            me_u32,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => {
+                                // Recommendation updated, wake up the thread if
+                                // needed and go away
+                                if futex_value == WORK_NOWHERE {
+                                    atomic_wait::wake_all(closest_futex);
+                                }
+                                break 'search;
+                            }
+                            Err(new_futex_value) => {
+                                futex_value = new_futex_value;
+                                continue 'compare_exchange;
+                            }
+                        }
+                    };
+                }
+
+                // Analyze current value of the neighbor's futex
+                match futex_value {
+                    // Never override the thread pool's stop signal
+                    WORK_OVER => break 'search,
+
+                    // Handle recommendations worse than stealing from us
+                    WORK_NOWHERE | WORK_FROM_INJECTOR => try_recommend!(),
+                    far_idx
+                        if (closest_asleep_u32.abs_diff(far_idx)
+                            > closest_asleep_u32.abs_diff(me_u32)) =>
+                    {
+                        try_recommend!()
+                    }
+
+                    // Leave better recommendations alone
+                    _closer_idx => continue 'search,
+                }
+            }
+        }
+    }
+}
+//
+// TODO: If I add a safe spawn(), bind its callable on F: 'scope, add tracking
+//       of spawned tasks and make the function that created the scope ensure
+//       that they are all finished before returning.
+
+/// A task is basically an FnOnce trait object
+///
+/// For now, we always implement it as Box<dyn FnOnce>, but we may try
+/// allocation elision optimizations later on if memory allocator overhead
+/// becomes a problem.
+///
+/// The callable is run by a particular worker thread and receives a Scope that
+/// allows it to interact with said thread.
+type Task = Box<dyn for<'scope> FnOnce(&Scope<'scope>) + Send + UnwindSafe>;
 
 #[cfg(test)]
 mod tests {
@@ -326,20 +662,21 @@ mod tests {
         if n > 0 {
             let sqrt_5 = 5.0f64.sqrt();
             let phi = (1.0 + sqrt_5) / 2.0;
-            let F_n = phi.powi(i32::try_from(n).unwrap()) / sqrt_5;
-            F_n.round() as u64
+            let f_n = phi.powi(i32::try_from(n).unwrap()) / sqrt_5;
+            f_n.round() as u64
         } else {
             0
         }
     }
 
     /// Recursive parallel fibonacci based on FlatPool
-    fn fibonacci_flat(scope: &Scope<'_, '_>, n: u64) -> u64 {
+    fn fibonacci_flat(scope: &Scope<'_>, n: u64) -> u64 {
         if n > 1 {
-            scope.join(
-                |scope| fibonacci_flat(scope, n - 1),
+            let (x, y) = scope.join(
+                || fibonacci_flat(scope, n - 1),
                 move |scope| fibonacci_flat(scope, n - 2),
-            )
+            );
+            x + y
         } else {
             n
         }
