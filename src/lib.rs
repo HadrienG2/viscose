@@ -1,3 +1,5 @@
+#![warn(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
+
 mod flags;
 
 use crossbeam::deque::{self, Injector, Steal, Stealer};
@@ -10,7 +12,7 @@ use hwlocality::{
 use std::{
     cell::Cell,
     collections::HashMap,
-    panic::{AssertUnwindSafe, UnwindSafe},
+    panic::AssertUnwindSafe,
     sync::{
         atomic::{self, AtomicBool, AtomicU32, Ordering},
         Arc, Mutex,
@@ -52,21 +54,24 @@ impl FlatPool {
             .map(|(worker_idx, (cpu, work_queue))| {
                 let topology = topology.clone();
                 let shared = shared.clone();
-                std::thread::spawn(move || {
-                    // Pin the worker thread to its assigned CPU
-                    topology
-                        .bind_cpu(
-                            &CpuSet::from(cpu),
-                            CpuBindingFlags::THREAD | CpuBindingFlags::STRICT,
-                        )
-                        .unwrap();
+                std::thread::Builder::new()
+                    .name(format!("FlatPool thread #{worker_idx} on CPU #{cpu}"))
+                    .spawn(move || {
+                        // Pin the worker thread to its assigned CPU
+                        topology
+                            .bind_cpu(
+                                &CpuSet::from(cpu),
+                                CpuBindingFlags::THREAD | CpuBindingFlags::STRICT,
+                            )
+                            .unwrap();
 
-                    // We won't need the hwloc topology again after this
-                    std::mem::drop(topology);
+                        // We won't need the hwloc topology again after this
+                        std::mem::drop(topology);
 
-                    // Start processing work
-                    Worker::run(&shared, worker_idx, work_queue);
-                })
+                        // Start processing work
+                        Worker::run(&shared, worker_idx, work_queue);
+                    })
+                    .unwrap()
             })
             .collect();
 
@@ -89,7 +94,7 @@ impl FlatPool {
     /// Synchronously execute work inside of the thread pool
     pub fn scope<Body, Res>(&self, body: Body) -> Res
     where
-        Body: for<'scope> FnOnce(&Scope<'scope>) -> Res + Send + UnwindSafe,
+        Body: AsyncCallback<Res>,
         Res: Send,
     {
         // Propagate worker thread panics
@@ -111,10 +116,10 @@ impl FlatPool {
                 self.spawn_unchecked(move |scope| {
                     // Run the callable, use mutex poisoning to notify the caller
                     // about any panic during task execution
-                    let _ = std::panic::catch_unwind(|| {
+                    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
                         let mut lock = result.lock().unwrap();
                         *lock = Some(body(scope));
-                    });
+                    }));
 
                     // Notify the caller that the task has been processed
                     me.unpark();
@@ -134,6 +139,11 @@ impl FlatPool {
     /// The closest worker thread is hinted to pick this work up, but it may be
     /// picked up by any other worker thread in the pool.
     ///
+    /// Although an UnwindSafe bound on f cannot be enforced as a result of
+    /// AssertUnwindSafe being limited to FnOnce() only, closures passed to this
+    /// function should propagate panics to their client. Failure to do so will
+    /// break the thread pool and likely result in a program abort.
+    ///
     /// # Safety
     ///
     /// The input callable is allowed to borrow variables from the surrounding
@@ -143,17 +153,18 @@ impl FlatPool {
     ///
     /// This function is guaranteed not to panic after scheduling the callable.
     /// More precisely, panics will be transleted to aborts.
-    unsafe fn spawn_unchecked(
-        &self,
-        f: impl for<'remote> FnOnce(&Scope<'remote>) + Send + UnwindSafe,
-    ) {
+    unsafe fn spawn_unchecked(&self, f: impl AsyncCallback<()>) {
         // Determine the caller's current CPU location to decide which worker
         // thread would be best placed for processing this task
         let caller_cpu = self
             .topology
             .last_cpu_location(CpuBindingFlags::THREAD)
             .unwrap();
-        let best_worker_idx = self.cpu_to_worker[&caller_cpu.first_set().unwrap()];
+        let best_worker_idx = self
+            .cpu_to_worker
+            .get(&caller_cpu.first_set().unwrap())
+            .copied()
+            .unwrap_or(self.workers.len() / 2);
 
         // Schedule the work to be executed
         let f = Box::new(f);
@@ -161,10 +172,9 @@ impl FlatPool {
         //         keep any state borrowed by f live until f is done executing,
         //         and therefore casting f to 'static is unobservable.
         let f = unsafe {
-            std::mem::transmute::<
-                Box<dyn for<'remote> FnOnce(&Scope<'remote>) + Send + UnwindSafe>,
-                Box<dyn for<'remote> FnOnce(&Scope<'remote>) + Send + UnwindSafe + 'static>,
-            >(Box::new(f))
+            std::mem::transmute::<Box<dyn AsyncCallback<()>>, Box<dyn AsyncCallback<()> + 'static>>(
+                Box::new(f),
+            )
         };
         self.shared.injector.push(f);
 
@@ -250,11 +260,11 @@ impl SharedState {
     /// `task_location` must not be `WORK_OVER` nor `WORK_NOWHERE`, since these
     /// are not actual task locations. The code will panic upon encountering.
     /// these location values.
-    fn recommend_steal(&self, closest_worker: usize, task_location: u32) {
+    fn recommend_steal(&self, local_worker: usize, task_location: u32) {
         // Iterate over increasingly remote job-less neighbors
         'search: for closest_asleep in self
             .steal_flags
-            .iter_unset_around(closest_worker, Ordering::Relaxed)
+            .iter_unset_around(local_worker, Ordering::Relaxed)
         {
             // Update their futex recommendation as appropriate
             let closest_futex = &self.workers[closest_asleep].futex;
@@ -291,7 +301,9 @@ impl SharedState {
                 // Analyze current value of the neighbor's futex
                 match (futex_value, task_location) {
                     // Never override the thread pool's stop signal
-                    (WORK_OVER, _) => break 'search,
+                    (WORK_OVER, _) => {
+                        break 'search;
+                    }
 
                     // Only actual task locations are accepted
                     (_, WORK_OVER | WORK_NOWHERE) => unreachable!(),
@@ -299,9 +311,15 @@ impl SharedState {
                     // If the neighbor currently has nothing to do, any location
                     // is accepted. But any other worker is considered more
                     // local than the injector.
-                    (WORK_NOWHERE, _) => try_recommend!(),
-                    (_, WORK_FROM_INJECTOR) => continue 'search,
-                    (WORK_FROM_INJECTOR, _) => try_recommend!(),
+                    (WORK_NOWHERE, _) => {
+                        try_recommend!();
+                    }
+                    (_, WORK_FROM_INJECTOR) => {
+                        continue 'search;
+                    }
+                    (WORK_FROM_INJECTOR, _) => {
+                        try_recommend!();
+                    }
 
                     // At this point, it is clear that both recommendation point
                     // to actual worker indices. Accept new recommendation if it
@@ -314,7 +332,9 @@ impl SharedState {
                     }
 
                     // ...otherwise, leave the existing recommendation alone
-                    _ => continue 'search,
+                    _ => {
+                        continue 'search;
+                    }
                 }
             }
         }
@@ -409,12 +429,12 @@ impl<'pool> Worker<'pool> {
     /// Main worker loop
     fn main(&self) {
         while self.work_incoming.get() {
-            self.step();
+            self.step(true);
         }
     }
 
     /// Single step of the main worker loop
-    fn step(&self) {
+    fn step(&self, can_sleep: bool) {
         // Process all work from our private work queue
         while let Some(task) = self.work_queue.pop() {
             self.process_task(task);
@@ -426,13 +446,13 @@ impl<'pool> Worker<'pool> {
             .fetch_clear(self.idx, Ordering::Relaxed);
 
         // Look for work elsewhere using our trusty futex as a guide
-        self.look_for_work();
+        self.look_for_work(can_sleep);
     }
 
     /// Process one incoming task
     fn process_task(&self, task: Task) {
         let scope = Scope::new(self);
-        if std::panic::catch_unwind(|| task(&scope)).is_err() {
+        if std::panic::catch_unwind(AssertUnwindSafe(|| task(&scope))).is_err() {
             // FIXME: Handle panics in user-provided task without bringing down
             //        the entire thread pool, if possible
             unimplemented!()
@@ -440,7 +460,7 @@ impl<'pool> Worker<'pool> {
     }
 
     /// Look for work using our futex as a guide
-    fn look_for_work(&self) {
+    fn look_for_work(&self, can_sleep: bool) {
         match self.futex.load(Ordering::Acquire) {
             // Thread pool is shutting down, so if we can't find
             // a task to steal now, we won't ever find one
@@ -463,8 +483,10 @@ impl<'pool> Worker<'pool> {
                         Ordering::Relaxed,
                     );
                 } else {
-                    // No work found, go to sleep
-                    atomic_wait::wait(self.futex, WORK_NOWHERE);
+                    // No work found, go to sleep if allowed to do so
+                    if can_sleep {
+                        atomic_wait::wait(self.futex, WORK_NOWHERE);
+                    }
                 }
             }
 
@@ -555,15 +577,15 @@ impl<'scope> Scope<'scope> {
     /// other worker threads to steal. If no other thread takes over the job, do
     /// it ourselves. Wait for both tasks to be complete before moving on, while
     /// participating to thread pool execution in meantime.
-    pub fn join<LocalFn, LocalResult, RemoteFn, RemoteResult>(
+    pub fn join<LocalFn, LocalRes, RemoteFn, RemoteRes>(
         &self,
         local: LocalFn,
         remote: RemoteFn,
-    ) -> (LocalResult, RemoteResult)
+    ) -> (LocalRes, RemoteRes)
     where
-        LocalFn: FnOnce() -> LocalResult + UnwindSafe,
-        RemoteFn: for<'remote> FnOnce(&Scope<'remote>) -> RemoteResult + Send + UnwindSafe,
-        RemoteResult: Send,
+        LocalFn: FnOnce() -> LocalRes,
+        RemoteFn: AsyncCallback<RemoteRes>,
+        RemoteRes: Send,
     {
         // No unwinding panics allowed until the remote task has completed
         let (local_result, remote_result) = abort_on_panic(|| {
@@ -581,10 +603,10 @@ impl<'scope> Scope<'scope> {
                 self.spawn_unchecked(move |scope| {
                     // Run the callable, use mutex poisoning to notify the
                     // caller about any panic during task execution
-                    let _ = std::panic::catch_unwind(|| {
+                    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
                         let mut result_lock = remote_result.lock().unwrap();
                         *result_lock = Some(remote(scope));
-                    });
+                    }));
 
                     // Notify the worker thread that the task has been processed
                     remote_finished.store(true, Ordering::Release);
@@ -596,11 +618,13 @@ impl<'scope> Scope<'scope> {
             };
 
             // Run local task
-            let local_result = std::panic::catch_unwind(local);
+            let local_result = std::panic::catch_unwind(AssertUnwindSafe(local));
 
             // Execute thread pool work while waiting for remote task
             while !remote_finished.load(Ordering::Relaxed) {
-                self.0.step();
+                // FIXME: Figure out if I can allow sleep here with a more
+                //        clever futex protocol.
+                self.0.step(false);
             }
             atomic::fence(Ordering::Acquire);
             (local_result, remote_result)
@@ -621,6 +645,11 @@ impl<'scope> Scope<'scope> {
     /// The work is scheduled on the active worker's thread work queue, but it
     /// may be picked up by any other worker thread in the thread pool.
     ///
+    /// Although an UnwindSafe bound on f cannot be enforced as a result of
+    /// AssertUnwindSafe being limited to FnOnce() only, closures passed to this
+    /// function should propagate panics to their client. Failure to do so will
+    /// break the thread pool and likely result in a program abort.
+    ///
     /// # Safety
     ///
     /// The input callable is allowed to borrow variables from the surrounding
@@ -630,20 +659,16 @@ impl<'scope> Scope<'scope> {
     /// This entails in particular that all code including spawn_unchecked until
     /// the point where the remote task has signaled completion should translate
     /// unwinding panics to aborts.
-    unsafe fn spawn_unchecked(
-        &self,
-        f: impl for<'remote> FnOnce(&Scope<'remote>) + Send + UnwindSafe,
-    ) {
+    unsafe fn spawn_unchecked(&self, f: impl AsyncCallback<()>) {
         // Schedule the work to be executed
         let f = Box::new(f);
         // SAFETY: Per safety precondition, the caller promises that it will
         //         keep any state borrowed by f live until f is done executing,
         //         and therefore casting f to 'static is unobservable.
         let f = unsafe {
-            std::mem::transmute::<
-                Box<dyn for<'remote> FnOnce(&Scope<'remote>) + Send + UnwindSafe>,
-                Box<dyn for<'remote> FnOnce(&Scope<'remote>) + Send + UnwindSafe + 'static>,
-            >(Box::new(f))
+            std::mem::transmute::<Box<dyn AsyncCallback<()>>, Box<dyn AsyncCallback<()> + 'static>>(
+                Box::new(f),
+            )
         };
         self.0.work_queue.push(f);
 
@@ -670,7 +695,17 @@ impl<'scope> Scope<'scope> {
 ///
 /// The callable is run by a particular worker thread and receives a Scope that
 /// allows it to interact with said thread.
-type Task = Box<dyn for<'scope> FnOnce(&Scope<'scope>) + Send + UnwindSafe>;
+type Task = Box<dyn AsyncCallback<()>>;
+
+/// Asynchronous callback, to be scheduled on the thread pool
+pub trait AsyncCallback<Res: Send>: for<'scope> FnOnce(&Scope<'scope>) -> Res + Send {}
+//
+impl<Res, Body> AsyncCallback<Res> for Body
+where
+    Res: Send,
+    Body: for<'scope> FnOnce(&Scope<'scope>) -> Res + Send,
+{
+}
 
 /// Translate unwinding panics to aborts
 pub fn abort_on_panic<R>(f: impl FnOnce() -> R) -> R {
@@ -680,34 +715,34 @@ pub fn abort_on_panic<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
+/// Reference computation of the N-th fibonacci term
+pub fn fibonacci_ref(n: u64) -> u64 {
+    if n > 0 {
+        let sqrt_5 = 5.0f64.sqrt();
+        let phi = (1.0 + sqrt_5) / 2.0;
+        let f_n = phi.powi(i32::try_from(n).unwrap()) / sqrt_5;
+        f_n.round() as u64
+    } else {
+        0
+    }
+}
+
+/// Recursive parallel fibonacci based on FlatPool
+pub fn fibonacci_flat(scope: &Scope<'_>, n: u64) -> u64 {
+    if n > 1 {
+        let (x, y) = scope.join(
+            || fibonacci_flat(scope, n - 1),
+            move |scope| fibonacci_flat(scope, n - 2),
+        );
+        x + y
+    } else {
+        n
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Reference computation of the N-th fibonacci term
-    fn fibonacci_ref(n: u64) -> u64 {
-        if n > 0 {
-            let sqrt_5 = 5.0f64.sqrt();
-            let phi = (1.0 + sqrt_5) / 2.0;
-            let f_n = phi.powi(i32::try_from(n).unwrap()) / sqrt_5;
-            f_n.round() as u64
-        } else {
-            0
-        }
-    }
-
-    /// Recursive parallel fibonacci based on FlatPool
-    fn fibonacci_flat(scope: &Scope<'_>, n: u64) -> u64 {
-        if n > 1 {
-            let (x, y) = scope.join(
-                || fibonacci_flat(scope, n - 1),
-                move |scope| fibonacci_flat(scope, n - 2),
-            );
-            x + y
-        } else {
-            n
-        }
-    }
 
     #[test]
     fn lifecycle() {
@@ -719,7 +754,9 @@ mod tests {
     fn fibonacci() {
         let flat = FlatPool::new();
         flat.scope(|scope| {
-            for i in 0..32 {
+            // Use a lower limit in debug builds to avoid stack overflow
+            let max_fibo = if cfg!(debug_assertions) { 19 } else { 32 };
+            for i in 0..=max_fibo {
                 assert_eq!(fibonacci_flat(scope, i), fibonacci_ref(i));
             }
         });
