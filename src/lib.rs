@@ -1,6 +1,6 @@
 #![warn(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
-mod flags;
+pub mod flags;
 
 use crossbeam::deque::{self, Injector, Steal, Stealer};
 use flags::AtomicFlags;

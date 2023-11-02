@@ -1,12 +1,14 @@
 //! Set of flags that can be atomically set, checked or unset
 
+mod iter;
+
 #[cfg(test)]
 use proptest::prelude::*;
 use std::{
     fmt::{self, Debug, Write},
     hash::{Hash, Hasher},
     iter::FusedIterator,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{self, AtomicUsize, Ordering},
     write,
 };
 
@@ -15,7 +17,7 @@ const WORD_BITS: usize = Word::BITS as usize;
 
 /// Atomic flags
 #[derive(Default)]
-pub(crate) struct AtomicFlags {
+pub struct AtomicFlags {
     /// Concrete flags data
     words: Box<[AtomicWord]>,
 
@@ -34,24 +36,57 @@ impl AtomicFlags {
         }
     }
 
+    /// Check how many flags there are in there
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Truth that there is at least one flag in there
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Check if the Nth flag is set with certain atomic ordering
+    #[inline]
     pub fn is_set(&self, bit_idx: usize, order: Ordering) -> bool {
-        let (word, bit) = self.bit(bit_idx);
+        let (word, bit) = self.word_and_bit(bit_idx);
         word.load(order) & bit != 0
     }
 
     /// Set the Nth flag with certain atomic ordering, tell whether that flag
     /// was set beforehand
     pub fn fetch_set(&self, bit_idx: usize, order: Ordering) -> bool {
-        let (word, bit) = self.bit(bit_idx);
+        let (word, bit) = self.word_and_bit(bit_idx);
         word.fetch_or(bit, order) & bit != 0
     }
 
     /// Clear the Nth flag with certain atomic ordering, tell whether that flag
     /// was set beforehand
     pub fn fetch_clear(&self, bit_idx: usize, order: Ordering) -> bool {
-        let (word, bit) = self.bit(bit_idx);
+        let (word, bit) = self.word_and_bit(bit_idx);
         word.fetch_and(!bit, order) & bit != 0
+    }
+
+    /// Set all the flags
+    #[inline]
+    pub fn set_all(&self, order: Ordering) {
+        if order != Ordering::Relaxed {
+            atomic::fence(order);
+        }
+        self.words
+            .iter()
+            .for_each(|word| word.store(Word::MAX, Ordering::Relaxed));
+    }
+
+    /// Clear all the flags
+    #[inline]
+    pub fn clear_all(&self, order: Ordering) {
+        if order != Ordering::Relaxed {
+            atomic::fence(order);
+        }
+        self.words
+            .iter()
+            .for_each(|word| word.store(0, Ordering::Relaxed));
     }
 
     /// Iterate over the global bit positions of set flags at increasing
@@ -64,8 +99,7 @@ impl AtomicFlags {
         center_bit_idx: usize,
         order: Ordering,
     ) -> impl Iterator<Item = usize> + '_ {
-        self.enumerate_bits_around(center_bit_idx, order)
-            .filter_map(|(idx, bit)| bit.then_some(idx))
+        iter::NearestFlagIterator::<true>::new(self, center_bit_idx, order)
     }
 
     /// Like iter_set_around, but for unset flags
@@ -74,100 +108,30 @@ impl AtomicFlags {
         center_bit_idx: usize,
         order: Ordering,
     ) -> impl Iterator<Item = usize> + '_ {
-        self.enumerate_bits_around(center_bit_idx, order)
-            .filter_map(|(idx, bit)| (!bit).then_some(idx))
+        iter::NearestFlagIterator::<false>::new(self, center_bit_idx, order)
     }
 
     /// Convert a global flag index into a (word, subword bit) pair
-    fn bit(&self, bit_idx: usize) -> (&AtomicWord, Word) {
-        let (word_idx, bit) = self.bit_pos(bit_idx);
+    #[inline]
+    fn word_and_bit(&self, bit_idx: usize) -> (&AtomicWord, Word) {
+        let (word_idx, bit) = self.word_idx_and_bit(bit_idx);
         (&self.words[word_idx], bit)
     }
 
-    /// Convert a global flag index into a (word pos, subword bit) pair
-    fn bit_pos(&self, bit_idx: usize) -> (usize, Word) {
-        assert!(bit_idx < self.len, "requested flag is out of bounds");
-        let word_idx = bit_idx / WORD_BITS;
-        let bit = 1 << (bit_idx % WORD_BITS);
-        (word_idx, bit)
+    /// Convert a global flag index into a (word idx, subword bit) pair
+    #[inline]
+    fn word_idx_and_bit(&self, bit_idx: usize) -> (usize, Word) {
+        let (word_idx, bit_shift) = self.word_idx_and_bit_shift(bit_idx);
+        (word_idx, 1 << bit_shift)
     }
 
-    /// Enumerate bits around a certain central position
-    ///
-    /// Word readout is performed with the specified ordering. Beware that not
-    /// every bit readout requires a word readout.
-    ///
-    /// Returns an iterator over increasingly remote bits on the left side of
-    /// the specified bit, and on the right side of the specified bit,
-    /// respectively.
-    fn enumerate_bits_around(
-        &self,
-        center_bit_idx: usize,
-        order: Ordering,
-    ) -> impl Iterator<Item = (usize, bool)> + '_ {
-        // Determine the position of the central bit
-        let (center_word_idx, center_bit) = self.bit_pos(center_bit_idx);
-
-        // Read out central word
-        let center_word = self.words[center_word_idx].load(order);
-
-        // Set up bit iteration towards higher-order bits via left-shifting
-        let mut left_bit_idx = center_bit_idx;
-        let mut left_bit = center_bit;
-        let mut left_word = center_word;
-        let mut left_word_idx = center_word_idx;
-
-        // Set up bit iteration towards lower-order bits via right-shifting
-        let mut right_bit_idx = center_bit_idx;
-        let mut right_bit = center_bit;
-        let mut right_word = center_word;
-        let mut right_word_idx = center_word_idx;
-
-        // Emit iterator that alternates between left bits and right bits,
-        // starting left unless the left iterator is exhausted from the start
-        let last_bit_idx = self.len - 1;
-        let mut go_left = left_bit_idx != last_bit_idx;
-        std::iter::once((center_bit_idx, center_word & center_bit != 0)).chain(std::iter::from_fn(
-            move || {
-                // Handle case where both left and right iterators are over
-                if left_bit_idx == last_bit_idx && right_bit_idx == 0 {
-                    return None;
-                }
-
-                // Handle case where we're going left
-                if go_left {
-                    // Move to the next bit on the left
-                    left_bit_idx += 1;
-                    left_bit <<= 1;
-                    if left_bit == 0 {
-                        left_bit = 1;
-                        left_word_idx += 1;
-                        left_word = self.words[left_word_idx].load(order);
-                    }
-
-                    // Iterate right next time unless right-hand side is done
-                    go_left = right_bit_idx == 0;
-
-                    // Emit bit value and index
-                    Some((left_bit_idx, left_word & left_bit != 0))
-                } else {
-                    // Move to the next bit on the right
-                    right_bit_idx -= 1;
-                    right_bit >>= 1;
-                    if right_bit == 0 {
-                        right_bit = 1 << (WORD_BITS - 1);
-                        right_word_idx -= 1;
-                        right_word = self.words[right_word_idx].load(order);
-                    }
-
-                    // Iterate left next time unless left-hand side is done
-                    go_left = left_bit_idx != last_bit_idx;
-
-                    // Emit bit value and index
-                    Some((right_bit_idx, right_word & right_bit != 0))
-                }
-            },
-        ))
+    /// Convert a global flag index into a (word idx, bit shift) pair
+    #[inline]
+    fn word_idx_and_bit_shift(&self, bit_idx: usize) -> (usize, u32) {
+        assert!(bit_idx < self.len, "requested flag is out of bounds");
+        let word_idx = bit_idx / WORD_BITS;
+        let bit_shift = (bit_idx % WORD_BITS) as u32;
+        (word_idx, bit_shift)
     }
 
     /// Iterate over the value of inner words
@@ -232,25 +196,30 @@ impl Clone for AtomicFlags {
 impl Debug for AtomicFlags {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut display = "AtomicFlags(".to_owned();
-        display.reserve(self.len + 1);
+        display.reserve(self.len + self.len.div_ceil(WORD_BITS));
         let mut words = self.words(Ordering::Relaxed).rev();
+        let mut has_word_before = false;
 
         let num_heading_bits = self.len % WORD_BITS;
         if num_heading_bits != 0 {
-            if let Some(partial_word) = words.next() {
-                for bit_idx in (0..num_heading_bits).rev() {
-                    let bit = 1 << bit_idx;
-                    if partial_word & bit == 0 {
-                        display.push('0');
-                    } else {
-                        display.push('1');
-                    }
+            let partial_word = words.next().unwrap();
+            for bit_idx in (0..num_heading_bits).rev() {
+                let bit = 1 << bit_idx;
+                if partial_word & bit == 0 {
+                    display.push('0');
+                } else {
+                    display.push('1');
                 }
             }
+            has_word_before = true;
         }
 
-        for full_word in words {
-            write!(display, "{full_word:b}")?;
+        for full_word in words.peekable() {
+            if has_word_before {
+                display.push('_');
+            }
+            write!(display, "{full_word:064b}")?;
+            has_word_before = true;
         }
 
         display.push(')');
@@ -285,10 +254,23 @@ type Word = usize;
 type AtomicWord = AtomicUsize;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use proptest::sample::SizeRange;
     use std::{collections::hash_map::RandomState, hash::BuildHasher};
+
+    /// Generate a set of >= 1 atomic flags and a vald index within it
+    pub(crate) fn flags_and_bit_idx() -> impl Strategy<Value = (AtomicFlags, usize)> {
+        any::<AtomicFlags>()
+            .prop_filter(
+                "need at least one element to have at least one index",
+                |flags| flags.len > 0,
+            )
+            .prop_flat_map(|flags| {
+                let bit_idx = 0..flags.len;
+                (Just(flags), bit_idx)
+            })
+    }
 
     proptest! {
         #[test]
@@ -309,30 +291,17 @@ mod tests {
         }
     }
 
-    /// Generate a set of >= 1 atomic flags and a vald index within it
-    fn flags_and_bit_idx() -> impl Strategy<Value = (AtomicFlags, usize)> {
-        any::<AtomicFlags>()
-            .prop_filter(
-                "need at least one element to have at least one index",
-                |flags| flags.len > 0,
-            )
-            .prop_flat_map(|flags| {
-                let bit_idx = 0..flags.len;
-                (Just(flags), bit_idx)
-            })
-    }
-
     proptest! {
         #[test]
         fn op_idx((flags, bit_idx) in flags_and_bit_idx()) {
             let initial_flags = flags.clone();
 
-            let (word_idx, bit) = flags.bit_pos(bit_idx);
+            let (word_idx, bit) = flags.word_idx_and_bit(bit_idx);
             prop_assert_eq!(word_idx, bit_idx / WORD_BITS);
             prop_assert_eq!(bit, 1 << (bit_idx % WORD_BITS));
             prop_assert_eq!(&flags, &initial_flags);
 
-            let (word, bit2) = flags.bit(bit_idx);
+            let (word, bit2) = flags.word_and_bit(bit_idx);
             prop_assert!(std::ptr::eq(word, &flags.words[word_idx]));
             prop_assert_eq!(bit, bit2);
             prop_assert_eq!(&flags, &initial_flags);
@@ -363,45 +332,6 @@ mod tests {
                 word.fetch_and(!bit, Ordering::Relaxed);
                 prop_assert_eq!(&flags, &initial_flags);
             }
-
-            let mut left_idx = bit_idx;
-            let mut right_idx = bit_idx;
-            let mut go_left = left_idx != flags.len - 1;
-            let mut iter = flags.enumerate_bits_around(bit_idx, Ordering::Relaxed);
-            assert_eq!(iter.next(), Some((bit_idx, is_set)));
-            for (bit_idx, is_set) in iter {
-                if go_left {
-                    left_idx += 1;
-                    prop_assert_eq!(bit_idx, left_idx);
-                    prop_assert_eq!(is_set, flags.is_set(left_idx, Ordering::Relaxed));
-                    go_left = right_idx == 0;
-                } else {
-                    right_idx -= 1;
-                    prop_assert_eq!(bit_idx, right_idx);
-                    prop_assert_eq!(is_set, flags.is_set(right_idx, Ordering::Relaxed));
-                    go_left = left_idx != flags.len - 1;
-                }
-                prop_assert_eq!(&flags, &initial_flags);
-            }
-
-            prop_assert!(
-                flags
-                    .iter_set_around(bit_idx, Ordering::Relaxed)
-                    .inspect(|_| assert_eq!(flags, initial_flags))
-                    .eq(
-                        flags.enumerate_bits_around(bit_idx, Ordering::Relaxed)
-                            .filter_map(|(bit_idx, is_set)| is_set.then_some(bit_idx))
-                    )
-            );
-            prop_assert!(
-                flags
-                    .iter_unset_around(bit_idx, Ordering::Relaxed)
-                    .inspect(|_| assert_eq!(flags, initial_flags))
-                    .eq(
-                        flags.enumerate_bits_around(bit_idx, Ordering::Relaxed)
-                            .filter_map(|(bit_idx, is_set)| (!is_set).then_some(bit_idx))
-                    )
-            );
         }
     }
 }
