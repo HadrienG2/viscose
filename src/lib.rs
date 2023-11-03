@@ -434,29 +434,27 @@ impl<'pool> Worker<'pool> {
     }
 
     /// Single step of the main worker loop
+    #[inline]
     fn step(&self, can_sleep: bool) {
-        // Process all work from our private work queue
-        while let Some(task) = self.work_queue.pop() {
+        // Process work from our private work queue
+        if let Some(task) = self.work_queue.pop() {
             self.process_task(task);
+        } else {
+            // Signal that there's no work to steal from us for now
+            self.shared
+                .steal_flags
+                .fetch_clear(self.idx, Ordering::Relaxed);
+
+            // Look for work elsewhere using our trusty futex as a guide
+            self.look_for_work(can_sleep);
         }
-
-        // Signal that there's no work to steal from us for now
-        self.shared
-            .steal_flags
-            .fetch_clear(self.idx, Ordering::Relaxed);
-
-        // Look for work elsewhere using our trusty futex as a guide
-        self.look_for_work(can_sleep);
     }
 
     /// Process one incoming task
+    #[inline]
     fn process_task(&self, task: Task) {
         let scope = Scope::new(self);
-        if std::panic::catch_unwind(AssertUnwindSafe(|| task(&scope))).is_err() {
-            // FIXME: Handle panics in user-provided task without bringing down
-            //        the entire thread pool, if possible
-            unimplemented!()
-        }
+        task(&scope);
     }
 
     /// Look for work using our futex as a guide
