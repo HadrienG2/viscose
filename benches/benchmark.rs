@@ -52,29 +52,33 @@ fn bench_flags(c: &mut Criterion) {
             b.iter(|| pessimize::hide(&flags).clear_all(Ordering::Relaxed))
         });
 
-        // Run one iteration of the iterators over set and unset indices
-        bench_indexed_op(
+        // Benchark the iterators over set and unset indices
+        fn bench_iterator<Item>(
+            c: &mut Criterion,
+            flags: &AtomicFlags,
+            name_header: &str,
+            next: impl Fn(&AtomicFlags, usize) -> Option<Item>,
+            count: impl Fn(&AtomicFlags, usize) -> usize,
+        ) {
+            flags.set_all(Ordering::Relaxed);
+            bench_indexed_op(c, flags, &format!("{name_header}/ones/once"), &next);
+            bench_indexed_op(c, flags, &format!("{name_header}/ones/all"), &count);
+            flags.clear_all(Ordering::Relaxed);
+            bench_indexed_op(c, flags, &format!("{name_header}/zeroes/once"), &next);
+            bench_indexed_op(c, flags, &format!("{name_header}/zeroes/all"), &count);
+        }
+        bench_iterator(
             c,
             &flags,
-            &format!("{header}/iter_set_around/once"),
+            &format!("{header}/iter_set_around"),
             |flags, pos| flags.iter_set_around(pos, Ordering::Relaxed).next(),
-        );
-        bench_indexed_op(
-            c,
-            &flags,
-            &format!("{header}/iter_set_around/all"),
             |flags, pos| flags.iter_set_around(pos, Ordering::Relaxed).count(),
         );
-        bench_indexed_op(
+        bench_iterator(
             c,
             &flags,
-            &format!("{header}/iter_unset_around/once"),
+            &format!("{header}/iter_unset_around"),
             |flags, pos| flags.iter_unset_around(pos, Ordering::Relaxed).next(),
-        );
-        bench_indexed_op(
-            c,
-            &flags,
-            &format!("{header}/iter_unset_around/all"),
             |flags, pos| flags.iter_unset_around(pos, Ordering::Relaxed).count(),
         );
     }

@@ -46,6 +46,7 @@ impl<'flags, const FIND_SET: bool> NearestFlagIterator<'flags, FIND_SET> {
 impl<'flags, const FIND_SET: bool> Iterator for NearestFlagIterator<'flags, FIND_SET> {
     type Item = usize;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         // Yield the central index first
         if self.must_yield_center {
@@ -205,7 +206,6 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
     }
 
     /// Convert a word from AtomicFlags to normalized_remainder format
-    #[inline]
     fn normalize_word(mut word: Word, bit_shift: u32) -> Word {
         // Normalize word for iteration over set bits
         if !FIND_SET {
