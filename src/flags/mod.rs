@@ -94,6 +94,7 @@ impl AtomicFlags {
     ///
     /// The underlying words are read with the specified ordering, but beware
     /// that not every bit readout requires a word readout.
+    #[inline]
     pub fn iter_set_around(
         &self,
         center_bit_idx: usize,
@@ -103,6 +104,7 @@ impl AtomicFlags {
     }
 
     /// Like iter_set_around, but for unset flags
+    #[inline]
     pub fn iter_unset_around(
         &self,
         center_bit_idx: usize,
@@ -135,6 +137,7 @@ impl AtomicFlags {
     }
 
     /// Iterate over the value of inner words
+    #[inline]
     fn words(
         &self,
         order: Ordering,

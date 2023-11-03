@@ -27,6 +27,7 @@ pub(crate) struct NearestFlagIterator<'flags, const FIND_SET: bool> {
 //
 impl<'flags, const FIND_SET: bool> NearestFlagIterator<'flags, FIND_SET> {
     /// Start iterating over set/uset bits around a central position
+    #[inline(always)]
     pub(crate) fn new(flags: &'flags AtomicFlags, center_bit_idx: usize, order: Ordering) -> Self {
         let left_indices =
             FlagIdxIterator::<'flags, FIND_SET, true>::new(flags, center_bit_idx, order).peekable();
@@ -46,7 +47,7 @@ impl<'flags, const FIND_SET: bool> NearestFlagIterator<'flags, FIND_SET> {
 impl<'flags, const FIND_SET: bool> Iterator for NearestFlagIterator<'flags, FIND_SET> {
     type Item = usize;
 
-    #[inline]
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         // Yield the central index first
         if self.must_yield_center {
@@ -57,8 +58,7 @@ impl<'flags, const FIND_SET: bool> Iterator for NearestFlagIterator<'flags, FIND
         // Otherwise, yield the closest of the next left and right bits
         match (self.left_indices.peek(), self.right_indices.peek()) {
             (Some(left_idx), Some(right_idx)) => {
-                if left_idx.abs_diff(self.center_bit_idx) <= right_idx.abs_diff(self.center_bit_idx)
-                {
+                if left_idx - self.center_bit_idx <= self.center_bit_idx - right_idx {
                     self.left_indices.next()
                 } else {
                     self.right_indices.next()
@@ -110,6 +110,7 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
     /// Start iteration
     ///
     /// The bit at initial position `after_bit_idx` will not be emitted.
+    #[inline]
     pub fn new(flags: &'flags AtomicFlags, after_bit_idx: usize, order: Ordering) -> Self {
         let (word_idx, bit_shift) = flags.word_idx_and_bit_shift(after_bit_idx);
         let word = flags.words[word_idx].load(order);
@@ -127,7 +128,7 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
 
     /// Go to the next occurence of the bit value of interest in the flags, or
     /// to the end of iteration.
-    #[inline]
+    #[inline(always)]
     fn find_next_bit(&mut self) -> Option<()> {
         self.seek_in_word(1)
             .and_then(|()| self.find_bit_in_word())
@@ -172,6 +173,7 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
 
     /// Go to the next word that features the bit value of interest, if any,
     /// else record that we're at the end of iteration and return None.
+    #[inline]
     fn find_next_word(&mut self) -> Option<()> {
         // Find the first word featuring a set/unset bit, if any
         let words = self.flags.words(self.order).enumerate();
@@ -206,6 +208,7 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
     }
 
     /// Convert a word from AtomicFlags to normalized_remainder format
+    #[inline]
     fn normalize_word(mut word: Word, bit_shift: u32) -> Word {
         // Normalize word for iteration over set bits
         if !FIND_SET {
@@ -214,6 +217,7 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
 
         // Shift word in such a way that the bit of interest is the first bit in
         // the direction of interest (MSB or LSB)
+        debug_assert!(bit_shift < Word::BITS);
         if GOING_LEFT {
             word >>= bit_shift;
         } else {
@@ -225,6 +229,7 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
     /// Number of bits from the original word that haven't been processed yet
     #[inline]
     fn remaining_bits_in_word(&self) -> u32 {
+        debug_assert!(self.bit_shift < Word::BITS);
         if GOING_LEFT {
             Word::BITS - self.bit_shift
         } else {
@@ -259,12 +264,9 @@ impl<const FIND_SET: bool, const GOING_LEFT: bool> Iterator
     fn next(&mut self) -> Option<usize> {
         // At the start of next(), either we've reached the end of iteration...
         let bit_idx = self.word_idx * WORD_BITS + self.bit_shift as usize;
-        if bit_idx >= self.flags.len() {
+        if bit_idx >= self.flags.len {
             return None;
         }
-
-        // ...or we're looking at the bit value of interest
-        debug_assert_eq!(self.flags.is_set(bit_idx, Ordering::Relaxed), FIND_SET);
 
         // Go to the next bit of interest and yield result
         self.find_next_bit();
