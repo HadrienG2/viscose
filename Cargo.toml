@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 atomic-wait = { version = "1.1.0", default-features = false }
-crossbeam = { version = "0.8.2", features = ["crossbeam-channel", "crossbeam-deque", "crossbeam-epoch", "crossbeam-queue"] }
+crossbeam = { version = "0.8.2", features = ["crossbeam-deque"] }
 hwlocality = { version = "1.0.0", path = "../RustModernization/hwlocality" }
 itertools = "0.11"
 
