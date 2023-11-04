@@ -107,7 +107,7 @@ impl FlatPool {
         }
 
         // Prepare job for execution, notify completion via thread park token
-        let mut job = Job::new(std::thread::current(), work);
+        let mut job = Job::new(Unpark(std::thread::current()), work);
 
         // From the point where the task is scheduled, until the point where it
         // has signaled end of execution, panics should translate into aborts
@@ -122,7 +122,8 @@ impl FlatPool {
             std::thread::park();
         });
         // SAFETY: We waited for the job to finish before collecting the result,
-        //         and thread::park() wakeup has >= Acquire memory ordering.
+        //         and thread::park() is documented to have Acquire ordering at
+        //         https://doc.rust-lang.org/std/thread/fn.park.html#memory-ordering
         unsafe { job.result_or_panic() }
     }
 
@@ -181,10 +182,14 @@ impl Drop for FlatPool {
     }
 }
 
-// SAFETY: Thread::unpark() calls into OS primitives with >=Release ordering
-unsafe impl Notify for Thread {
+/// Job completion notification that unparks a thread
+struct Unpark(Thread);
+//
+// SAFETY: Thread::unpark() is documented to have Release ordering at
+//         https://doc.rust-lang.org/std/thread/fn.park.html#memory-ordering
+unsafe impl Notify for Unpark {
     fn notify(self) {
-        self.unpark()
+        self.0.unpark()
     }
 }
 
