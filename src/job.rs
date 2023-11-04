@@ -82,6 +82,7 @@ impl<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify> JobState<Res, ImplWork,
     ///
     /// This should only be called once, failure to do so will result in at
     /// least a panic and likely a full program abort.
+    #[inline]
     fn run(&mut self, scope: &Scope<'_>) {
         let Self::Scheduled(notify, work) = std::mem::replace(self, Self::Running) else {
             panic!("attempted to execute a Job in an invalid state");
@@ -108,6 +109,7 @@ impl DynJob {
     /// # Safety
     ///
     /// See top-level [`Job`] documentation.
+    #[inline]
     pub unsafe fn run(self, scope: &Scope<'_>) {
         (self.run)(self.state, scope)
     }

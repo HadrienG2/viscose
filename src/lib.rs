@@ -106,8 +106,13 @@ impl FlatPool {
             }
         }
 
-        // Prepare job for execution, notify completion via thread park token
-        let mut job = Job::new(Unpark(std::thread::current()), work);
+        // Prepare job for execution, notify completion via thread unparking
+        let finished = AtomicBool::new(false);
+        let notify = NotifyParked {
+            finished: &finished,
+            thread: std::thread::current(),
+        };
+        let mut job = Job::new(notify, work);
 
         // From the point where the task is scheduled, until the point where it
         // has signaled end of execution, panics should translate into aborts
@@ -119,11 +124,13 @@ impl FlatPool {
             unsafe { self.spawn_unchecked(job.as_dyn()) };
 
             // Wait for the end of job execution
-            std::thread::park();
+            while !finished.load(Ordering::Relaxed) {
+                std::thread::park();
+            }
+            atomic::fence(Ordering::Acquire);
         });
-        // SAFETY: We waited for the job to finish before collecting the result,
-        //         and thread::park() is documented to have Acquire ordering at
-        //         https://doc.rust-lang.org/std/thread/fn.park.html#memory-ordering
+        // SAFETY: We waited for the job to finish before collecting the result
+        //         and used an Acquire barrier to synchronize
         unsafe { job.result_or_panic() }
     }
 
@@ -135,7 +142,7 @@ impl FlatPool {
     /// # Safety
     ///
     /// The [`Job`] API contract must be honored as long as the completion
-    /// notification has not been received. This enteils in particular that all
+    /// notification has not been received. This entails in particular that all
     /// code including spawn_unchecked until the point where the remote task has
     /// signaled completion should translate unwinding panics to aborts.
     unsafe fn spawn_unchecked(&self, job: DynJob) {
@@ -183,13 +190,19 @@ impl Drop for FlatPool {
 }
 
 /// Job completion notification that unparks a thread
-struct Unpark(Thread);
+struct NotifyParked<'flag> {
+    /// Flag to be set to notify completion
+    finished: &'flag AtomicBool,
+
+    /// Thread to be unparked
+    thread: Thread,
+}
 //
-// SAFETY: Thread::unpark() is documented to have Release ordering at
-//         https://doc.rust-lang.org/std/thread/fn.park.html#memory-ordering
-unsafe impl Notify for Unpark {
+// SAFETY: finished is set with Release ordering and is the sig
+unsafe impl Notify for NotifyParked<'_> {
     fn notify(self) {
-        self.0.unpark()
+        self.finished.store(true, Ordering::Release);
+        self.thread.unpark()
     }
 }
 
@@ -578,7 +591,7 @@ impl<'scope> Scope<'scope> {
     {
         // Set up remote job and its completion notification mechanism
         let remote_finished = AtomicBool::new(false);
-        let notify = NotifyJoin {
+        let notify = NotifyFutex {
             remote_finished: &remote_finished,
             futex: self.0.futex,
         };
@@ -627,9 +640,10 @@ impl<'scope> Scope<'scope> {
     /// # Safety
     ///
     /// The [`Job`] API contract must be honored as long as the completion
-    /// notification has not been received. This enteils in particular that all
+    /// notification has not been received. This entails in particular that all
     /// code including spawn_unchecked until the point where the remote task has
     /// signaled completion should translate unwinding panics to aborts.
+    #[inline]
     unsafe fn spawn_unchecked(&self, job: DynJob) {
         // Schedule the work to be executed
         self.0.work_queue.push(job);
@@ -650,7 +664,7 @@ impl<'scope> Scope<'scope> {
 //       that they are all finished before returning.
 
 /// Mechanism to notify worker threads of join() completion
-struct NotifyJoin<'stack> {
+struct NotifyFutex<'stack> {
     /// Flag to be set once the remote job of this join() is finished
     remote_finished: &'stack AtomicBool,
 
@@ -658,14 +672,15 @@ struct NotifyJoin<'stack> {
     futex: &'stack AtomicU32,
 }
 //
-// SAFETY: remote_finished is set with Release ordering
-unsafe impl Notify for NotifyJoin<'_> {
+// SAFETY: remote_finished is set with Release ordering and is the signal that
+//         the worker uses to synchronize.
+unsafe impl Notify for NotifyFutex<'_> {
     fn notify(self) {
         self.remote_finished.store(true, Ordering::Release);
         // TODO: See if I can find a way to avoid calling wake when
         //       the thread is awake without causing a race
         //       condition when it's concurrently falling asleep.
-        atomic_wait::wake_all(self.futex);
+        /* atomic_wait::wake_all(self.futex); */
     }
 }
 
