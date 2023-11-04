@@ -752,9 +752,7 @@ mod tests {
     fn fibonacci() {
         let flat = FlatPool::new();
         flat.scope(|scope| {
-            // Use a lower limit in debug builds to avoid stack overflow
-            let max_fibo = if cfg!(debug_assertions) { 19 } else { 32 };
-            for i in 0..=max_fibo {
+            for i in 0..=34 {
                 assert_eq!(fibonacci_flat(scope, i), fibonacci_ref(i));
             }
         });
