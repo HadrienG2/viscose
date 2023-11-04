@@ -1,6 +1,7 @@
 #![warn(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
 pub mod flags;
+mod futex;
 mod job;
 
 use crate::job::{DynJob, Job, Notify};
