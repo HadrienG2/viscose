@@ -10,14 +10,14 @@ use hwlocality::{
     topology::Topology,
 };
 use std::{
-    cell::Cell,
+    cell::{Cell, UnsafeCell},
     collections::HashMap,
     panic::AssertUnwindSafe,
     sync::{
         atomic::{self, AtomicBool, AtomicU32, Ordering},
-        Arc, Mutex,
+        Arc,
     },
-    thread::JoinHandle,
+    thread::{JoinHandle, Thread},
 };
 
 /// Simple flat pinned thread pool, used to check hypothesis that pinning and
@@ -55,7 +55,7 @@ impl FlatPool {
                 let topology = topology.clone();
                 let shared = shared.clone();
                 std::thread::Builder::new()
-                    .name(format!("FlatPool thread #{worker_idx} on CPU #{cpu}"))
+                    .name(format!("FlatPool worker #{worker_idx} (CPU {cpu})"))
                     .spawn(move || {
                         // Pin the worker thread to its assigned CPU
                         topology
@@ -92,9 +92,9 @@ impl FlatPool {
     }
 
     /// Synchronously execute work inside of the thread pool
-    pub fn scope<Body, Res>(&self, body: Body) -> Res
+    pub fn run<W, Res>(&self, work: W) -> Res
     where
-        Body: AsyncCallback<Res>,
+        W: Work<Res>,
         Res: Send,
     {
         // Propagate worker thread panics
@@ -104,34 +104,24 @@ impl FlatPool {
             }
         }
 
+        // Prepare job for execution, notify completion via thread park token
+        let mut job = Job::new(std::thread::current(), work);
+
         // From the point where the task is scheduled, until the point where it
         // has signaled end of execution, panics should translate into aborts
-        let result = abort_on_panic(|| {
+        abort_on_panic(|| {
             // Schedule work execution
-            let me = std::thread::current();
-            let result = Mutex::new(None);
-            // SAFETY: This is fine because we wait for work completion below
-            unsafe {
-                let result = &result;
-                self.spawn_unchecked(move |scope| {
-                    // Run the callable, use mutex poisoning to notify the caller
-                    // about any panic during task execution
-                    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                        let mut lock = result.lock().unwrap();
-                        *lock = Some(body(scope));
-                    }));
+            // SAFETY: We wait for the job to complete before letting it go out
+            //         of scope or otherwise touching it in any way, and panics
+            //         are translated to aborts until it's done executing.
+            unsafe { self.spawn_unchecked(job.as_dyn()) };
 
-                    // Notify the caller that the task has been processed
-                    me.unpark();
-                });
-            }
-
-            // Wait for work completion and collect result
+            // Wait for the end of job execution
             std::thread::park();
-            result
         });
-        let result = result.lock().unwrap().take().unwrap();
-        result
+        // SAFETY: We waited for the job to finish before collecting the result,
+        //         and thread::park() wakeup has >= Acquire memory ordering.
+        unsafe { job.result() }
     }
 
     /// Schedule work for execution on the thread pool, without lifetime checks
@@ -139,21 +129,13 @@ impl FlatPool {
     /// The closest worker thread is hinted to pick this work up, but it may be
     /// picked up by any other worker thread in the pool.
     ///
-    /// Although an UnwindSafe bound on f cannot be enforced as a result of
-    /// AssertUnwindSafe being limited to FnOnce() only, closures passed to this
-    /// function should propagate panics to their client. Failure to do so will
-    /// break the thread pool and likely result in a program abort.
-    ///
     /// # Safety
     ///
-    /// The input callable is allowed to borrow variables from the surrounding
-    /// scope, and it is the caller's responsibility to ensure that said scope
-    /// is not exited before the caller is done executing. This notably entails
-    /// that the caller is not allowed do panic, but should abort on panics.
-    ///
-    /// This function is guaranteed not to panic after scheduling the callable.
-    /// More precisely, panics will be transleted to aborts.
-    unsafe fn spawn_unchecked(&self, f: impl AsyncCallback<()>) {
+    /// The [`Job`] API contract must be honored as long as the completion
+    /// notification has not been received. This enteils in particular that all
+    /// code including spawn_unchecked until the point where the remote task has
+    /// signaled completion should translate unwinding panics to aborts.
+    unsafe fn spawn_unchecked(&self, job: DynJob) {
         // Determine the caller's current CPU location to decide which worker
         // thread would be best placed for processing this task
         let caller_cpu = self
@@ -164,19 +146,11 @@ impl FlatPool {
             .cpu_to_worker
             .get(&caller_cpu.first_set().unwrap())
             .copied()
+            // FIXME: Pick true closest CPU
             .unwrap_or(self.workers.len() / 2);
 
         // Schedule the work to be executed
-        let f = Box::new(f);
-        // SAFETY: Per safety precondition, the caller promises that it will
-        //         keep any state borrowed by f live until f is done executing,
-        //         and therefore casting f to 'static is unobservable.
-        let f = unsafe {
-            std::mem::transmute::<Box<dyn AsyncCallback<()>>, Box<dyn AsyncCallback<()> + 'static>>(
-                Box::new(f),
-            )
-        };
-        self.shared.injector.push(f);
+        self.shared.injector.push(job);
 
         // Find the nearest available thread and recommend it to process this
         self.shared
@@ -205,11 +179,18 @@ impl Drop for FlatPool {
     }
 }
 
+// SAFETY: Thread::unpark() calls into OS primitives with >=Release ordering
+unsafe impl Notify for Thread {
+    fn notify(self) {
+        self.unpark()
+    }
+}
+
 /// State that is shared between users of the thread pool and all thread pool
 /// workers
 struct SharedState {
     /// Global work injector
-    injector: Injector<Task>,
+    injector: Injector<DynJob>,
 
     /// Worker interfaces
     workers: Box<[WorkerInterface]>,
@@ -231,7 +212,7 @@ struct SharedState {
 //
 impl SharedState {
     /// Set up the shared state
-    fn with_work_queues(num_workers: usize) -> (Arc<Self>, Box<[deque::Worker<Task>]>) {
+    fn with_work_queues(num_workers: usize) -> (Arc<Self>, Box<[deque::Worker<DynJob>]>) {
         assert!(
             num_workers < usize::try_from(WORK_SPECIAL_START).unwrap(),
             "unsupported number of worker threads"
@@ -344,7 +325,7 @@ impl SharedState {
 /// External interface to a single worker in a thread pool
 struct WorkerInterface {
     /// A way to steal from the worker
-    stealer: Stealer<Task>,
+    stealer: Stealer<DynJob>,
 
     /// Futex that the worker sleeps on when it has nothing to do, used to
     /// instruct it what to do when it is awakened.
@@ -384,7 +365,7 @@ const WORK_SPECIAL_START: u32 = u32::MAX - 2;
 //
 impl WorkerInterface {
     /// Set up a worker's work queue and external interface
-    fn with_work_queue() -> (Self, deque::Worker<Task>) {
+    fn with_work_queue() -> (Self, deque::Worker<DynJob>) {
         let worker = deque::Worker::new_lifo();
         let interface = Self {
             stealer: worker.stealer(),
@@ -406,7 +387,7 @@ struct Worker<'pool> {
     futex: &'pool AtomicU32,
 
     /// Work queue
-    work_queue: deque::Worker<Task>,
+    work_queue: deque::Worker<DynJob>,
 
     /// Truth that there might still be work coming from other worker threads or
     /// from thread pool clients.
@@ -415,7 +396,7 @@ struct Worker<'pool> {
 //
 impl<'pool> Worker<'pool> {
     /// Set up and run the worker
-    pub fn run(shared: &'pool SharedState, idx: usize, work_queue: deque::Worker<Task>) {
+    pub fn run(shared: &'pool SharedState, idx: usize, work_queue: deque::Worker<DynJob>) {
         let worker = Self {
             shared,
             idx,
@@ -452,9 +433,12 @@ impl<'pool> Worker<'pool> {
 
     /// Process one incoming task
     #[inline]
-    fn process_task(&self, task: Task) {
+    fn process_task(&self, job: DynJob) {
         let scope = Scope::new(self);
-        task(&scope);
+        // SAFETY: All methods that push [`DynJob`]s into the thread pool ensure
+        //         that the associated [`Job`] cannot go out of scope until it
+        //         is done executing.
+        unsafe { job.run(&scope) };
     }
 
     /// Look for work using our futex as a guide
@@ -547,7 +531,7 @@ impl<'pool> Worker<'pool> {
     /// Try to steal work using the specified procedure
     ///
     /// Return truth that a task was successfully stolen and run.
-    fn steal(&self, mut attempt: impl FnMut() -> Steal<Task>) -> bool {
+    fn steal(&self, mut attempt: impl FnMut() -> Steal<DynJob>) -> bool {
         loop {
             match attempt() {
                 Steal::Success(task) => {
@@ -582,38 +566,24 @@ impl<'scope> Scope<'scope> {
     ) -> (LocalRes, RemoteRes)
     where
         LocalFn: FnOnce() -> LocalRes,
-        RemoteFn: AsyncCallback<RemoteRes>,
+        RemoteFn: Work<RemoteRes>,
         RemoteRes: Send,
     {
-        // No unwinding panics allowed until the remote task has completed
-        let (local_result, remote_result) = abort_on_panic(|| {
-            // Spawn remote task
-            // SAFETY: This is safe because we will wait for remote work to
-            //         complete before exiting the scope of borrowed variables,
-            //         and panics are translated to aborts until the remote task
-            //         is done executing.
-            let remote_finished = AtomicBool::new(false);
-            let remote_result = Mutex::new(None);
-            unsafe {
-                let futex = self.0.futex;
-                let remote_finished = &remote_finished;
-                let remote_result = &remote_result;
-                self.spawn_unchecked(move |scope| {
-                    // Run the callable, use mutex poisoning to notify the
-                    // caller about any panic during task execution
-                    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                        let mut result_lock = remote_result.lock().unwrap();
-                        *result_lock = Some(remote(scope));
-                    }));
+        // Set up remote job and its completion notification mechanism
+        let remote_finished = AtomicBool::new(false);
+        let notify = NotifyJoin {
+            remote_finished: &remote_finished,
+            futex: self.0.futex,
+        };
+        let mut remote_job = Job::new(notify, remote);
 
-                    // Notify the worker thread that the task has been processed
-                    remote_finished.store(true, Ordering::Release);
-                    // TODO: See if I can find a way to avoid calling wake when
-                    //       the thread is awake without causing a race
-                    //       condition when it's concurrently falling asleep.
-                    atomic_wait::wake_all(futex);
-                })
-            };
+        // No unwinding panics allowed until the remote task has completed
+        let local_result = abort_on_panic(|| {
+            // Spawn remote task
+            // SAFETY: We wait for the job to complete before letting it go out
+            //         of scope or otherwise touching it in any way, and panics
+            //         are translated to aborts until it's done executing.
+            unsafe { self.spawn_unchecked(remote_job.as_dyn()) };
 
             // Run local task
             let local_result = std::panic::catch_unwind(AssertUnwindSafe(local));
@@ -625,12 +595,14 @@ impl<'scope> Scope<'scope> {
                 self.0.step(false);
             }
             atomic::fence(Ordering::Acquire);
-            (local_result, remote_result)
+            local_result
         });
 
         // Collect and return results
-        let remote_result = remote_result.lock().unwrap().take().unwrap();
-        (local_result.unwrap(), remote_result)
+        // SAFETY: Collecting the remote result is safe because we have waited
+        //         for the end of the job and the completion signal has been
+        //         acknowledged with an Acquire memory barrier.
+        (local_result.unwrap(), unsafe { remote_job.result() })
     }
 
     /// Set up a scope associated with a particular worker thread
@@ -643,34 +615,17 @@ impl<'scope> Scope<'scope> {
     /// The work is scheduled on the active worker's thread work queue, but it
     /// may be picked up by any other worker thread in the thread pool.
     ///
-    /// Although an UnwindSafe bound on f cannot be enforced as a result of
-    /// AssertUnwindSafe being limited to FnOnce() only, closures passed to this
-    /// function should propagate panics to their client. Failure to do so will
-    /// break the thread pool and likely result in a program abort.
-    ///
     /// # Safety
     ///
-    /// The input callable is allowed to borrow variables from the surrounding
-    /// scope, and it is the caller's responsibility to ensure that said scope
-    /// is not exited before the caller is done executing.
-    ///
-    /// This entails in particular that all code including spawn_unchecked until
-    /// the point where the remote task has signaled completion should translate
-    /// unwinding panics to aborts.
-    unsafe fn spawn_unchecked(&self, f: impl AsyncCallback<()>) {
+    /// The [`Job`] API contract must be honored as long as the completion
+    /// notification has not been received. This enteils in particular that all
+    /// code including spawn_unchecked until the point where the remote task has
+    /// signaled completion should translate unwinding panics to aborts.
+    unsafe fn spawn_unchecked(&self, job: DynJob) {
         // Schedule the work to be executed
-        let f = Box::new(f);
-        // SAFETY: Per safety precondition, the caller promises that it will
-        //         keep any state borrowed by f live until f is done executing,
-        //         and therefore casting f to 'static is unobservable.
-        let f = unsafe {
-            std::mem::transmute::<Box<dyn AsyncCallback<()>>, Box<dyn AsyncCallback<()> + 'static>>(
-                Box::new(f),
-            )
-        };
-        self.0.work_queue.push(f);
+        self.0.work_queue.push(job);
 
-        // Notify others that we have work available for stealing.
+        // Notify other workers that we have work available for stealing.
         atomic::fence(Ordering::Release);
         let shared = &self.0.shared;
         let me = self.0.idx;
@@ -685,20 +640,164 @@ impl<'scope> Scope<'scope> {
 //       of spawned tasks and make the function that created the scope ensure
 //       that they are all finished before returning.
 
-/// A task is basically an FnOnce trait object
-///
-/// For now, we always implement it as Box<dyn FnOnce>, but we may try
-/// allocation elision optimizations later on if memory allocator overhead
-/// becomes a problem.
-///
-/// The callable is run by a particular worker thread and receives a Scope that
-/// allows it to interact with said thread.
-type Task = Box<dyn AsyncCallback<()>>;
+/// Mechanism to notify worker threads of join() completion
+struct NotifyJoin<'stack> {
+    /// Flag to be set once the remote job of this join() is finished
+    remote_finished: &'stack AtomicBool,
 
-/// Asynchronous callback, to be scheduled on the thread pool
-pub trait AsyncCallback<Res: Send>: for<'scope> FnOnce(&Scope<'scope>) -> Res + Send {}
+    /// Futex of the worker thread to be awakened, if sleeping
+    futex: &'stack AtomicU32,
+}
 //
-impl<Res, Body> AsyncCallback<Res> for Body
+// SAFETY: remote_finished is set with Release ordering
+unsafe impl Notify for NotifyJoin<'_> {
+    fn notify(self) {
+        self.remote_finished.store(true, Ordering::Release);
+        // TODO: See if I can find a way to avoid calling wake when
+        //       the thread is awake without causing a race
+        //       condition when it's concurrently falling asleep.
+        atomic_wait::wake_all(self.futex);
+    }
+}
+
+/// [`Work`] that has been prepared for execution by the thread pool
+///
+/// # Safety
+///
+/// Safe use of [`Job`] requires carefully following the following procedure:
+///
+/// - Create a [`Job`] on the stack frame where it will be executed.
+/// - Create a type-erased job handle with `as_dyn()` and submit it for
+///   execution on the thread pool.
+/// - Until the job completion signal is received, do not exit the current stack
+///   frame or interact with the Job in any way, including but not limited to...
+///     - Moving or dropping the job
+///     - Calling any Job method
+/// - Once a job completion signal has been received with Acquire memory
+///   ordering, you may extract the result and propagate panics with `result()`.
+struct Job<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify>(
+    UnsafeCell<JobState<Res, ImplWork, ImplNotify>>,
+);
+//
+impl<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify> Job<Res, ImplWork, ImplNotify> {
+    /// Prepare [`Work`] for execution by the thread pool
+    pub fn new(notify: ImplNotify, work: ImplWork) -> Self {
+        Self(UnsafeCell::new(JobState::Scheduled(notify, work)))
+    }
+
+    /// Create a type-erased handle that can be pushed on a work queue
+    ///
+    /// # Safety
+    ///
+    /// Should only be called once, as preparation for submitting the job to the
+    /// thread pool.
+    pub unsafe fn as_dyn(&mut self) -> DynJob {
+        let state = self.0.get();
+        let state = state.cast::<()>();
+        let run = |state: *mut (), scope: &Scope<'_>| {
+            let state = state.cast::<JobState<Res, ImplWork, ImplNotify>>();
+            // SAFETY: Per `Job` API contract
+            unsafe { (*state).run(scope) };
+        };
+        DynJob { state, run }
+    }
+
+    /// Extract the job result or propagate job panic
+    ///
+    /// # Safety
+    ///
+    /// Should only be called after the job completion notification has been
+    /// received.
+    pub unsafe fn result(mut self) -> Res {
+        match std::mem::replace(self.0.get_mut(), JobState::Collected) {
+            JobState::Scheduled(_, _) | JobState::Running => {
+                panic!("Job result shouldn't be collected before completion notification")
+            }
+            JobState::Finished(result) => match result {
+                Ok(result) => result,
+                Err(payload) => std::panic::resume_unwind(payload),
+            },
+            JobState::Collected => unreachable!(),
+        }
+    }
+}
+
+/// [`Job`] state machine
+enum JobState<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify> {
+    /// Job has not started executing yet
+    Scheduled(ImplNotify, ImplWork),
+
+    /// Job is executing on some worker thread
+    Running,
+
+    /// Job execution is complete and result can be collected
+    Finished(std::thread::Result<Res>),
+
+    /// Job result has been collected
+    Collected,
+}
+//
+impl<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify> JobState<Res, ImplWork, ImplNotify> {
+    /// Run the job
+    ///
+    /// This should only be called once, failure to do so will result in at
+    /// least a panic and likely a full program abort.
+    fn run(&mut self, scope: &Scope<'_>) {
+        let Self::Scheduled(notify, work) = std::mem::replace(self, Self::Running) else {
+            panic!("attempted to execute a Job in an invalid state");
+        };
+        *self = Self::Finished(std::panic::catch_unwind(AssertUnwindSafe(|| work(scope))));
+        notify.notify()
+    }
+}
+
+/// Type-erased handle to a [`Job`]
+struct DynJob {
+    /// Type-erased `&mut JobState<...>` pointer
+    state: *mut (),
+
+    /// Type-erased `JobState<...>::run()` method
+    ///
+    /// The first parameter must be `self.job`.
+    run: fn(*mut (), &Scope<'_>),
+}
+//
+impl DynJob {
+    /// Execute the job
+    ///
+    /// # Safety
+    ///
+    /// See top-level [`Job`] documentation.
+    pub unsafe fn run(self, scope: &Scope<'_>) {
+        (self.run)(self.state, scope)
+    }
+}
+//
+// SAFETY: It is safe to send a DynJob to another thread because inner Work is
+//         safe to send across thread and the Job API contract ensures that the
+//         current thread will not touch the Job in any way until the other
+//         thread is done with the DynJob, which means that for all intents and
+//         purposes we effectively own the inner Work.
+unsafe impl Send for DynJob {}
+
+/// Mechanism to notify the program that a job is done executing
+///
+/// # Safety
+///
+/// No notification should be received until `self.notify()` is called, and the
+/// notification process must feature an `Ordering::Release` memory barrier.
+unsafe trait Notify {
+    /// Send in the notification
+    fn notify(self);
+}
+
+/// Function that can be scheduled for execution by the thread pool
+///
+/// The input [`Scope`] allows the scheduled work to interact with the thread
+/// pool by e.g. spawning new tasks.
+pub trait Work<Res: Send>: for<'scope> FnOnce(&Scope<'scope>) -> Res + Send {}
+//
+impl<Res, Body> Work<Res> for Body
 where
     Res: Send,
     Body: for<'scope> FnOnce(&Scope<'scope>) -> Res + Send,
@@ -726,6 +825,7 @@ pub fn fibonacci_ref(n: u64) -> u64 {
 }
 
 /// Recursive parallel fibonacci based on FlatPool
+#[inline]
 pub fn fibonacci_flat(scope: &Scope<'_>, n: u64) -> u64 {
     if n > 1 {
         let (x, y) = scope.join(
@@ -751,7 +851,7 @@ mod tests {
     #[test]
     fn fibonacci() {
         let flat = FlatPool::new();
-        flat.scope(|scope| {
+        flat.run(|scope| {
             for i in 0..=34 {
                 assert_eq!(fibonacci_flat(scope, i), fibonacci_ref(i));
             }

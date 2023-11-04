@@ -109,7 +109,7 @@ fn bench_fibonacci(c: &mut Criterion) {
 
     let pool = FlatPool::new();
     bench_backend(c, "flat", |b: &mut Bencher, size| {
-        pool.scope(|scope| b.iter(|| sched_local::fibonacci_flat(scope, pessimize::hide(size))))
+        pool.run(|scope| b.iter(|| sched_local::fibonacci_flat(scope, pessimize::hide(size))))
     })
 }
 
