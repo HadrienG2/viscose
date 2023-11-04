@@ -123,7 +123,7 @@ impl FlatPool {
         });
         // SAFETY: We waited for the job to finish before collecting the result,
         //         and thread::park() wakeup has >= Acquire memory ordering.
-        unsafe { job.result() }
+        unsafe { job.result_or_panic() }
     }
 
     /// Schedule work for execution on the thread pool, without lifetime checks
@@ -600,11 +600,13 @@ impl<'scope> Scope<'scope> {
             local_result
         });
 
-        // Collect and return results
+        // Return local and remote results, propagating panics
         // SAFETY: Collecting the remote result is safe because we have waited
         //         for the end of the job and the completion signal has been
         //         acknowledged with an Acquire memory barrier.
-        (local_result.unwrap(), unsafe { remote_job.result() })
+        (result_or_panic(local_result), unsafe {
+            remote_job.result_or_panic()
+        })
     }
 
     /// Set up a scope associated with a particular worker thread
@@ -680,6 +682,14 @@ fn abort_on_panic<R>(f: impl FnOnce() -> R) -> R {
     match std::panic::catch_unwind(AssertUnwindSafe(f)) {
         Ok(result) => result,
         Err(_) => std::process::abort(),
+    }
+}
+
+/// Extract the result or propagate the panic from a `thread::Result`
+fn result_or_panic<R>(result: std::thread::Result<R>) -> R {
+    match result {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
     }
 }
 

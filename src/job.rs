@@ -51,15 +51,12 @@ impl<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify> Job<Res, ImplWork, Impl
     ///
     /// Should only be called after the job completion notification has been
     /// received.
-    pub unsafe fn result(mut self) -> Res {
+    pub unsafe fn result_or_panic(mut self) -> Res {
         match std::mem::replace(self.0.get_mut(), JobState::Collected) {
             JobState::Scheduled(_, _) | JobState::Running => {
                 panic!("Job result shouldn't be collected before completion notification")
             }
-            JobState::Finished(result) => match result {
-                Ok(result) => result,
-                Err(payload) => std::panic::resume_unwind(payload),
-            },
+            JobState::Finished(result) => crate::result_or_panic(result),
             JobState::Collected => unreachable!(),
         }
     }
