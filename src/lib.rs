@@ -1,7 +1,7 @@
 #![warn(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
 pub mod flags;
-pub mod job;
+mod job;
 
 use crate::job::{DynJob, Job, Notify};
 use crossbeam::deque::{self, Injector, Steal, Stealer};
@@ -410,7 +410,7 @@ struct Worker<'pool> {
     work_queue: deque::Worker<DynJob>,
 
     /// Truth that there might still be work coming from other worker threads or
-    /// from thread pool clients.
+    /// from external thread pool clients.
     work_incoming: Cell<bool>,
 }
 //
@@ -464,8 +464,8 @@ impl<'pool> Worker<'pool> {
     /// Look for work using our futex as a guide
     fn look_for_work(&self, can_sleep: bool) {
         match self.futex.load(Ordering::Acquire) {
-            // Thread pool is shutting down, so if we can't find
-            // a task to steal now, we won't ever find one
+            // Thread pool is shutting down, so if we can't find a task to steal
+            // now, we likely won't ever find one again and can quit
             WORK_OVER => {
                 if self.steal_from_anyone().is_none() {
                     self.work_incoming.set(false);
