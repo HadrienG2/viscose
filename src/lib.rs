@@ -413,6 +413,12 @@ struct Worker<'pool> {
     /// Truth that there might still be work coming from other worker threads or
     /// from external thread pool clients.
     work_incoming: Cell<bool>,
+
+    /// Private copy of our "work available to steal" bit in the steal_flags
+    ///
+    /// This ensures we don't need to access any shared variable subjected to
+    /// concurrent access contention in the fast path.
+    work_available: Cell<bool>,
 }
 //
 impl<'pool> Worker<'pool> {
@@ -424,6 +430,7 @@ impl<'pool> Worker<'pool> {
             futex: &shared.workers[idx].futex,
             work_queue,
             work_incoming: Cell::new(true),
+            work_available: Cell::new(false),
         };
         worker.main();
     }
@@ -438,18 +445,23 @@ impl<'pool> Worker<'pool> {
     /// Single step of the main worker loop
     #[inline]
     fn step(&self, can_sleep: bool) {
-        // Process work from our private work queue
-        if let Some(task) = self.work_queue.pop() {
-            self.process_task(task);
-        } else {
-            // Signal that there's no work to steal from us for now
-            self.shared
-                .steal_flags
-                .fetch_clear(self.idx, Ordering::Relaxed);
-
-            // Look for work elsewhere using our trusty futex as a guide
-            self.look_for_work(can_sleep);
+        // If we have recorded work in our private work queue...
+        if self.work_available.get() {
+            // Process work from our private work queue, if still there
+            if let Some(task) = self.work_queue.pop() {
+                self.process_task(task);
+                return;
+            } else {
+                // Otherwise notify others that our work queue is now empty
+                self.shared
+                    .steal_flags
+                    .fetch_clear(self.idx, Ordering::Relaxed);
+                self.work_available.set(false);
+            }
         }
+
+        // Look for work elsewhere using our trusty futex as a guide
+        self.look_for_work(can_sleep);
     }
 
     /// Process one incoming task
@@ -649,13 +661,19 @@ impl<'scope> Scope<'scope> {
         // Schedule the work to be executed
         self.0.work_queue.push(job);
 
-        // Notify other workers that we have work available for stealing.
+        // ...and once this push is visible...
         atomic::fence(Ordering::Release);
+
+        // Tell the world that we now have work available to steal if that
+        // wasn't the case before...
         let shared = &self.0.shared;
         let me = self.0.idx;
-        if !shared.steal_flags.is_set(me, Ordering::Relaxed) {
+        if !self.0.work_available.get() {
+            self.0.work_available.set(true);
             shared.steal_flags.fetch_set(me, Ordering::Relaxed);
         }
+
+        // ...and personally notify the closest starving thread about it
         self.0.shared.recommend_steal(me, me as u32);
     }
 }
