@@ -219,16 +219,15 @@ struct SharedState {
     /// Per-worker truth that each worker _might_ have work ready to be stolen
     /// inside of its work queue
     ///
-    /// Set by the associated worker when pushing work, cleared by the worker
-    /// when it tries to pop work and the queue is empty. In an ideal world,
-    /// other workers could update it quicker by clearing it when they fail to
-    /// steal work, but this would race with the setting of the flag, and it's
-    /// better to have the flag set when it shouldn't be than to have it cleared
-    /// when it should be set.
+    /// Set by the associated worker upon pushing work, cleared by the worker
+    /// when it tries to pop work and the queue is empty. See note in the
+    /// work-stealing code to understand why it is preferrable that stealers do
+    /// not clear this flag upon observing an empty work queue.
     ///
     /// The flag is set with Release ordering, so if the readout of a set flag
-    /// is performed with Acquire ordering, the pushed work is observable.
-    steal_flags: AtomicFlags,
+    /// is performed with Acquire ordering or followed by an Acquire barrier,
+    /// the pushed work should be observable.
+    work_availability: AtomicFlags,
 }
 //
 impl SharedState {
@@ -249,7 +248,7 @@ impl SharedState {
         let result = Arc::new(Self {
             injector,
             workers: workers.into(),
-            steal_flags: AtomicFlags::new(num_workers),
+            work_availability: AtomicFlags::new(num_workers),
         });
         (result, work_queues.into())
     }
@@ -265,7 +264,7 @@ impl SharedState {
     fn recommend_steal(&self, local_worker: usize, task_location: u32) {
         // Iterate over increasingly remote job-less neighbors
         'search: for closest_asleep in self
-            .steal_flags
+            .work_availability
             .iter_unset_around(local_worker, Ordering::Relaxed)
         {
             // Update their futex recommendation as appropriate
@@ -414,10 +413,11 @@ struct Worker<'pool> {
     /// from external thread pool clients.
     work_incoming: Cell<bool>,
 
-    /// Private copy of our "work available to steal" bit in the steal_flags
+    /// Private copy of our bit in the shared work_availability flags
     ///
-    /// This ensures we don't need to access any shared variable subjected to
-    /// concurrent access contention in the fast path.
+    /// This ensures that in the happy path, we don't need to access any shared
+    /// variable subjected to concurrent access cache contention, besides the
+    /// state of our work queue.
     work_available: Cell<bool>,
 }
 //
@@ -454,7 +454,7 @@ impl<'pool> Worker<'pool> {
             } else {
                 // Otherwise notify others that our work queue is now empty
                 self.shared
-                    .steal_flags
+                    .work_availability
                     .fetch_clear(self.idx, Ordering::Relaxed);
                 self.work_available.set(false);
             }
@@ -531,6 +531,60 @@ impl<'pool> Worker<'pool> {
     ///
     /// Return truth that a task was successfully stolen and run.
     fn steal_from_worker(&self, idx: usize) -> bool {
+        // NOTE: It may seem that upon failure to steal, we should clear the
+        // corresponding work_availability flag to tell other workers that there
+        // is no work left to steal here. However, this would create an ABA
+        // problem : the worker from which we're trying to steal might have
+        // concurrently pushed new work, and then our assessment that there's no
+        // work to steal is outdated and should not be published to the world.
+        //
+        // We could try to resolve this ABA problem by modifying the
+        // work_available flags so that they contain not one bit per worker in
+        // an AtomicUsize word, but two : truth that there's work available to
+        // steal (work_available), and truth that new work has been pushed since
+        // our last failed work-stealing attempt (new_work). With this extra
+        // state, we could imagine the following synchronization protocol...
+        //
+        // Thief side steal algorithm:
+        //
+        // - Attempt to steal work, exit on success
+        // - On failure, clear new_work with fetch_and(Acquire)
+        // - Attempt to steal work again, exit on success
+        // - On failure, use compare_exchange_weak to tell if new_work is still
+        //   unset, and if so clear work_available too, with a complicated CAS
+        //   recovery procedure on failure.
+        //
+        // Worker side push algorithm:
+        //
+        // - Push work
+        // - Set new_work and work_available with fetch_or(Release).
+        //
+        // ...but going in this direction would have many serious drawbacks:
+        //
+        // - It would add the overhead of a RMW operation every time a worker
+        //   pushes work, even on the happy path where nobody is attempting to
+        //   steal any work from this worker.
+        //     * The worker can't avoid this overhead because no matter when it
+        //       last checked work_available, another thread might have cleared
+        //       it since, and only the worker can set it back.
+        // - I'm not convinced that this algorithm is robust in the presence of
+        //   multiple concurrent thieves and multiple worker pushes. Ensuring
+        //   correctness in this situation might require even more per-worker
+        //   state and an even more complex/costly synchronization protocol.
+        // - In any case, this would already massively complicate the
+        //   synchronization protocol, which increases the risk of subtle
+        //   concurrency bugs that can only be reproduced on weird hardware and
+        //   decreases future maintainablity of the codebase.
+        //
+        // The current approach where the worker is the only one that can clear
+        // the work_available flag instead ensures, with a relatively simple
+        // synchronization protocol that does not entail any shared memory
+        // operation on the worker happy path, that the work_available flag will
+        // _eventually_ be cleared next time the worker checks its work queue
+        // and figures out it's empty. There might be some useless work stealing
+        // while the worker finishes processing its current task, but it seems
+        // like a fair price to pay in exchange for a clean synchronization
+        // protocol and a cheap happy path when every worker stays fed.
         self.steal(|| self.shared.workers[idx].stealer.steal())
     }
 
@@ -549,7 +603,7 @@ impl<'pool> Worker<'pool> {
         // Try to steal from other workers at increasing distances
         for idx in self
             .shared
-            .steal_flags
+            .work_availability
             .iter_set_around(self.idx, Ordering::Acquire)
         {
             if self.steal_from_worker(idx) {
@@ -664,16 +718,16 @@ impl<'scope> Scope<'scope> {
         // ...and once this push is visible...
         atomic::fence(Ordering::Release);
 
-        // Tell the world that we now have work available to steal if that
-        // wasn't the case before...
+        // ...tell the world that we now have work available to steal if they
+        // didn't know about it before...
         let shared = &self.0.shared;
         let me = self.0.idx;
         if !self.0.work_available.get() {
             self.0.work_available.set(true);
-            shared.steal_flags.fetch_set(me, Ordering::Relaxed);
+            shared.work_availability.fetch_set(me, Ordering::Relaxed);
         }
 
-        // ...and personally notify the closest starving thread about it
+        // ...and notify the closest starving thread (if any) about it
         self.0.shared.recommend_steal(me, me as u32);
     }
 }
