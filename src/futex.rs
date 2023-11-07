@@ -144,7 +144,6 @@ impl WorkerFutex {
     ///
     /// Should have announced intent to sleep with prepare_wait() and
     /// busy-waited for a reasonable amount of time before calling this method.
-    #[inline]
     pub fn wait_for_change(
         &self,
         initial: WorkerFutexState,
@@ -211,6 +210,7 @@ impl WorkerFutex {
     ///
     /// Note that unlike `compare_exchange`, this returns the _updated_ futex
     /// state when the state has been successfully updated.
+    #[inline]
     pub fn suggest_steal(
         &self,
         proposed_location: StealLocation,
@@ -321,7 +321,6 @@ impl WorkerFutex {
     }
 
     /// Add an Acquire barrier to a user-specified ordering
-    #[inline]
     fn at_least_acquire(order: Ordering) -> Ordering {
         match order {
             Ordering::Relaxed | Ordering::Acquire => Ordering::Acquire,

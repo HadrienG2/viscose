@@ -47,7 +47,6 @@ impl AtomicFlags {
     }
 
     /// Check if the Nth flag is set with certain atomic ordering
-    #[inline]
     pub fn is_set(&self, bit_idx: usize, order: Ordering) -> bool {
         let (word, bit) = self.word_and_bit(bit_idx);
         word.load(order) & bit != 0
@@ -68,7 +67,6 @@ impl AtomicFlags {
     }
 
     /// Set all the flags
-    #[inline]
     pub fn set_all(&self, order: Ordering) {
         if order != Ordering::Relaxed {
             atomic::fence(order);
@@ -79,7 +77,6 @@ impl AtomicFlags {
     }
 
     /// Clear all the flags
-    #[inline]
     pub fn clear_all(&self, order: Ordering) {
         if order != Ordering::Relaxed {
             atomic::fence(order);
@@ -112,21 +109,18 @@ impl AtomicFlags {
     }
 
     /// Convert a global flag index into a (word, subword bit) pair
-    #[inline]
     fn word_and_bit(&self, bit_idx: usize) -> (&AtomicWord, Word) {
         let (word_idx, bit) = self.word_idx_and_bit(bit_idx);
         (&self.words[word_idx], bit)
     }
 
     /// Convert a global flag index into a (word idx, subword bit) pair
-    #[inline]
     fn word_idx_and_bit(&self, bit_idx: usize) -> (usize, Word) {
         let (word_idx, bit_shift) = self.word_idx_and_bit_shift(bit_idx);
         (word_idx, 1 << bit_shift)
     }
 
     /// Convert a global flag index into a (word idx, bit shift) pair
-    #[inline]
     fn word_idx_and_bit_shift(&self, bit_idx: usize) -> (usize, u32) {
         assert!(bit_idx < self.len, "requested flag is out of bounds");
         let word_idx = bit_idx / WORD_BITS;
@@ -135,7 +129,6 @@ impl AtomicFlags {
     }
 
     /// Iterate over the value of inner words
-    #[inline]
     fn words(
         &self,
         order: Ordering,

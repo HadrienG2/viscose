@@ -387,7 +387,6 @@ impl<'pool> Worker<'pool> {
     }
 
     /// Single step of the main worker loop
-    #[inline]
     fn step(&self) {
         // If we have recorded work in our private work queue...
         if self.work_available.get() {
@@ -412,7 +411,6 @@ impl<'pool> Worker<'pool> {
     }
 
     /// Process one incoming task
-    #[inline]
     fn process_task(&self, job: DynJob) {
         let scope = Scope::new(self);
         // SAFETY: All methods that push [`DynJob`]s into the thread pool ensure

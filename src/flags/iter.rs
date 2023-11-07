@@ -50,7 +50,6 @@ impl<'flags, const FIND_SET: bool, const INCLUDE_CENTER: bool> Iterator
 {
     type Item = usize;
 
-    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         // Yield the central index first
         if INCLUDE_CENTER && self.yield_center {
@@ -163,14 +162,12 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
 
     /// Move forward by N bits within the current word if there are that enough
     /// bits remaining, otherwise return None
-    #[inline]
     fn seek_in_word(&mut self, shift: u32) -> Option<()> {
         (shift < self.remaining_bits_in_word()).then(|| self.seek_in_word_unchecked(shift))
     }
 
     /// Move forward by N bits with the current word, assuming there are enough
     /// bits remaining for this operation to make sense
-    #[inline]
     fn seek_in_word_unchecked(&mut self, shift: u32) {
         debug_assert!(shift < self.remaining_bits_in_word());
         if GOING_LEFT {
@@ -184,7 +181,6 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
 
     /// Go to the next word that features the bit value of interest, if any,
     /// else record that we're at the end of iteration and return None.
-    #[inline]
     fn find_next_word(&mut self) -> Option<()> {
         // Find the first word featuring a set/unset bit, if any
         let words = self.flags.words(self.order).enumerate();
@@ -219,7 +215,6 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
     }
 
     /// Convert a word from AtomicFlags to normalized_remainder format
-    #[inline]
     fn normalize_word(mut word: Word, bit_shift: u32) -> Word {
         // Normalize word for iteration over set bits
         if !FIND_SET {
@@ -238,7 +233,6 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
     }
 
     /// Number of bits from the original word that haven't been processed yet
-    #[inline]
     fn remaining_bits_in_word(&self) -> u32 {
         debug_assert!(self.bit_shift < Word::BITS);
         if GOING_LEFT {
@@ -271,7 +265,6 @@ impl<const FIND_SET: bool, const GOING_LEFT: bool> Iterator
 {
     type Item = usize;
 
-    #[inline]
     fn next(&mut self) -> Option<usize> {
         let bit_idx = self.peek()?;
         self.find_next_bit();
