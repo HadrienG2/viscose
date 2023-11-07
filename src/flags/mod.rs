@@ -31,18 +31,21 @@ pub struct AtomicFlags {
 impl AtomicFlags {
     /// Create a set of N flags, initially all unset
     pub fn new(len: usize) -> Self {
-        let trailing_bits = len % WORD_BITS;
-        let end_bits_mask = if trailing_bits == 0 {
-            Word::MAX
-        } else {
-            (1 << trailing_bits) - 1
-        };
         Self {
             words: std::iter::repeat_with(|| AtomicWord::new(0))
                 .take(len.div_ceil(WORD_BITS))
                 .collect(),
-            end_bits_mask,
+            end_bits_mask: Self::end_bits_mask(len % WORD_BITS),
             len,
+        }
+    }
+
+    /// end_bits_mask for a given number of trailing bits
+    fn end_bits_mask(trailing_bits: usize) -> Word {
+        if trailing_bits == 0 {
+            Word::MAX
+        } else {
+            (1 << trailing_bits) - 1
         }
     }
 
@@ -189,7 +192,7 @@ impl Arbitrary for AtomicFlags {
             // Emit final flags
             Self {
                 words: words.into_boxed_slice(),
-                end_bits_mask: (1 << current_bit) - 1,
+                end_bits_mask: AtomicFlags::end_bits_mask(current_bit),
                 len,
             }
         })
