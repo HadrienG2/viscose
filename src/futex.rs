@@ -7,6 +7,7 @@ use proptest::{
 };
 use std::{
     debug_assert, debug_assert_eq, debug_assert_ne,
+    fmt::{self, Debug},
     sync::atomic::{self, AtomicU32, Ordering},
 };
 #[cfg(test)]
@@ -24,7 +25,6 @@ use std::{ops::Range, sync::Arc};
 /// - Truth that the worker is asleep due to lack of work (in which case threads
 ///   which submit new info to the worker using this futex should wake it up
 ///   with atomic_wait::wake_all), or that it is going to fall asleep ("sleepy")
-#[derive(Debug)]
 pub(crate) struct WorkerFutex(AtomicU32);
 //
 impl WorkerFutex {
@@ -34,12 +34,12 @@ impl WorkerFutex {
     pub const MAX_WORKERS: usize = RAW_LOCATION_NUM_NORMAL as usize;
 
     /// Set up a worker futex
-    pub fn new() -> Self {
-        Self::with_state(WorkerFutexState::default())
+    pub const fn new() -> Self {
+        Self::with_state(WorkerFutexState::INITIAL)
     }
 
     /// Set up a worker futex with a custom initial state
-    fn with_state(state: WorkerFutexState) -> Self {
+    const fn with_state(state: WorkerFutexState) -> Self {
         Self(AtomicU32::new(state.to_raw()))
     }
 
@@ -47,9 +47,14 @@ impl WorkerFutex {
 
     /// Read out the current futex state
     pub fn load(&self, order: Ordering) -> WorkerFutexState {
-        let result = WorkerFutexState::from_raw(self.0.load(order));
+        let result = self.load_unchecked(order);
         debug_assert!(!result.sleeping);
         result
+    }
+
+    /// Load without state validity checks
+    fn load_unchecked(&self, order: Ordering) -> WorkerFutexState {
+        WorkerFutexState::from_raw(self.0.load(order))
     }
 
     /// Clear steal location after it becomes outdated, fail if the steal
@@ -203,6 +208,7 @@ impl WorkerFutex {
     ) -> bool {
         // Need Acquire ordering on success so that the action of updating the
         // location cannot be reordered after that of waking up the worker
+        debug_assert!(worker_idx < Self::MAX_WORKERS);
         let update = Self::at_least_acquire(update);
 
         // Update the stealing location if our proposal is better
@@ -288,7 +294,7 @@ impl WorkerFutex {
     fn wake_if_asleep(&self, old_raw: RawWorkerFutexState) {
         if old_raw & FUTEX_BIT_SLEEPING != 0 {
             debug_assert_eq!(old_raw & RAW_LOCATION_MASK, RAW_LOCATION_NONE);
-            debug_assert_ne!(old_raw & (FUTEX_BIT_SLEEPY | FUTEX_BIT_WORK_INCOMING), 0);
+            debug_assert_ne!(old_raw & (FUTEX_BIT_WORK_INCOMING | FUTEX_BIT_SLEEPY), 0);
             atomic_wait::wake_all(&self.0)
         }
     }
@@ -314,6 +320,18 @@ impl Arbitrary for WorkerFutex {
         <WorkerFutexState as Arbitrary>::arbitrary_with(args).prop_map(Self::with_state)
     }
 }
+//
+impl Debug for WorkerFutex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.load_unchecked(Ordering::Relaxed);
+        let s = if f.alternate() {
+            format!("WorkerFutex({state:#?})")
+        } else {
+            format!("WorkerFutex({state:?})")
+        };
+        f.pad(&s)
+    }
+}
 
 /// Current worker futex state
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -321,66 +339,74 @@ pub(crate) struct WorkerFutexState {
     /// Location from which this worker is recommended to steal
     steal_location: Option<StealLocation>,
 
+    /// Truth that the thread pool is reachable and may receive more work
+    work_incoming: bool,
+
     /// Truth that the worker announced intent to go to sleep
     sleepy: bool,
 
     /// Truth that the worker is sleeping
     sleeping: bool,
-
-    /// Truth that the thread pool is reachable and may receive more work
-    work_incoming: bool,
 }
 //
 impl WorkerFutexState {
+    /// Initial worker futex state
+    const INITIAL: WorkerFutexState = WorkerFutexState {
+        steal_location: None,
+        work_incoming: true,
+        sleepy: false,
+        sleeping: false,
+    };
+
     /// Location that this thread is recommended stealing from
-    pub(crate) fn location(&self) -> Option<StealLocation> {
+    pub(crate) const fn steal_location(&self) -> Option<StealLocation> {
         self.steal_location
     }
 
     /// Truth that the thread pool is reachable and may receive more work
     ///
     /// Once this has become `false`, it can never become `true` again.
-    pub(crate) fn work_incoming(&self) -> bool {
+    pub(crate) const fn work_incoming(&self) -> bool {
         self.work_incoming
     }
 
     /// Decode the raw state from the futex data
-    fn from_raw(raw: RawWorkerFutexState) -> Self {
+    const fn from_raw(raw: RawWorkerFutexState) -> Self {
+        let raw_location = raw & RAW_LOCATION_MASK;
+        let steal_location = StealLocation::from_raw(raw_location);
         let work_incoming = raw & FUTEX_BIT_WORK_INCOMING != 0;
         let sleepy = raw & FUTEX_BIT_SLEEPY != 0;
         let sleeping = raw & FUTEX_BIT_SLEEPING != 0;
-        let raw_location = raw & RAW_LOCATION_MASK;
-        let steal_location = StealLocation::from_raw(raw_location);
         let result = Self {
             steal_location,
+            work_incoming,
             sleeping,
             sleepy,
-            work_incoming,
         };
         result.debug_check_state();
         result
     }
 
     /// Convert back to raw futex data
-    fn to_raw(self) -> RawWorkerFutexState {
+    const fn to_raw(self) -> RawWorkerFutexState {
         self.debug_check_state();
         let mut raw = StealLocation::to_raw(self.steal_location);
+        if self.work_incoming {
+            raw |= FUTEX_BIT_WORK_INCOMING;
+        }
         if self.sleepy {
             raw |= FUTEX_BIT_SLEEPY
         }
         if self.sleeping {
             raw |= FUTEX_BIT_SLEEPING;
         }
-        if self.work_incoming {
-            raw |= FUTEX_BIT_WORK_INCOMING;
-        }
         raw
     }
 
     /// Check that current futex state makes sense in debug builds
-    fn debug_check_state(&self) {
+    const fn debug_check_state(&self) {
         if self.sleepy {
-            debug_assert_eq!(self.steal_location, None);
+            debug_assert!(self.steal_location.is_none());
             debug_assert!(self.work_incoming);
         }
         if self.sleeping {
@@ -392,36 +418,52 @@ impl WorkerFutexState {
 #[cfg(test)]
 impl Arbitrary for WorkerFutexState {
     type Parameters = <Option<StealLocation> as Arbitrary>::Parameters;
-    type Strategy = Map<
+    type Strategy = TupleUnion<(
         (
-            <Option<StealLocation> as Arbitrary>::Strategy,
-            <[bool; 3] as Arbitrary>::Strategy,
+            u32,
+            Arc<
+                Map<
+                    (
+                        <Option<StealLocation> as Arbitrary>::Strategy,
+                        <bool as Arbitrary>::Strategy,
+                    ),
+                    fn((Option<StealLocation>, bool)) -> Self,
+                >,
+            >,
         ),
-        fn((Option<StealLocation>, [bool; 3])) -> Self,
-    >;
+        (
+            u32,
+            Arc<Map<<bool as Arbitrary>::Strategy, fn(bool) -> Self>>,
+        ),
+    )>;
 
     fn arbitrary_with(args: Self::Parameters) -> Self::Strategy {
-        (
-            <Option<StealLocation> as Arbitrary>::arbitrary_with(args),
-            any::<[bool; 3]>(),
-        )
-            .prop_map(|(steal_location, [sleepy, sleeping, work_incoming])| Self {
-                steal_location,
-                sleepy,
+        prop_oneof![
+            // Non-sleepy state may have arbitrary recommended stealing
+            // location, no more work incoming
+            4 => (<Option<StealLocation> as Arbitrary>::arbitrary_with(args), any::<bool>())
+                .prop_map(|(steal_location, work_incoming)| Self {
+                    steal_location,
+                    work_incoming,
+                    sleepy: false,
+                    sleeping: false,
+                }),
+            // Worker may only become sleepy when there is no recommended
+            // stealing location and work might still be incoming, and worker
+            // may only start to sleep after becoming sleepy
+            1 => any::<bool>().prop_map(|sleeping| Self {
+                steal_location: None,
+                work_incoming: true,
+                sleepy: true,
                 sleeping,
-                work_incoming,
             })
+        ]
     }
 }
 //
 impl Default for WorkerFutexState {
     fn default() -> Self {
-        Self {
-            steal_location: None,
-            sleepy: false,
-            sleeping: false,
-            work_incoming: true,
-        }
+        Self::INITIAL
     }
 }
 
@@ -437,20 +479,23 @@ pub(crate) enum StealLocation {
 //
 impl StealLocation {
     /// Translate a raw location from the futex to a high-level location
-    fn from_raw(raw: RawStealLocation) -> Option<Self> {
+    const fn from_raw(raw: RawStealLocation) -> Option<Self> {
         match raw {
             RAW_LOCATION_NONE => None,
             RAW_LOCATION_INJECTOR => Some(StealLocation::Injector),
-            worker_idx => Some(StealLocation::Worker(usize::try_from(worker_idx).unwrap())),
+            worker_idx => {
+                assert!(worker_idx < RAW_LOCATION_NUM_NORMAL);
+                Some(StealLocation::Worker(worker_idx as usize))
+            }
         }
     }
 
     /// Translate a high-level location back into a raw location for the futex
-    fn to_raw(opt: Option<Self>) -> RawStealLocation {
+    const fn to_raw(opt: Option<Self>) -> RawStealLocation {
         match opt {
             Some(StealLocation::Worker(worker_idx)) => {
                 assert!(worker_idx < WorkerFutex::MAX_WORKERS);
-                u32::try_from(worker_idx).unwrap()
+                worker_idx as RawStealLocation
             }
             Some(StealLocation::Injector) => RAW_LOCATION_INJECTOR,
             None => RAW_LOCATION_NONE,
@@ -460,6 +505,7 @@ impl StealLocation {
     /// Truth that this location is closer to a specific worker thread than
     /// another location
     fn is_closer(self, other: StealLocation, worker_idx: usize) -> bool {
+        debug_assert!(worker_idx < WorkerFutex::MAX_WORKERS);
         match (self, other) {
             (Self::Worker(self_idx), Self::Worker(other_idx)) => {
                 self_idx.abs_diff(worker_idx) < other_idx.abs_diff(worker_idx)
@@ -523,88 +569,386 @@ const RAW_LOCATION_NUM_NORMAL: RawStealLocation = RAW_LOCATION_INJECTOR;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        fmt::Debug,
+        sync::{atomic::AtomicBool, Barrier},
+        time::Duration,
+    };
 
-    // Atomic ordering suitable for load operations
+    /// Atomic ordering suitable for load operations
     fn load_order() -> impl Strategy<Value = Ordering> {
         prop::sample::select(&[Ordering::Relaxed, Ordering::Acquire, Ordering::SeqCst][..])
-    }
-
-    // Atomic ordering suitable for read-modify-write operations
-    fn rmw_order() -> impl Strategy<Value = Ordering> {
-        any::<Ordering>()
     }
 
     proptest! {
         #[test]
         fn new(load_order in load_order()) {
             let futex = WorkerFutex::new();
+            assert_eq!(futex.load_unchecked(load_order), WorkerFutexState::default());
             assert_eq!(futex.load(load_order), WorkerFutexState::default());
         }
 
         #[test]
         fn with_state(state: WorkerFutexState, load_order in load_order()) {
             let futex = WorkerFutex::with_state(state);
-            assert_eq!(futex.load(load_order), state);
-        }
-
-        #[test]
-        fn clear_outdated_location_success(
-            futex: WorkerFutex,
-            load_order in load_order(),
-            success_order in rmw_order(),
-            failure_order in load_order()
-        ) {
-            let current = futex.load(load_order);
-            if can_clear_outdated_location(current) {
-                check_clear_outdated_location_success(futex, load_order, success_order, failure_order);
+            assert_eq!(futex.load_unchecked(load_order), state);
+            if !state.sleeping {
+                assert_eq!(futex.load(load_order), state);
             }
         }
+    }
 
-        #[test]
-        fn clear_outdated_location(
-            futex: WorkerFutex,
-            expected: WorkerFutexState,
-            load_order in load_order(),
-            success_order in rmw_order(),
-            failure_order in load_order()
-        ) {
-            let current = futex.load(load_order);
-            if can_clear_outdated_location(current) {
-                if expected == current {
-                    check_clear_outdated_location_success(futex, load_order, success_order, failure_order);
-                } else {
-                    assert_eq!(
-                        futex.clear_outdated_location(expected, success_order, failure_order),
-                        Err(current)
-                    );
-                    assert_eq!(futex.load(load_order), current);
-                }
+    /// Transform a Strategy for WorkerFutexState into one for WorkerFutex
+    fn futex_with_state(
+        state_strategy: impl Strategy<Value = WorkerFutexState>,
+    ) -> impl Strategy<Value = WorkerFutex> {
+        state_strategy.prop_map(WorkerFutex::with_state)
+    }
+
+    /// Atomic ordering suitable for read-modify-write operations
+    fn rmw_order() -> impl Strategy<Value = Ordering> {
+        any::<Ordering>()
+    }
+
+    /// Futex state where steal_location is always set
+    fn state_with_location() -> impl Strategy<Value = WorkerFutexState> {
+        any::<(StealLocation, bool)>().prop_map(|(steal_location, work_incoming)| {
+            WorkerFutexState {
+                steal_location: Some(steal_location),
+                work_incoming,
+                sleepy: false,
+                sleeping: false,
             }
-        }
-
-        // TODO: Test other methods
+        })
     }
 
-    fn can_clear_outdated_location(state: WorkerFutexState) -> bool {
-        state.location().is_some() & !(state.sleepy & state.sleeping)
-    }
-
-    fn check_clear_outdated_location_success(
-        futex: WorkerFutex,
-        load_order: Ordering,
-        success_order: Ordering,
-        failure_order: Ordering,
-    ) {
-        let current = futex.load(load_order);
-        assert!(can_clear_outdated_location(current));
+    /// Check that clear_outdated_location does clear the steal_location,
+    /// assuming there is one steal_location set initially.
+    fn check_clear_location_success(futex: WorkerFutex, update: Ordering, load: Ordering) {
+        let current = futex.load(Ordering::Relaxed);
+        assert!(current.steal_location.is_some() && !(current.sleepy | current.sleeping));
         let expected_out = WorkerFutexState {
             steal_location: None,
             ..current
         };
         assert_eq!(
-            futex.clear_outdated_location(current, success_order, failure_order),
+            futex.clear_outdated_location(current, update, load),
             Ok(expected_out)
         );
-        assert_eq!(futex.load(load_order), expected_out);
+        assert_eq!(futex.load(Ordering::Relaxed), expected_out);
+    }
+
+    proptest! {
+        #[test]
+        fn clear_location_success(
+            futex in futex_with_state(state_with_location()),
+            update in rmw_order(),
+            load in load_order()
+        ) {
+            check_clear_location_success(futex, update, load);
+        }
+
+        #[test]
+        fn clear_location(
+            futex in futex_with_state(state_with_location()),
+            expected in state_with_location(),
+            update in rmw_order(),
+            load in load_order()
+        ) {
+            let current = futex.load(Ordering::Relaxed);
+            if expected.steal_location == current.steal_location {
+                check_clear_location_success(futex, update, load);
+            } else {
+                assert_eq!(
+                    futex.clear_outdated_location(expected, update, load),
+                    Err(current)
+                );
+                assert_eq!(futex.load(Ordering::Relaxed), current);
+            }
+        }
+    }
+
+    /// Only valid futex state from which sleepy flag can be set
+    const FUTURE_SLEEPY_STATE: WorkerFutexState = WorkerFutexState {
+        steal_location: None,
+        work_incoming: true,
+        sleepy: false,
+        sleeping: false,
+    };
+
+    /// Only valid futex state with sleepy flag set
+    const SLEEPY_STATE: WorkerFutexState = WorkerFutexState {
+        steal_location: None,
+        work_incoming: true,
+        sleepy: true,
+        sleeping: false,
+    };
+
+    /// Futex state where work_incoming is false
+    fn done_state() -> impl Strategy<Value = WorkerFutexState> {
+        any::<Option<StealLocation>>().prop_map(|steal_location| WorkerFutexState {
+            steal_location,
+            work_incoming: false,
+            sleepy: false,
+            sleeping: false,
+        })
+    }
+
+    /// Futex state that can't transition to the sleepy state
+    fn sleepless_state() -> impl Strategy<Value = WorkerFutexState> {
+        prop_oneof![
+            4 => state_with_location(),
+            1 => done_state(),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn sleepy_success(
+            update in rmw_order(),
+            load in load_order(),
+        ) {
+            let futex = WorkerFutex::with_state(FUTURE_SLEEPY_STATE);
+            assert_eq!(futex.notify_sleepy(FUTURE_SLEEPY_STATE, update, load), Ok(SLEEPY_STATE));
+            assert_eq!(futex.load(Ordering::Relaxed), SLEEPY_STATE);
+        }
+
+        #[test]
+        fn sleepy_failure(
+            futex in futex_with_state(sleepless_state()),
+            update in rmw_order(),
+            load in load_order(),
+        ) {
+            let current = futex.load(Ordering::Relaxed);
+            assert_eq!(
+                futex.notify_sleepy(FUTURE_SLEEPY_STATE, update, load),
+                Err(current)
+            );
+            assert_eq!(futex.load(Ordering::Relaxed), current);
+        }
+    }
+
+    /// Arbitrary non-sleeping and non-sleepy state
+    fn wakeup_state() -> impl Strategy<Value = WorkerFutexState> {
+        prop_oneof![
+            2 => state_with_location(),
+            1 => done_state(),
+            1 => Just(FUTURE_SLEEPY_STATE),
+        ]
+    }
+
+    /// Only currently allowed sleeping futex state
+    const SLEEPING_STATE: WorkerFutexState = WorkerFutexState {
+        steal_location: None,
+        work_incoming: true,
+        sleepy: true,
+        sleeping: true,
+    };
+
+    /// Reasonable delay to wait for threads to go to sleep
+    const WAIT_FOR_SLEEP: Duration = Duration::from_millis(100);
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 5, .. ProptestConfig::default()
+        })]
+        #[test]
+        fn wait_for_change(
+            final_state in wakeup_state(),
+            sleep in rmw_order(),
+            wake in load_order(),
+        ) {
+            let futex = WorkerFutex::with_state(SLEEPY_STATE);
+            let done_waiting = AtomicBool::new(false);
+            let barrier = Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let new_state = futex.wait_for_change(SLEEPY_STATE, sleep, wake);
+                    done_waiting.store(true, Ordering::Release);
+                    barrier.wait();
+                    assert_eq!(new_state, final_state);
+                    assert_eq!(futex.load(Ordering::Relaxed), final_state);
+                });
+
+                std::thread::sleep(WAIT_FOR_SLEEP);
+                assert!(!done_waiting.load(Ordering::Relaxed));
+                assert_eq!(futex.load_unchecked(Ordering::Relaxed), SLEEPING_STATE);
+
+                futex.0.store(final_state.to_raw(), Ordering::Release);
+                atomic_wait::wake_all(&futex.0);
+                barrier.wait();
+            });
+        }
+
+        #[test]
+        fn location_is_closer(
+            location1: StealLocation,
+            location2: StealLocation,
+            worker_idx in  0..WorkerFutex::MAX_WORKERS,
+        ) {
+            let assert_location1_closer = || {
+                assert!(location1.is_closer(location2, worker_idx));
+                assert!(!location2.is_closer(location1, worker_idx));
+            };
+            let assert_location2_closer = || {
+                assert!(!location1.is_closer(location2, worker_idx));
+                assert!(location2.is_closer(location1, worker_idx));
+            };
+            let assert_distance_equal = || {
+                assert!(!location1.is_closer(location2, worker_idx));
+                assert!(!location2.is_closer(location1, worker_idx));
+            };
+            match (location1, location2) {
+                (StealLocation::Worker(_), StealLocation::Injector) => {
+                    assert_location1_closer();
+                }
+                (StealLocation::Injector, StealLocation::Injector) => {
+                    assert_distance_equal();
+                }
+                (StealLocation::Injector, StealLocation::Worker(_)) => {
+                    assert_location2_closer();
+                }
+                (StealLocation::Worker(idx1), StealLocation::Worker(idx2)) => {
+                    let distance1 = worker_idx.abs_diff(idx1);
+                    let distance2 = worker_idx.abs_diff(idx2);
+                    match distance1.cmp(&distance2) {
+                        std::cmp::Ordering::Less => assert_location1_closer(),
+                        std::cmp::Ordering::Equal => assert_distance_equal(),
+                        std::cmp::Ordering::Greater => assert_location2_closer(),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Test that an operation that should wake up a thread waiting on the futex
+    /// does do so, and otherwise meets expectations
+    fn test_waking_op<R: Debug + Eq>(
+        futex: WorkerFutex,
+        operation: impl FnOnce(&WorkerFutex) -> R,
+        expected_result: R,
+        expected_state_change: impl FnOnce(WorkerFutexState) -> WorkerFutexState + Send,
+    ) {
+        let initial = futex.load_unchecked(Ordering::Relaxed);
+        let start = Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                start.wait();
+                let mut current = futex.load_unchecked(Ordering::Relaxed);
+                if initial.sleeping {
+                    let initial_raw = initial.to_raw();
+                    while current == initial {
+                        atomic_wait::wait(&futex.0, initial_raw);
+                        current = WorkerFutexState::from_raw(futex.0.fetch_or(0, Ordering::AcqRel));
+                    }
+                }
+
+                let expected = expected_state_change(initial);
+                assert!(!(expected.sleepy | expected.sleeping));
+                assert_eq!(current, expected);
+                assert_eq!(futex.load(Ordering::Relaxed), expected);
+            });
+
+            if initial.sleeping {
+                start.wait();
+                std::thread::sleep(WAIT_FOR_SLEEP);
+                assert_eq!(operation(&futex), expected_result);
+            } else {
+                assert_eq!(operation(&futex), expected_result);
+                start.wait();
+            }
+        });
+    }
+
+    proptest! {
+        #[test]
+        fn suggest_steal(
+            futex: WorkerFutex,
+            proposed_location: StealLocation,
+            worker_idx in 0..WorkerFutex::MAX_WORKERS,
+            update in rmw_order(),
+            load in load_order(),
+        ) {
+            let initial = futex.load_unchecked(Ordering::Relaxed);
+
+            let closer = match initial.steal_location {
+                Some(initial_location) => proposed_location.is_closer(initial_location, worker_idx),
+                None => true,
+            };
+            let suggest = |futex: &WorkerFutex| futex.suggest_steal(proposed_location, worker_idx, update, load);
+            if !closer {
+                assert!(!suggest(&futex));
+                assert_eq!(futex.load_unchecked(Ordering::Relaxed), initial);
+                return Ok(());
+            }
+
+            test_waking_op(
+                futex,
+                suggest,
+                true,
+                |initial| WorkerFutexState {
+                    steal_location: Some(proposed_location),
+                    sleepy: false,
+                    sleeping: false,
+                    ..initial
+                }
+            );
+        }
+
+        #[test]
+        fn wake(
+            futex: WorkerFutex,
+            order in rmw_order(),
+        ) {
+            test_waking_op(
+                futex,
+                |futex| futex.wake(order),
+                (),
+                |initial| WorkerFutexState {
+                    sleepy: false,
+                    sleeping: false,
+                    ..initial
+                }
+            );
+        }
+    }
+
+    /// Futex state where work_incoming is always true
+    fn live_pool_state() -> impl Strategy<Value = WorkerFutexState> {
+        prop_oneof![
+            4 => any::<Option<StealLocation>>()
+                .prop_map(|steal_location| WorkerFutexState {
+                    steal_location,
+                    work_incoming: true,
+                    sleepy: false,
+                    sleeping: false,
+                }),
+            1 => any::<bool>().prop_map(|sleeping| WorkerFutexState {
+                steal_location: None,
+                work_incoming: true,
+                sleepy: true,
+                sleeping,
+            })
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn notify_shutdown(
+            futex in futex_with_state(live_pool_state()),
+            order in rmw_order(),
+        ) {
+            test_waking_op(
+                futex,
+                |futex| futex.notify_shutdown(order),
+                (),
+                |initial| WorkerFutexState {
+                    work_incoming: false,
+                    sleepy: false,
+                    sleeping: false,
+                    ..initial
+                }
+            );
+        }
     }
 }
