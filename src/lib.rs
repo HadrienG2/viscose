@@ -184,8 +184,11 @@ impl FlatPool {
         // Find the nearest available thread and recommend it to process this
         //
         // Need Release ordering to make sure they see the pushed work
-        self.shared
-            .recommend_steal(best_worker_idx, StealLocation::Injector, Ordering::Release);
+        self.shared.recommend_steal::<true>(
+            best_worker_idx,
+            StealLocation::Injector,
+            Ordering::Release,
+        );
     }
 }
 //
@@ -283,13 +286,18 @@ impl SharedState {
     /// `task_location` must not be `WORK_OVER` nor `WORK_NOWHERE`, since these
     /// are not actual task locations. The code will panic upon encountering.
     /// these location values.
-    fn recommend_steal(&self, local_worker: usize, task_location: StealLocation, update: Ordering) {
+    fn recommend_steal<const INCLUDE_CENTER: bool>(
+        &self,
+        local_worker: usize,
+        task_location: StealLocation,
+        update: Ordering,
+    ) {
         // Iterate over increasingly remote job-less neighbors
         //
         // Need Acquire ordering so the futex is read after the status flag
         for closest_asleep in self
             .work_availability
-            .iter_unset_around(local_worker, Ordering::Acquire)
+            .iter_unset_around::<INCLUDE_CENTER>(local_worker, Ordering::Acquire)
         {
             // Update their futex recommendation as appropriate
             let accepted = self.workers[closest_asleep].futex.suggest_steal(
@@ -583,7 +591,7 @@ impl<'pool> Worker<'pool> {
         for idx in self
             .shared
             .work_availability
-            .iter_set_around(self.idx, Ordering::Acquire)
+            .iter_set_around::<false>(self.idx, Ordering::Acquire)
         {
             if self.steal_from_worker(idx) {
                 return Some(StealLocation::Worker(idx));
@@ -711,7 +719,7 @@ impl<'scope> Scope<'scope> {
         // ...and personally notify the closest starving thread about it
         self.0
             .shared
-            .recommend_steal(me, StealLocation::Worker(me), Ordering::Relaxed);
+            .recommend_steal::<false>(me, StealLocation::Worker(me), Ordering::Relaxed);
     }
 }
 //

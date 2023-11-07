@@ -70,16 +70,58 @@ fn bench_flags(c: &mut Criterion) {
         bench_iterator(
             c,
             &flags,
-            &format!("{header}/iter_set_around"),
-            |flags, pos| flags.iter_set_around(pos, Ordering::Relaxed).next(),
-            |flags, pos| flags.iter_set_around(pos, Ordering::Relaxed).count(),
+            &format!("{header}/iter_set_around/inclusive"),
+            |flags, pos| flags.iter_set_around::<true>(pos, Ordering::Relaxed).next(),
+            |flags, pos| {
+                flags
+                    .iter_set_around::<true>(pos, Ordering::Relaxed)
+                    .count()
+            },
         );
         bench_iterator(
             c,
             &flags,
-            &format!("{header}/iter_unset_around"),
-            |flags, pos| flags.iter_unset_around(pos, Ordering::Relaxed).next(),
-            |flags, pos| flags.iter_unset_around(pos, Ordering::Relaxed).count(),
+            &format!("{header}/iter_set_around/exclusive"),
+            |flags, pos| {
+                flags
+                    .iter_set_around::<false>(pos, Ordering::Relaxed)
+                    .next()
+            },
+            |flags, pos| {
+                flags
+                    .iter_set_around::<false>(pos, Ordering::Relaxed)
+                    .count()
+            },
+        );
+        bench_iterator(
+            c,
+            &flags,
+            &format!("{header}/iter_unset_around/inclusive"),
+            |flags, pos| {
+                flags
+                    .iter_unset_around::<true>(pos, Ordering::Relaxed)
+                    .next()
+            },
+            |flags, pos| {
+                flags
+                    .iter_unset_around::<true>(pos, Ordering::Relaxed)
+                    .count()
+            },
+        );
+        bench_iterator(
+            c,
+            &flags,
+            &format!("{header}/iter_unset_around/exclusive"),
+            |flags, pos| {
+                flags
+                    .iter_unset_around::<false>(pos, Ordering::Relaxed)
+                    .next()
+            },
+            |flags, pos| {
+                flags
+                    .iter_unset_around::<false>(pos, Ordering::Relaxed)
+                    .count()
+            },
         );
     }
 }

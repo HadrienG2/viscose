@@ -94,23 +94,21 @@ impl AtomicFlags {
     ///
     /// The underlying words are read with the specified ordering, but beware
     /// that not every bit readout requires a word readout.
-    #[inline]
-    pub fn iter_set_around(
+    pub fn iter_set_around<const INCLUDE_CENTER: bool>(
         &self,
         center_bit_idx: usize,
         order: Ordering,
     ) -> impl Iterator<Item = usize> + '_ {
-        iter::NearestFlagIterator::<true>::new(self, center_bit_idx, order)
+        iter::NearestFlagIterator::<true, INCLUDE_CENTER>::new(self, center_bit_idx, order)
     }
 
     /// Like iter_set_around, but for unset flags
-    #[inline]
-    pub fn iter_unset_around(
+    pub fn iter_unset_around<const INCLUDE_CENTER: bool>(
         &self,
         center_bit_idx: usize,
         order: Ordering,
     ) -> impl Iterator<Item = usize> + '_ {
-        iter::NearestFlagIterator::<false>::new(self, center_bit_idx, order)
+        iter::NearestFlagIterator::<false, INCLUDE_CENTER>::new(self, center_bit_idx, order)
     }
 
     /// Convert a global flag index into a (word, subword bit) pair

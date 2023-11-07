@@ -4,54 +4,57 @@ use super::{AtomicFlags, Word, WORD_BITS};
 use std::{
     debug_assert,
     fmt::{self, Debug},
-    iter::{FusedIterator, Peekable},
+    iter::FusedIterator,
     sync::atomic::Ordering,
 };
 
 /// Iterator over the position of set/unset bits at increasing distances from a
 /// certain central point
 #[derive(Debug, Clone)]
-pub(crate) struct NearestFlagIterator<'flags, const FIND_SET: bool> {
+pub(crate) struct NearestFlagIterator<'flags, const FIND_SET: bool, const INCLUDE_CENTER: bool> {
     /// Iterator going towards higher-order bits via left shifts
-    left_indices: Peekable<FlagIdxIterator<'flags, FIND_SET, true>>,
+    left_indices: FlagIdxIterator<'flags, FIND_SET, true>,
 
     /// Center bit position
     center_bit_idx: usize,
 
     /// Truth that center_bit_idx must be yielded and hasn't been yielded yet
-    must_yield_center: bool,
+    yield_center: bool,
 
     /// Iterator going towards lower-order bits via right shifts
-    right_indices: Peekable<FlagIdxIterator<'flags, FIND_SET, false>>,
+    right_indices: FlagIdxIterator<'flags, FIND_SET, false>,
 }
 //
-impl<'flags, const FIND_SET: bool> NearestFlagIterator<'flags, FIND_SET> {
+impl<'flags, const FIND_SET: bool, const INCLUDE_CENTER: bool>
+    NearestFlagIterator<'flags, FIND_SET, INCLUDE_CENTER>
+{
     /// Start iterating over set/uset bits around a central position
     #[inline(always)]
     pub(crate) fn new(flags: &'flags AtomicFlags, center_bit_idx: usize, order: Ordering) -> Self {
         let left_indices =
-            FlagIdxIterator::<'flags, FIND_SET, true>::new(flags, center_bit_idx, order).peekable();
+            FlagIdxIterator::<'flags, FIND_SET, true>::new(flags, center_bit_idx, order);
         let right_indices =
-            FlagIdxIterator::<'flags, FIND_SET, false>::new(flags, center_bit_idx, order)
-                .peekable();
-        let must_yield_center = flags.is_set(center_bit_idx, order) == FIND_SET;
+            FlagIdxIterator::<'flags, FIND_SET, false>::new(flags, center_bit_idx, order);
+        let yield_center = INCLUDE_CENTER && (flags.is_set(center_bit_idx, order) == FIND_SET);
         Self {
             left_indices,
-            center_bit_idx,
-            must_yield_center,
+            center_bit_idx: (INCLUDE_CENTER as usize) * center_bit_idx,
+            yield_center,
             right_indices,
         }
     }
 }
 //
-impl<'flags, const FIND_SET: bool> Iterator for NearestFlagIterator<'flags, FIND_SET> {
+impl<'flags, const FIND_SET: bool, const INCLUDE_CENTER: bool> Iterator
+    for NearestFlagIterator<'flags, FIND_SET, INCLUDE_CENTER>
+{
     type Item = usize;
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         // Yield the central index first
-        if self.must_yield_center {
-            self.must_yield_center = false;
+        if INCLUDE_CENTER && self.yield_center {
+            self.yield_center = false;
             return Some(self.center_bit_idx);
         }
 
@@ -71,7 +74,10 @@ impl<'flags, const FIND_SET: bool> Iterator for NearestFlagIterator<'flags, FIND
     }
 }
 //
-impl<const FIND_SET: bool> FusedIterator for NearestFlagIterator<'_, FIND_SET> {}
+impl<const FIND_SET: bool, const INCLUDE_CENTER: bool> FusedIterator
+    for NearestFlagIterator<'_, FIND_SET, INCLUDE_CENTER>
+{
+}
 
 /// Iterator over the position of set/unset bits in a specific direction
 ///
@@ -110,7 +116,7 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
     /// Start iteration
     ///
     /// The bit at initial position `after_bit_idx` will not be emitted.
-    #[inline]
+    #[inline(always)]
     pub fn new(flags: &'flags AtomicFlags, after_bit_idx: usize, order: Ordering) -> Self {
         let (word_idx, bit_shift) = flags.word_idx_and_bit_shift(after_bit_idx);
         let word = flags.words[word_idx].load(order);
@@ -126,6 +132,12 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
         result
     }
 
+    /// Peek next iterator element without advancing the iterator
+    pub fn peek(&self) -> Option<usize> {
+        let bit_idx = self.word_idx * WORD_BITS + self.bit_shift as usize;
+        (bit_idx < self.flags.len).then_some(bit_idx)
+    }
+
     /// Go to the next occurence of the bit value of interest in the flags, or
     /// to the end of iteration.
     #[inline(always)]
@@ -139,7 +151,6 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
     }
 
     /// Seek active word to the bit value of interest or return None
-    #[inline]
     fn find_bit_in_word(&mut self) -> Option<()> {
         let shift = if GOING_LEFT {
             self.normalized_remainder.trailing_zeros()
@@ -262,13 +273,7 @@ impl<const FIND_SET: bool, const GOING_LEFT: bool> Iterator
 
     #[inline]
     fn next(&mut self) -> Option<usize> {
-        // At the start of next(), either we've reached the end of iteration...
-        let bit_idx = self.word_idx * WORD_BITS + self.bit_shift as usize;
-        if bit_idx >= self.flags.len {
-            return None;
-        }
-
-        // Go to the next bit of interest and yield result
+        let bit_idx = self.peek()?;
         self.find_next_bit();
         Some(bit_idx)
     }
