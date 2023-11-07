@@ -25,6 +25,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Busy-waiting time between declaring sleepiness and falling asleep
+///
+/// This is a compromise between avoiding sleep and wakeup latency on one side,
+/// and keeping idle threads asleep on the other side.
+const SLEEPY_DURATION: Duration = Duration::from_micros(100);
+
+/// Sleep duration used for busy waiting
+///
+/// Need a non-zero sleep duration to trigger a scheduler yield on Linux.
+const YIELD_DURATION: Duration = Duration::from_nanos(1);
+
 /// Simple flat pinned thread pool, used to check hypothesis that pinning and
 /// avoidance of TLS alone won't let us significantly outperform rayon
 pub struct FlatPool {
@@ -310,14 +321,6 @@ impl WorkerInterface {
         (interface, worker)
     }
 }
-
-/// Busy-waiting time between declaring sleepiness and falling asleep
-const SLEEPY_DURATION: Duration = Duration::from_millis(20);
-
-/// Sleep duration used for busy waiting
-///
-/// Need a non-zero sleep duration to trigger a scheduler yield on Linux.
-const YIELD_DURATION: Duration = Duration::from_nanos(1);
 
 /// Worker thread
 struct Worker<'pool> {
