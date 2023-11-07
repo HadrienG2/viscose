@@ -5,7 +5,10 @@ mod futex;
 mod job;
 
 use crate::job::{DynJob, Job, Notify};
-use crossbeam::deque::{self, Injector, Steal, Stealer};
+use crossbeam::{
+    deque::{self, Injector, Steal, Stealer},
+    utils::CachePadded,
+};
 use flags::AtomicFlags;
 use futex::{StealLocation, WorkerFutex};
 use hwlocality::{
@@ -231,7 +234,7 @@ struct SharedState {
     injector: Injector<DynJob>,
 
     /// Worker interfaces
-    workers: Box<[WorkerInterface]>,
+    workers: Box<[CachePadded<WorkerInterface>]>,
 
     /// Per-worker truth that each worker _might_ have work ready to be stolen
     /// inside of its work queue
@@ -259,7 +262,7 @@ impl SharedState {
         let mut workers = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
             let (worker, work_queue) = WorkerInterface::with_work_queue();
-            workers.push(worker);
+            workers.push(CachePadded::new(worker));
             work_queues.push(work_queue);
         }
         let result = Arc::new(Self {
