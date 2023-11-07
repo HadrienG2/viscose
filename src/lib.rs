@@ -133,11 +133,12 @@ impl FlatPool {
 
         // From the point where the task is scheduled, until the point where it
         // has signaled end of execution, panics should translate into aborts
-        abort_on_panic(|| {
+        {
             // Schedule work execution
             // SAFETY: We wait for the job to complete before letting it go out
             //         of scope or otherwise touching it in any way, and panics
             //         are translated to aborts until it's done executing.
+            let abort = AbortGuard;
             unsafe { self.spawn_unchecked(job.as_dyn()) };
 
             // Wait for the end of job execution then synchronize
@@ -145,7 +146,8 @@ impl FlatPool {
                 std::thread::park();
             }
             atomic::fence(Ordering::Acquire);
-        });
+            std::mem::forget(abort);
+        }
         // SAFETY: We waited for the job to finish before collecting the result
         //         and used an Acquire barrier to synchronize
         unsafe { job.result_or_panic() }
@@ -643,11 +645,12 @@ impl<'scope> Scope<'scope> {
         let mut remote_job = Job::new(notify, remote);
 
         // No unwinding panics allowed until the remote task has completed
-        let local_result = abort_on_panic(|| {
+        let local_result = {
             // Spawn remote task
             // SAFETY: We wait for the job to complete before letting it go out
             //         of scope or otherwise touching it in any way, and panics
             //         are translated to aborts until it's done executing.
+            let abort = AbortGuard;
             unsafe { self.spawn_unchecked(remote_job.as_dyn()) };
 
             // Run local task
@@ -659,8 +662,9 @@ impl<'scope> Scope<'scope> {
                 self.0.step();
             }
             atomic::fence(Ordering::Acquire);
+            std::mem::forget(abort);
             local_result
-        });
+        };
 
         // Return local and remote results, propagating panics
         // SAFETY: Collecting the remote result is safe because we have waited
@@ -746,11 +750,12 @@ where
 {
 }
 
-/// Translate unwinding panics into aborts
-fn abort_on_panic<R>(f: impl FnOnce() -> R) -> R {
-    match std::panic::catch_unwind(AssertUnwindSafe(f)) {
-        Ok(result) => result,
-        Err(_) => std::process::abort(),
+/// Aborts if dropped, used to translate panics to aborts
+struct AbortGuard;
+//
+impl Drop for AbortGuard {
+    fn drop(&mut self) {
+        std::process::abort()
     }
 }
 
