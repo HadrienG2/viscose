@@ -7,6 +7,7 @@ mod job;
 use crate::job::{DynJob, Job, Notify};
 use crossbeam::deque::{self, Injector, Steal, Stealer};
 use flags::AtomicFlags;
+use futex::{StealLocation, WorkerFutex};
 use hwlocality::{
     bitmap::BitmapIndex,
     cpu::{binding::CpuBindingFlags, cpuset::CpuSet},
@@ -17,10 +18,11 @@ use std::{
     collections::HashMap,
     panic::AssertUnwindSafe,
     sync::{
-        atomic::{self, AtomicBool, AtomicU32, Ordering},
+        atomic::{self, AtomicBool, Ordering},
         Arc,
     },
     thread::{JoinHandle, Thread},
+    time::{Duration, Instant},
 };
 
 /// Simple flat pinned thread pool, used to check hypothesis that pinning and
@@ -124,7 +126,7 @@ impl FlatPool {
             //         are translated to aborts until it's done executing.
             unsafe { self.spawn_unchecked(job.as_dyn()) };
 
-            // Wait for the end of job execution
+            // Wait for the end of job execution then synchronize
             while !finished.load(Ordering::Relaxed) {
                 std::thread::park();
             }
@@ -164,8 +166,10 @@ impl FlatPool {
         self.shared.injector.push(job);
 
         // Find the nearest available thread and recommend it to process this
+        //
+        // Need Release ordering to make sure they see the pushed work
         self.shared
-            .recommend_steal(best_worker_idx, WORK_FROM_INJECTOR);
+            .recommend_steal(best_worker_idx, StealLocation::Injector, Ordering::Release);
     }
 }
 //
@@ -178,9 +182,10 @@ impl Default for FlatPool {
 impl Drop for FlatPool {
     fn drop(&mut self) {
         // Tell workers that no further work will be coming and wake them all up
+        //
+        // Need Release ordering to make sure they see all previous pushed work
         for worker in self.shared.workers.iter() {
-            worker.futex.store(WORK_OVER, Ordering::Release);
-            atomic_wait::wake_all(&worker.futex);
+            worker.futex.notify_shutdown(Ordering::Release);
         }
 
         // Join all the worker thread
@@ -199,7 +204,8 @@ struct NotifyParked<'flag> {
     thread: Thread,
 }
 //
-// SAFETY: finished is set with Release ordering and is the sig
+// SAFETY: finished is set with Release ordering and is the signal that the main
+//         thread uses to synchronize.
 unsafe impl Notify for NotifyParked<'_> {
     fn notify(self) {
         self.finished.store(true, Ordering::Release);
@@ -234,7 +240,7 @@ impl SharedState {
     /// Set up the shared state
     fn with_work_queues(num_workers: usize) -> (Arc<Self>, Box<[deque::Worker<DynJob>]>) {
         assert!(
-            num_workers < usize::try_from(WORK_SPECIAL_START).unwrap(),
+            num_workers < WorkerFutex::MAX_WORKERS,
             "unsupported number of worker threads"
         );
         let injector = Injector::new();
@@ -261,82 +267,23 @@ impl SharedState {
     /// `task_location` must not be `WORK_OVER` nor `WORK_NOWHERE`, since these
     /// are not actual task locations. The code will panic upon encountering.
     /// these location values.
-    fn recommend_steal(&self, local_worker: usize, task_location: u32) {
+    fn recommend_steal(&self, local_worker: usize, task_location: StealLocation, update: Ordering) {
         // Iterate over increasingly remote job-less neighbors
-        'search: for closest_asleep in self
+        //
+        // Need Acquire ordering so the futex is read after the status flag
+        for closest_asleep in self
             .work_availability
-            .iter_unset_around(local_worker, Ordering::Relaxed)
+            .iter_unset_around(local_worker, Ordering::Acquire)
         {
             // Update their futex recommendation as appropriate
-            let closest_futex = &self.workers[closest_asleep].futex;
-            let closest_asleep_u32 = closest_asleep as u32;
-            let mut futex_value = closest_futex.load(Ordering::Relaxed);
-            'compare_exchange: loop {
-                // Once it is determined that the current stealing
-                // recommendation is worse than stealing from us, call this
-                // macro to update the recommendation.
-                macro_rules! try_recommend {
-                    () => {
-                        match closest_futex.compare_exchange_weak(
-                            futex_value,
-                            task_location,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        ) {
-                            Ok(_) => {
-                                // Recommendation updated, wake up the thread if
-                                // needed and go away
-                                if futex_value == WORK_NOWHERE {
-                                    atomic_wait::wake_all(closest_futex);
-                                }
-                                break 'search;
-                            }
-                            Err(new_futex_value) => {
-                                futex_value = new_futex_value;
-                                continue 'compare_exchange;
-                            }
-                        }
-                    };
-                }
-
-                // Analyze current value of the neighbor's futex
-                match (futex_value, task_location) {
-                    // Never override the thread pool's stop signal
-                    (WORK_OVER, _) => {
-                        break 'search;
-                    }
-
-                    // Only actual task locations are accepted
-                    (_, WORK_OVER | WORK_NOWHERE) => unreachable!(),
-
-                    // If the neighbor currently has nothing to do, any location
-                    // is accepted. But any other worker is considered more
-                    // local than the injector.
-                    (WORK_NOWHERE, _) => {
-                        try_recommend!();
-                    }
-                    (_, WORK_FROM_INJECTOR) => {
-                        continue 'search;
-                    }
-                    (WORK_FROM_INJECTOR, _) => {
-                        try_recommend!();
-                    }
-
-                    // At this point, it is clear that both recommendation point
-                    // to actual worker indices. Accept new recommendation if it
-                    // is closer than the previous recommendation...
-                    (old_idx, new_idx)
-                        if (closest_asleep_u32.abs_diff(old_idx)
-                            > closest_asleep_u32.abs_diff(new_idx)) =>
-                    {
-                        try_recommend!()
-                    }
-
-                    // ...otherwise, leave the existing recommendation alone
-                    _ => {
-                        continue 'search;
-                    }
-                }
+            let accepted = self.workers[closest_asleep].futex.suggest_steal(
+                task_location,
+                local_worker,
+                update,
+                Ordering::Relaxed,
+            );
+            if accepted.is_ok() {
+                return;
             }
         }
     }
@@ -349,39 +296,8 @@ struct WorkerInterface {
 
     /// Futex that the worker sleeps on when it has nothing to do, used to
     /// instruct it what to do when it is awakened.
-    ///
-    /// - Most values designate the index of a thread that the freshly awakened
-    ///   worker should steal from
-    /// - WORK_OVER means that the flat pool has been dropped, so no more work
-    ///   will be coming up and the worker should exit as soon as it has
-    ///   exhausted its work pile.
-    /// - WORK_NOWHERE means that there is no work left to steal but more work
-    ///   might still be coming up, and the worker should fall to sleep when it
-    ///   has no work to do in its work queue  (this is used to handle spurious
-    ///   wakeup).
-    /// - WORK_FROM_INJECTOR means that there is work available in the global
-    ///   work injector.
-    /// - WORK_SPECIAL_START is set to the lowest special value of the futex and
-    ///   used to detect when the number of workers exceeds the implementation's
-    ///   capabilities.
-    ///
-    futex: AtomicU32,
+    futex: WorkerFutex,
 }
-//
-/// `Worker::work_futex` value used to signal that the thread pool was dropped
-const WORK_OVER: u32 = u32::MAX;
-//
-/// `Worker::work_futex` value used to signal that there is no work available at
-/// the moment and the thread should fall back asleep.
-const WORK_NOWHERE: u32 = u32::MAX - 1;
-//
-/// `Worker::work_futex` value used to signal that there is work available from
-/// the thread pool's top level injector.
-const WORK_FROM_INJECTOR: u32 = u32::MAX - 2;
-//
-/// Lowest special value of `Worker::work_futex` aka maximal number of worker
-/// threads that this thread pool implementation supports.
-const WORK_SPECIAL_START: u32 = u32::MAX - 2;
 //
 impl WorkerInterface {
     /// Set up a worker's work queue and external interface
@@ -389,11 +305,19 @@ impl WorkerInterface {
         let worker = deque::Worker::new_lifo();
         let interface = Self {
             stealer: worker.stealer(),
-            futex: AtomicU32::new(WORK_NOWHERE),
+            futex: WorkerFutex::new(),
         };
         (interface, worker)
     }
 }
+
+/// Busy-waiting time between declaring sleepiness and falling asleep
+const SLEEPY_DURATION: Duration = Duration::from_millis(20);
+
+/// Sleep duration used for busy waiting
+///
+/// Need a non-zero sleep duration to trigger a scheduler yield on Linux.
+const YIELD_DURATION: Duration = Duration::from_nanos(1);
 
 /// Worker thread
 struct Worker<'pool> {
@@ -404,14 +328,10 @@ struct Worker<'pool> {
     idx: usize,
 
     /// Quick access to this thread's futex
-    futex: &'pool AtomicU32,
+    futex: &'pool WorkerFutex,
 
     /// Work queue
     work_queue: deque::Worker<DynJob>,
-
-    /// Truth that there might still be work coming from other worker threads or
-    /// from external thread pool clients.
-    work_incoming: Cell<bool>,
 
     /// Private copy of our bit in the shared work_availability flags
     ///
@@ -419,32 +339,40 @@ struct Worker<'pool> {
     /// variable subjected to concurrent access cache contention, besides the
     /// state of our work queue.
     work_available: Cell<bool>,
+
+    /// Timestamp where we entered the sleepy state
+    sleepy_timestamp: Cell<Option<Instant>>,
+
+    /// Truth that we reached the end of observable work and expect no more work
+    work_over: Cell<bool>,
 }
 //
 impl<'pool> Worker<'pool> {
     /// Set up and run the worker
     pub fn run(shared: &'pool SharedState, idx: usize, work_queue: deque::Worker<DynJob>) {
+        let futex = &shared.workers[idx].futex;
         let worker = Self {
             shared,
             idx,
-            futex: &shared.workers[idx].futex,
+            futex,
             work_queue,
-            work_incoming: Cell::new(true),
             work_available: Cell::new(false),
+            sleepy_timestamp: Cell::new(None),
+            work_over: Cell::new(false),
         };
         worker.main();
     }
 
     /// Main worker loop
     fn main(&self) {
-        while self.work_incoming.get() {
-            self.step(true);
+        while !self.work_over.get() {
+            self.step();
         }
     }
 
     /// Single step of the main worker loop
     #[inline]
-    fn step(&self, can_sleep: bool) {
+    fn step(&self) {
         // If we have recorded work in our private work queue...
         if self.work_available.get() {
             // Process work from our private work queue, if still there
@@ -453,15 +381,18 @@ impl<'pool> Worker<'pool> {
                 return;
             } else {
                 // Otherwise notify others that our work queue is now empty
+                //
+                // Use Release ordering to make sure this happens after emptying
+                // the work queue.
                 self.shared
                     .work_availability
-                    .fetch_clear(self.idx, Ordering::Relaxed);
+                    .fetch_clear(self.idx, Ordering::Release);
                 self.work_available.set(false);
             }
         }
 
         // Look for work elsewhere using our trusty futex as a guide
-        self.look_for_work(can_sleep);
+        self.look_for_work();
     }
 
     /// Process one incoming task
@@ -475,54 +406,92 @@ impl<'pool> Worker<'pool> {
     }
 
     /// Look for work using our futex as a guide
-    fn look_for_work(&self, can_sleep: bool) {
-        match self.futex.load(Ordering::Acquire) {
-            // Thread pool is shutting down, so if we can't find a task to steal
-            // now, we likely won't ever find one again and can quit
-            WORK_OVER => {
-                if self.steal_from_anyone().is_none() {
-                    self.work_incoming.set(false);
-                }
-            }
+    fn look_for_work(&self) {
+        // Need an up-to-date futex readout as steal location can evolve
+        //
+        // Acquire ordering ensures we see the world like the previous threads
+        // that updated the futex.
+        let futex_state = self.futex.load_from_worker(Ordering::Acquire);
 
-            // No particular work stealing recommandation, check all
-            // possibilities and go to sleep if we don't find any work anywhere
-            WORK_NOWHERE => {
-                if let Some(location) = self.steal_from_anyone() {
-                    // Record any place where we found work so we can try to
-                    // steal from there right away next time.
-                    let _ = self.futex.compare_exchange(
-                        WORK_NOWHERE,
-                        location,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    );
-                } else {
-                    // No work found, go to sleep if allowed to do so
-                    if can_sleep {
-                        atomic_wait::wait(self.futex, WORK_NOWHERE);
+        // Any futex event clears the futex sleepy flag, which we should
+        // acknowledge by resetting our internal sleepy timer.
+        if self.sleepy_timestamp.get().is_some() && !futex_state.is_sleepy() {
+            self.sleepy_timestamp.set(None);
+        }
+
+        // Check if we've been recommended to steal from one specific location
+        if let Some(location) = futex_state.steal_location() {
+            // Try to steal from that recommended location
+            let successful = match location {
+                StealLocation::Worker(idx) => self.steal_from_worker(idx),
+                StealLocation::Injector => self.steal_from_injector(),
+            };
+
+            // Once stealing starts to fail, the recommandation has become
+            // outdated, so discard it: we'll try exhaustive search next unless
+            // another recommendation has come up in meantime.
+            //
+            // Here we can use Relaxed because no one else should read from our
+            // futex location (we're just talking to ourself) and we aren't
+            // using the updated futex state at the moment.
+            if !successful {
+                let _new_futex_state = self.futex.clear_outdated_location(
+                    futex_state,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
+        } else {
+            // No particular recommended stealing location, try to steal a task
+            // from all possible locations
+            if let Some(location) = self.steal_from_anyone() {
+                // Record any place where we found work so we can try to steal
+                // from there right away next time, unless a better
+                // recommendation has concurrently come up.
+                //
+                // Can use Relaxed because we are talking to ourselves and we
+                // aren't using the updated futex state at the moment.
+                let _new_futex_state = self.futex.suggest_steal(
+                    location,
+                    self.idx,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            } else if futex_state.work_incoming() {
+                // No work available for now, but more work might still be
+                // coming, just wait for it after warning others
+                if futex_state.is_sleepy() {
+                    // Start with some busy waiting...
+                    if self.sleepy_timestamp.get().unwrap().elapsed() < SLEEPY_DURATION {
+                        std::thread::sleep(YIELD_DURATION)
+                    } else {
+                        // ...then truly fall asleep after a while
+                        //
+                        // Synchronize with other threads manipulating the futex
+                        // during out sleep.
+                        let _new_futex_state = self.futex.wait_for_change(
+                            futex_state,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        );
                     }
+                } else {
+                    // Tell others we're going to busy-wait and then sleep if
+                    // nothing happens soon + start associated timer.
+                    //
+                    // Synchronize with other threads manipulating the futex.
+                    self.sleepy_timestamp.set(Some(Instant::now()));
+                    let _new_futex_state =
+                        self.futex
+                            .notify_sleepy(futex_state, Ordering::Release, Ordering::Acquire);
                 }
-            }
-
-            // There is a recommandation to steal work from somewhere
-            work_location => {
-                // Try to steal from the current recommended location
-                let succeeded = match work_location {
-                    WORK_FROM_INJECTOR => self.steal_from_injector(),
-                    idx => self.steal_from_worker(idx as usize),
-                };
-
-                // Once stealing starts to fail, the recommandation becomes
-                // outdated, so discard it: we'll try exhaustive search next.
-                if !succeeded {
-                    let _ = self.futex.compare_exchange(
-                        work_location,
-                        WORK_NOWHERE,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    );
-                }
+            } else {
+                // No work available for now and no more work expected, nothing
+                // to do (this should only be a transient state when we are
+                // waiting for a signal that will be sent by other workers
+                // processing their own work)
+                self.work_over.set(true);
+                std::thread::sleep(YIELD_DURATION)
             }
         }
     }
@@ -599,20 +568,23 @@ impl<'pool> Worker<'pool> {
     ///
     /// Return from which source work was stolen (if any), using the conventions
     /// of `self.futex`, so that `self.futex` can be updated if appropriate.
-    fn steal_from_anyone(&self) -> Option<u32> {
+    fn steal_from_anyone(&self) -> Option<StealLocation> {
         // Try to steal from other workers at increasing distances
+        //
+        // Need Acquire so stealing happens after checking work availability.
         for idx in self
             .shared
             .work_availability
             .iter_set_around(self.idx, Ordering::Acquire)
         {
             if self.steal_from_worker(idx) {
-                return Some(idx as u32);
+                return Some(StealLocation::Worker(idx));
             }
         }
 
         // Try to steal from the global injector
-        self.steal_from_injector().then_some(WORK_FROM_INJECTOR)
+        self.steal_from_injector()
+            .then_some(StealLocation::Injector)
     }
 
     /// Try to steal work using the specified procedure
@@ -675,11 +647,10 @@ impl<'scope> Scope<'scope> {
             // Run local task
             let local_result = std::panic::catch_unwind(AssertUnwindSafe(local));
 
-            // Execute thread pool work while waiting for remote task
+            // Execute thread pool work while waiting for remote task,
+            // synchronize with the remote task once it completes
             while !remote_finished.load(Ordering::Relaxed) {
-                // FIXME: Figure out if I can allow sleep here with a more
-                //        clever futex protocol.
-                self.0.step(false);
+                self.0.step();
             }
             atomic::fence(Ordering::Acquire);
             local_result
@@ -727,8 +698,10 @@ impl<'scope> Scope<'scope> {
             shared.work_availability.fetch_set(me, Ordering::Relaxed);
         }
 
-        // ...and notify the closest starving thread (if any) about it
-        self.0.shared.recommend_steal(me, me as u32);
+        // ...and personally notify the closest starving thread about it
+        self.0
+            .shared
+            .recommend_steal(me, StealLocation::Worker(me), Ordering::Relaxed);
     }
 }
 //
@@ -742,7 +715,7 @@ struct NotifyFutex<'stack> {
     remote_finished: &'stack AtomicBool,
 
     /// Futex of the worker thread to be awakened, if sleeping
-    futex: &'stack AtomicU32,
+    futex: &'stack WorkerFutex,
 }
 //
 // SAFETY: remote_finished is set with Release ordering and is the signal that
@@ -750,10 +723,7 @@ struct NotifyFutex<'stack> {
 unsafe impl Notify for NotifyFutex<'_> {
     fn notify(self) {
         self.remote_finished.store(true, Ordering::Release);
-        // TODO: See if I can find a way to avoid calling wake when
-        //       the thread is awake without causing a race
-        //       condition when it's concurrently falling asleep.
-        /* atomic_wait::wake_all(self.futex); */
+        self.futex.wake(Ordering::Release);
     }
 }
 
