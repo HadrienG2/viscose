@@ -38,7 +38,7 @@ impl<'flags, const FIND_SET: bool, const INCLUDE_CENTER: bool>
         let yield_center = INCLUDE_CENTER && (flags.is_set(center_bit_idx, order) == FIND_SET);
         Self {
             left_indices,
-            center_bit_idx: (INCLUDE_CENTER as usize) * center_bit_idx,
+            center_bit_idx,
             yield_center,
             right_indices,
         }
@@ -310,16 +310,20 @@ mod tests {
     }
 
     /// Check outcome of iterating over NearestFlagIterator
-    fn check_nearest<const FIND_SET: bool>(
+    fn check_nearest<const FIND_SET: bool, const INCLUDE_CENTER: bool>(
         flags: &AtomicFlags,
         center_idx: usize,
     ) -> Result<(), TestCaseError> {
-        let mut iterator =
-            NearestFlagIterator::<FIND_SET>::new(flags, center_idx, Ordering::Relaxed);
+        let mut iterator = NearestFlagIterator::<FIND_SET, INCLUDE_CENTER>::new(
+            flags,
+            center_idx,
+            Ordering::Relaxed,
+        );
         let left_indices = (center_idx..flags.len()).skip(1);
         let right_indices = (0..center_idx).rev();
-        let indices =
-            std::iter::once(center_idx).chain(itertools::interleave(left_indices, right_indices));
+        let indices = std::iter::once(center_idx)
+            .chain(itertools::interleave(left_indices, right_indices))
+            .skip(usize::from(!INCLUDE_CENTER));
         for idx in indices {
             if flags.is_set(idx, Ordering::Relaxed) == FIND_SET {
                 prop_assert_eq!(iterator.next(), Some(idx));
@@ -337,8 +341,10 @@ mod tests {
             check_iterate::<true, false>(&flags, start_idx)?;
             check_iterate::<true, true>(&flags, start_idx)?;
 
-            check_nearest::<false>(&flags, start_idx)?;
-            check_nearest::<true>(&flags, start_idx)?;
+            check_nearest::<false, false>(&flags, start_idx)?;
+            check_nearest::<false, true>(&flags, start_idx)?;
+            check_nearest::<true, false>(&flags, start_idx)?;
+            check_nearest::<true, true>(&flags, start_idx)?;
         }
     }
 
