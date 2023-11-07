@@ -119,16 +119,70 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
     pub fn new(flags: &'flags AtomicFlags, after_bit_idx: usize, order: Ordering) -> Self {
         let (word_idx, bit_shift) = flags.word_idx_and_bit_shift(after_bit_idx);
         let word = flags.words[word_idx].load(order);
-        let normalized_remainder = Self::normalize_word(word, bit_shift);
+        if flags.words.len() == 1 && Self::is_empty_word(flags, 0, word) {
+            debug_assert_eq!(word_idx, 0);
+            Self::new_single_empty_word(flags, order)
+        } else {
+            Self::new_general(flags, order, word_idx, word, bit_shift)
+        }
+    }
+
+    /// General end of [`new()`]
+    fn new_general(
+        flags: &'flags AtomicFlags,
+        order: Ordering,
+        word_idx: usize,
+        word: Word,
+        bit_shift: u32,
+    ) -> Self {
         let mut result = Self {
             flags,
             order,
             word_idx,
             bit_shift,
-            normalized_remainder,
+            normalized_remainder: Self::normalize_word(word, bit_shift),
         };
         result.find_next_bit();
         result
+    }
+
+    /// Specialized end of [`new_general()`] for a word where every bit is set
+    fn new_single_empty_word(flags: &'flags AtomicFlags, order: Ordering) -> Self {
+        Self {
+            flags,
+            order,
+            word_idx: 1,
+            bit_shift: Word::BITS,
+            normalized_remainder: 0,
+        }
+    }
+
+    /// Expected value of a word where every bit has the value we're looking for
+    fn is_empty_word(flags: &AtomicFlags, word_idx: usize, word: Word) -> bool {
+        if FIND_SET {
+            word & flags.bits_mask(word_idx) == Word::MIN
+        } else {
+            word | !flags.bits_mask(word_idx) == Word::MAX
+        }
+    }
+
+    /// First bit in a word, in our direction of iteration
+    fn first_bit_shift() -> u32 {
+        if GOING_LEFT {
+            0
+        } else {
+            Word::BITS - 1
+        }
+    }
+
+    /// Number of bits to skip from first bit to a certain bit shift, in our
+    /// direction of iteration
+    fn first_to_bit(bit_shift: u32) -> u32 {
+        if GOING_LEFT {
+            bit_shift
+        } else {
+            Word::BITS - 1 - bit_shift
+        }
     }
 
     /// Peek next iterator element without advancing the iterator
@@ -201,7 +255,7 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
         if let Some((word_idx, word)) = find_result {
             // Determine the first bit to be probed within this word
             self.word_idx = word_idx;
-            self.bit_shift = if GOING_LEFT { 0 } else { Word::BITS - 1 };
+            self.bit_shift = Self::first_bit_shift();
             self.normalized_remainder = Self::normalize_word(word, self.bit_shift);
             Some(())
         } else {
@@ -225,10 +279,10 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
         // the direction of interest (MSB or LSB)
         debug_assert!(bit_shift < Word::BITS);
         if GOING_LEFT {
-            word >>= bit_shift;
+            word >>= Self::first_to_bit(bit_shift);
         } else {
-            word <<= Word::BITS - 1 - bit_shift;
-        };
+            word <<= Self::first_to_bit(bit_shift);
+        }
         word
     }
 

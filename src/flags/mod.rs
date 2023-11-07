@@ -21,6 +21,9 @@ pub struct AtomicFlags {
     /// Concrete flags data
     words: Box<[AtomicWord]>,
 
+    /// Mask of the significant bits in the last word of the flags
+    end_bits_mask: Word,
+
     /// Number of actually meaningful bits
     len: usize,
 }
@@ -28,10 +31,17 @@ pub struct AtomicFlags {
 impl AtomicFlags {
     /// Create a set of N flags, initially all unset
     pub fn new(len: usize) -> Self {
+        let trailing_bits = len % WORD_BITS;
+        let end_bits_mask = if trailing_bits == 0 {
+            Word::MAX
+        } else {
+            (1 << trailing_bits) - 1
+        };
         Self {
             words: std::iter::repeat_with(|| AtomicWord::new(0))
                 .take(len.div_ceil(WORD_BITS))
                 .collect(),
+            end_bits_mask,
             len,
         }
     }
@@ -136,6 +146,15 @@ impl AtomicFlags {
     {
         self.words.iter().map(move |word| word.load(order))
     }
+
+    /// Mask of significant bits in a given word of the flags
+    fn bits_mask(&self, word_idx: usize) -> Word {
+        if word_idx == self.words.len() - 1 {
+            self.end_bits_mask
+        } else {
+            Word::MAX
+        }
+    }
 }
 //
 #[cfg(test)]
@@ -170,6 +189,7 @@ impl Arbitrary for AtomicFlags {
             // Emit final flags
             Self {
                 words: words.into_boxed_slice(),
+                end_bits_mask: (1 << current_bit) - 1,
                 len,
             }
         })
@@ -182,8 +202,11 @@ impl Clone for AtomicFlags {
             .words(Ordering::Relaxed)
             .map(AtomicUsize::new)
             .collect();
-        let len = self.len;
-        Self { words, len }
+        Self {
+            words,
+            end_bits_mask: self.end_bits_mask,
+            len: self.len,
+        }
     }
 }
 //
