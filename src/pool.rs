@@ -4,11 +4,11 @@ use crate::{
     flags::AtomicFlags,
     futex::{StealLocation, WorkerFutex},
     job::{DynJob, Job, Notify},
-    worker::{Worker, WorkerInterface},
+    worker::Worker,
     AbortGuard, Work,
 };
 use crossbeam::{
-    deque::{self, Injector},
+    deque::{self, Injector, Stealer},
     utils::CachePadded,
 };
 use hwlocality::{
@@ -301,6 +301,28 @@ impl SharedState {
                 return;
             }
         }
+    }
+}
+
+/// External interface to a single worker in a thread pool
+pub(crate) struct WorkerInterface {
+    /// A way to steal from the worker
+    pub stealer: Stealer<DynJob>,
+
+    /// Futex that the worker sleeps on when it has nothing to do, used to
+    /// instruct it what to do when it is awakened.
+    pub futex: WorkerFutex,
+}
+//
+impl WorkerInterface {
+    /// Set up a worker's work queue and external interface
+    pub fn with_work_queue() -> (Self, deque::Worker<DynJob>) {
+        let worker = deque::Worker::new_lifo();
+        let interface = Self {
+            stealer: worker.stealer(),
+            futex: WorkerFutex::new(),
+        };
+        (interface, worker)
     }
 }
 

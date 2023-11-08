@@ -6,35 +6,13 @@ use crate::{
     pool::SharedState,
     AbortGuard, Work, MAX_SPIN_ITERS, SLEEPY_DURATION, YIELD_DURATION,
 };
-use crossbeam::deque::{self, Steal, Stealer};
+use crossbeam::deque::{self, Steal};
 use std::{
     cell::Cell,
     panic::AssertUnwindSafe,
     sync::atomic::{self, AtomicBool, Ordering},
     time::Instant,
 };
-
-/// External interface to a single worker in a thread pool
-pub(crate) struct WorkerInterface {
-    /// A way to steal from the worker
-    pub stealer: Stealer<DynJob>,
-
-    /// Futex that the worker sleeps on when it has nothing to do, used to
-    /// instruct it what to do when it is awakened.
-    pub futex: WorkerFutex,
-}
-//
-impl WorkerInterface {
-    /// Set up a worker's work queue and external interface
-    pub fn with_work_queue() -> (Self, deque::Worker<DynJob>) {
-        let worker = deque::Worker::new_lifo();
-        let interface = Self {
-            stealer: worker.stealer(),
-            futex: WorkerFutex::new(),
-        };
-        (interface, worker)
-    }
-}
 
 /// Worker thread
 pub(crate) struct Worker<'pool> {
