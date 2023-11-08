@@ -1,5 +1,4 @@
 use criterion::{criterion_group, criterion_main, Bencher, Criterion};
-use iterator_ilp::IteratorILP;
 use sched_local::{pool::FlatPool, LocalFloats, LocalFloatsSlice};
 
 fn criterion_benchmark(c: &mut Criterion) {
