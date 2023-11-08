@@ -13,7 +13,7 @@ use std::time::Duration;
 ///
 /// This is a compromise between avoiding sleep and wakeup latency on one side,
 /// and keeping idle threads asleep on the other side.
-const SLEEPY_DURATION: Duration = Duration::from_micros(100);
+const SLEEPY_DURATION: Duration = Duration::from_micros(1);
 
 /// Sleep duration used for busy waiting
 ///
