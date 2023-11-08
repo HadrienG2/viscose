@@ -397,6 +397,11 @@ impl<'scope> Scope<'scope> {
         })
     }
 
+    /// Numerical identifier of the worker thread this job runs on
+    pub fn worker_id(&self) -> usize {
+        self.0.idx
+    }
+
     /// Set up a scope associated with a particular worker thread
     fn new(worker: &'scope Worker<'scope>) -> Self {
         Self(AssertUnwindSafe(worker))
