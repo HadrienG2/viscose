@@ -58,10 +58,10 @@ fn bench_flags(c: &mut Criterion) {
         {
             let mut group = c.benchmark_group(&format!("{header}/all/"));
             group.throughput(Throughput::Elements(flags.len() as _));
-            group.bench_function(&format!("{header}/set_all"), |b| {
+            group.bench_function("set", |b| {
                 b.iter(|| pessimize::hide(&flags).set_all(Ordering::Relaxed))
             });
-            group.bench_function(&format!("{header}/clear_all"), |b| {
+            group.bench_function("clear", |b| {
                 b.iter(|| pessimize::hide(&flags).clear_all(Ordering::Relaxed))
             });
         }
