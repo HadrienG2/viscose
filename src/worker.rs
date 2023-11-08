@@ -4,7 +4,7 @@ use crate::{
     futex::{StealLocation, WorkerFutex},
     job::{DynJob, Job, Notify},
     pool::SharedState,
-    AbortGuard, Work, SLEEPY_DURATION, YIELD_DURATION,
+    AbortGuard, Work, MAX_SPIN_ITERS, SLEEPY_DURATION, YIELD_DURATION,
 };
 use crossbeam::deque::{self, Steal, Stealer};
 use std::{
@@ -57,8 +57,11 @@ pub(crate) struct Worker<'pool> {
     /// state of our work queue.
     work_available: Cell<bool>,
 
-    /// Timestamp where we entered the sleepy state
-    sleepy_timestamp: Cell<Option<Instant>>,
+    /// Sleepy state variables
+    ///
+    /// First is the current number of suggested spin-wait iterations, second is
+    /// the time at which we declared ourselves sleepy.
+    sleepy_state: Cell<Option<(usize, Instant)>>,
 
     /// Truth that we reached the end of observable work and expect no more work
     ///
@@ -77,7 +80,7 @@ impl<'pool> Worker<'pool> {
             futex,
             work_queue,
             work_available: Cell::new(false),
-            sleepy_timestamp: Cell::new(None),
+            sleepy_state: Cell::new(None),
             work_over: Cell::new(false),
         };
         worker.main();
@@ -132,9 +135,9 @@ impl<'pool> Worker<'pool> {
         let futex_state = self.futex.load_from_worker(Ordering::Acquire);
 
         // Any futex event clears the futex sleepy flag, which we should
-        // acknowledge by resetting our internal sleepy timer.
-        if self.sleepy_timestamp.get().is_some() && !futex_state.is_sleepy() {
-            self.sleepy_timestamp.set(None);
+        // acknowledge by resetting our internal sleepy state.
+        if self.sleepy_state.get().is_some() && !futex_state.is_sleepy() {
+            self.sleepy_state.set(None);
         }
 
         // Check if we've been recommended to steal from one specific location
@@ -180,7 +183,13 @@ impl<'pool> Worker<'pool> {
                 // coming, just wait for it after warning others
                 if futex_state.is_sleepy() {
                     // Start with some busy waiting...
-                    if self.sleepy_timestamp.get().unwrap().elapsed() < SLEEPY_DURATION {
+                    let (spin_iters, sleepy_start) = self.sleepy_state.get().unwrap();
+                    if spin_iters <= MAX_SPIN_ITERS {
+                        for _ in 0..spin_iters {
+                            std::hint::spin_loop()
+                        }
+                        self.sleepy_state.set(Some((2 * spin_iters, sleepy_start)));
+                    } else if sleepy_start.elapsed() < SLEEPY_DURATION {
                         std::thread::sleep(YIELD_DURATION)
                     } else {
                         // ...then truly fall asleep after a while
@@ -198,7 +207,7 @@ impl<'pool> Worker<'pool> {
                     // nothing happens soon + start associated timer.
                     //
                     // Synchronize with other threads manipulating the futex.
-                    self.sleepy_timestamp.set(Some(Instant::now()));
+                    self.sleepy_state.set(Some((1, Instant::now())));
                     let _new_futex_state =
                         self.futex
                             .notify_sleepy(futex_state, Ordering::Release, Ordering::Acquire);
