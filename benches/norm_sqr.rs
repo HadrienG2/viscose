@@ -27,13 +27,13 @@ fn criterion_benchmark(c: &mut Criterion) {
         }
     }
 
-    macro_rules! bench_sum {
+    macro_rules! bench_norm_sqr {
         () => {
             // I picked these values because...
             // - 4 is the sweet spot for hyperthreaded SSE
             // - 8 is the sweet spot for non-HT SSE and HT AVX
             // - 16 is the sweet spot for non-HT AVX
-            bench_sum!(ilp[4, 8, 16]);
+            bench_norm_sqr!(ilp[4, 8, 16]);
         };
         (
             ilp[$($ilp_streams:literal),*]
@@ -42,7 +42,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             // - Each float is 4 bytes
             // - The hyperthreaded sweet spot is <=16 KiB/thread -> 4096 floats
             // - The non-HT sweet spot is <=32 KiB/thread -> 8192 floats
-            bench_sum!(ilp$ilp_streams/block_pow2[11, 12, 13]);
+            bench_norm_sqr!(ilp$ilp_streams/block_pow2[11, 12, 13]);
         )*};
         (
             ilp$ilp_streams:literal/block_pow2[$($block_size_pow2:literal),*]
@@ -52,20 +52,20 @@ fn criterion_benchmark(c: &mut Criterion) {
 
             bench_backend::<BLOCK_SIZE>(
                 c,
-                &format!("sum/rayon/ilp{ILP_STREAMS}"),
+                &format!("norm_sqr/rayon/ilp{ILP_STREAMS}"),
                 |b: &mut Bencher, slice| {
-                    b.iter(|| sum_rayon::<BLOCK_SIZE, ILP_STREAMS>(pessimize::hide(slice)))
+                    b.iter(|| norm_sqr_rayon::<BLOCK_SIZE, ILP_STREAMS, ILP_STREAMS>(pessimize::hide(slice)))
                 },
             );
 
             let pool = FlatPool::new();
             bench_backend::<BLOCK_SIZE>(
                 c,
-                &format!("sum/flat/ilp{ILP_STREAMS}"),
+                &format!("norm_sqr/flat/ilp{ILP_STREAMS}"),
                 |b: &mut Bencher, slice| {
                     pool.run(|scope| {
                         b.iter(|| {
-                            sched_local::sum_flat::<BLOCK_SIZE, ILP_STREAMS>(
+                            sched_local::norm_sqr_flat::<BLOCK_SIZE, ILP_STREAMS, ILP_STREAMS, false>(
                                 scope,
                                 pessimize::hide(slice),
                             )
@@ -75,7 +75,55 @@ fn criterion_benchmark(c: &mut Criterion) {
             );
         })*};
     }
-    bench_sum!();
+    bench_norm_sqr!();
+}
+
+fn norm_sqr_rayon<
+    const BLOCK_SIZE: usize,
+    const SUM_ILP_STREAMS: usize,
+    const NORM_ILP_STREAMS: usize,
+>(
+    slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
+) -> f32 {
+    slice.process(
+        |[mut left, mut right]| {
+            rayon::join(
+                || square_rayon::<BLOCK_SIZE>(&mut left),
+                || square_rayon::<BLOCK_SIZE>(&mut right),
+            );
+            let (left, right) = rayon::join(
+                || sum_rayon::<BLOCK_SIZE, SUM_ILP_STREAMS>(&mut left),
+                || sum_rayon::<BLOCK_SIZE, SUM_ILP_STREAMS>(&mut right),
+            );
+            left + right
+        },
+        |block, _locality| {
+            block.iter().copied().fold_ilp::<NORM_ILP_STREAMS, f32>(
+                || 0.0,
+                |acc, elem| {
+                    if cfg!(target_feature = "fma") {
+                        elem.mul_add(elem, acc)
+                    } else {
+                        acc + elem * elem
+                    }
+                },
+                |acc1, acc2| acc1 + acc2,
+            )
+        },
+        0.0,
+    )
+}
+
+fn square_rayon<const BLOCK_SIZE: usize>(slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>) {
+    slice.process(
+        |[mut left, mut right]| {
+            rayon::join(|| square_rayon(&mut left), || square_rayon(&mut right));
+        },
+        |block, _locality| {
+            block.iter_mut().for_each(|elem| *elem = elem.powi(2));
+        },
+        (),
+    );
 }
 
 fn sum_rayon<const BLOCK_SIZE: usize, const ILP_STREAMS: usize>(
