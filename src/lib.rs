@@ -8,10 +8,7 @@ mod worker;
 
 use crate::worker::Scope;
 use iterator_ilp::IteratorILP;
-use std::{
-    sync::atomic::{AtomicUsize, Ordering},
-    time::Duration,
-};
+use std::time::Duration;
 
 /// Busy-waiting time between declaring sleepiness and falling asleep
 ///
@@ -200,43 +197,24 @@ impl<'target, const BLOCK_SIZE: usize> LocalFloatsSlice<'target, BLOCK_SIZE> {
 /// squares of vector elements and then reads them back to assess how the
 /// performance of such memory-bound code is affected by allocation locality.
 #[inline]
-pub fn norm_sqr_flat<
-    const BLOCK_SIZE: usize,
-    const SUM_ILP_STREAMS: usize,
-    const NORM_ILP_STREAMS: usize,
-    const TRACK_MIGRATIONS: bool,
->(
+pub fn norm_sqr_flat<const BLOCK_SIZE: usize, const REDUCE_ILP_STREAMS: usize>(
     scope: &Scope<'_>,
     slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
 ) -> f32 {
-    let num_migrations = &AtomicUsize::new(0);
-    let num_blocks = slice.locality.len();
-    let result = slice.process(
+    slice.process(
         |[mut left, mut right]| {
             scope.join(
-                || square_impl::<BLOCK_SIZE, TRACK_MIGRATIONS>(scope, &mut left),
-                |scope| square_impl::<BLOCK_SIZE, TRACK_MIGRATIONS>(scope, &mut right),
+                || square_flat(scope, &mut left),
+                |scope| square_flat(scope, &mut right),
             );
             let (left, right) = scope.join(
-                || {
-                    sum_impl::<BLOCK_SIZE, SUM_ILP_STREAMS, TRACK_MIGRATIONS>(
-                        scope,
-                        &mut left,
-                        num_migrations,
-                    )
-                },
-                move |scope| {
-                    sum_impl::<BLOCK_SIZE, SUM_ILP_STREAMS, TRACK_MIGRATIONS>(
-                        scope,
-                        &mut right,
-                        num_migrations,
-                    )
-                },
+                || sum_flat::<BLOCK_SIZE, REDUCE_ILP_STREAMS>(scope, &mut left),
+                move |scope| sum_flat::<BLOCK_SIZE, REDUCE_ILP_STREAMS>(scope, &mut right),
             );
             left + right
         },
         |block, _locality| {
-            block.iter().copied().fold_ilp::<NORM_ILP_STREAMS, f32>(
+            block.iter().copied().fold_ilp::<REDUCE_ILP_STREAMS, _>(
                 || 0.0,
                 |acc, term| {
                     if cfg!(target_feature = "fma") {
@@ -249,15 +227,7 @@ pub fn norm_sqr_flat<
             )
         },
         0.0,
-    );
-    #[allow(clippy::print_stdout)]
-    if TRACK_MIGRATIONS {
-        println!(
-            "{}/{num_blocks} blocks were used outside of their home locality",
-            num_migrations.load(Ordering::Relaxed),
-        );
-    }
-    result
+    )
 }
 
 /// Square each number inside of a LocalFloatsSlice
@@ -266,7 +236,20 @@ pub fn square_flat<const BLOCK_SIZE: usize>(
     scope: &Scope<'_>,
     slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
 ) {
-    square_impl::<BLOCK_SIZE, false>(scope, slice)
+    slice.process(
+        |[mut left, mut right]| {
+            scope.join(
+                || square_flat(scope, &mut left),
+                move |scope| square_flat(scope, &mut right),
+            );
+        },
+        |block, locality| {
+            *locality = Some(scope.worker_id());
+            // TODO: Experiment with pinning allocations, etc
+            block.iter_mut().for_each(|elem| *elem = elem.powi(2));
+        },
+        (),
+    )
 }
 
 /// Sum the numbers inside of a LocalFloatSlice
@@ -275,66 +258,15 @@ pub fn sum_flat<const BLOCK_SIZE: usize, const ILP_STREAMS: usize>(
     scope: &Scope<'_>,
     slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
 ) -> f32 {
-    sum_impl::<BLOCK_SIZE, ILP_STREAMS, false>(scope, slice, &AtomicUsize::new(0))
-}
-
-/// Implementation of [`square()`] that tracks where data was originally located
-#[inline]
-fn square_impl<const BLOCK_SIZE: usize, const TRACK_MIGRATIONS: bool>(
-    scope: &Scope<'_>,
-    slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
-) {
-    slice.process(
-        |[mut left, mut right]| {
-            scope.join(
-                || square_impl::<BLOCK_SIZE, TRACK_MIGRATIONS>(scope, &mut left),
-                move |scope| square_impl::<BLOCK_SIZE, TRACK_MIGRATIONS>(scope, &mut right),
-            );
-        },
-        |block, locality| {
-            if TRACK_MIGRATIONS {
-                *locality = Some(scope.worker_id());
-            }
-            // TODO: Experiment with pinning allocations, etc
-            block.iter_mut().for_each(|elem| *elem = elem.powi(2));
-        },
-        (),
-    );
-}
-
-/// Implementation of [`sum()`] that tracks if data moved since [`square()`]
-#[inline]
-fn sum_impl<const BLOCK_SIZE: usize, const ILP_STREAMS: usize, const TRACK_MIGRATIONS: bool>(
-    scope: &Scope<'_>,
-    slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
-    num_migrations: &AtomicUsize,
-) -> f32 {
     slice.process(
         |[mut left, mut right]| {
             let (left, right) = scope.join(
-                || {
-                    sum_impl::<BLOCK_SIZE, ILP_STREAMS, TRACK_MIGRATIONS>(
-                        scope,
-                        &mut left,
-                        num_migrations,
-                    )
-                },
-                move |scope| {
-                    sum_impl::<BLOCK_SIZE, ILP_STREAMS, TRACK_MIGRATIONS>(
-                        scope,
-                        &mut right,
-                        num_migrations,
-                    )
-                },
+                || sum_flat::<BLOCK_SIZE, ILP_STREAMS>(scope, &mut left),
+                move |scope| sum_flat::<BLOCK_SIZE, ILP_STREAMS>(scope, &mut right),
             );
             left + right
         },
-        |block, locality| {
-            if TRACK_MIGRATIONS && locality.unwrap() != scope.worker_id() {
-                num_migrations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            block.iter().copied().sum_ilp::<ILP_STREAMS, f32>()
-        },
+        |block, _locality| block.iter().copied().sum_ilp::<ILP_STREAMS, f32>(),
         0.0,
     )
 }

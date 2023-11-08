@@ -43,7 +43,11 @@ fn criterion_benchmark(c: &mut Criterion) {
             }
         )*};
     }
-    bench_square!(13, 14, 15, 16);
+    // I picked these values because...
+    // - Each float is 4 bytes
+    // - The hyperthreaded sweet spot is <=16 KiB/thread -> 4096 floats
+    // - The non-HT sweet spot is <=32 KiB/thread -> 8192 floats
+    bench_square!(11, 12, 13);
 }
 
 fn square_rayon<const BLOCK_SIZE: usize>(slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>) {

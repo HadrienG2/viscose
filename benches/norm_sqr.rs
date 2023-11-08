@@ -55,7 +55,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                 c,
                 &format!("norm_sqr/rayon/ilp{ILP_STREAMS}"),
                 |b: &mut Bencher, slice| {
-                    b.iter(|| norm_sqr_rayon::<BLOCK_SIZE, ILP_STREAMS, ILP_STREAMS>(pessimize::hide(slice)))
+                    b.iter(|| norm_sqr_rayon::<BLOCK_SIZE, ILP_STREAMS>(pessimize::hide(slice)))
                 },
             );
 
@@ -66,7 +66,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                 |b: &mut Bencher, slice| {
                     pool.run(|scope| {
                         b.iter(|| {
-                            sched_local::norm_sqr_flat::<BLOCK_SIZE, ILP_STREAMS, ILP_STREAMS, false>(
+                            sched_local::norm_sqr_flat::<BLOCK_SIZE, ILP_STREAMS>(
                                 scope,
                                 pessimize::hide(slice),
                             )
@@ -79,11 +79,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     bench_norm_sqr!();
 }
 
-fn norm_sqr_rayon<
-    const BLOCK_SIZE: usize,
-    const SUM_ILP_STREAMS: usize,
-    const NORM_ILP_STREAMS: usize,
->(
+fn norm_sqr_rayon<const BLOCK_SIZE: usize, const REDUCE_ILP_STREAMS: usize>(
     slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
 ) -> f32 {
     slice.process(
@@ -93,13 +89,13 @@ fn norm_sqr_rayon<
                 || square_rayon::<BLOCK_SIZE>(&mut right),
             );
             let (left, right) = rayon::join(
-                || sum_rayon::<BLOCK_SIZE, SUM_ILP_STREAMS>(&mut left),
-                || sum_rayon::<BLOCK_SIZE, SUM_ILP_STREAMS>(&mut right),
+                || sum_rayon::<BLOCK_SIZE, REDUCE_ILP_STREAMS>(&mut left),
+                || sum_rayon::<BLOCK_SIZE, REDUCE_ILP_STREAMS>(&mut right),
             );
             left + right
         },
         |block, _locality| {
-            block.iter().copied().fold_ilp::<NORM_ILP_STREAMS, f32>(
+            block.iter().copied().fold_ilp::<REDUCE_ILP_STREAMS, f32>(
                 || 0.0,
                 |acc, elem| {
                     if cfg!(target_feature = "fma") {
