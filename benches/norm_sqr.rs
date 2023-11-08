@@ -8,10 +8,11 @@ fn criterion_benchmark(c: &mut Criterion) {
         group_name: &str,
         mut bench_impl: impl FnMut(&mut Bencher, &mut LocalFloatsSlice<'_, BLOCK_SIZE>),
     ) {
-        // 2^21 floats is 2^23 bytes = 8 MiB, which is enough to saturate the
-        // laptop on which I'm currently testing. Tune this up for testing on
-        // larger compute nodes with huge L3 caches.
-        const MAX_DATASET_SIZE_POW2: u32 = 21;
+        // 2^22 floats is 2^24 bytes = 16 MiB, which is enough to saturate the
+        // L3 of the largest computer I'm currently testing on. Tune this up for
+        // testing on larger compute nodes with huge L3 caches.
+        // FIXME: ...or better, autotune this using hwlocality cache stats
+        const MAX_DATASET_SIZE_POW2: u32 = 22;
         assert!(BLOCK_SIZE.is_power_of_two());
         let block_size_pow2 = BLOCK_SIZE.trailing_zeros();
         let mut group = c.benchmark_group(group_name);
