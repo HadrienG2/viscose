@@ -199,7 +199,7 @@ impl WorkerFutex {
 
         // By the time we wake up, the thread that awakened us will have cleared
         // the sleepy and sleeping flags, so we can just return the new state
-        assert!(!(current.sleepy | current.sleeping));
+        debug_assert!(!(current.sleepy | current.sleeping));
         current
     }
 
@@ -611,16 +611,16 @@ mod tests {
         #[test]
         fn new(load_order in rmw_order()) {
             let futex = WorkerFutex::new();
-            assert_eq!(futex.load(load_order), WorkerFutexState::default());
-            assert_eq!(futex.load_from_worker(load_order), WorkerFutexState::default());
+            prop_assert_eq!(futex.load(load_order), WorkerFutexState::default());
+            prop_assert_eq!(futex.load_from_worker(load_order), WorkerFutexState::default());
         }
 
         #[test]
         fn with_state(state: WorkerFutexState, load_order in rmw_order()) {
             let futex = WorkerFutex::with_state(state);
-            assert_eq!(futex.load(load_order), state);
+            prop_assert_eq!(futex.load(load_order), state);
             if !state.sleeping {
-                assert_eq!(futex.load_from_worker(load_order), state);
+                prop_assert_eq!(futex.load_from_worker(load_order), state);
             }
         }
     }
@@ -651,18 +651,23 @@ mod tests {
 
     /// Check that clear_outdated_location does clear the steal_location,
     /// assuming there is one steal_location set initially.
-    fn check_clear_location_success(futex: WorkerFutex, update: Ordering, load: Ordering) {
+    fn check_clear_location_success(
+        futex: WorkerFutex,
+        update: Ordering,
+        load: Ordering,
+    ) -> Result<(), TestCaseError> {
         let current = futex.load_from_worker(Ordering::Relaxed);
-        assert!(current.steal_location.is_some() && !(current.sleepy | current.sleeping));
+        prop_assert!(current.steal_location.is_some() && !(current.sleepy | current.sleeping));
         let expected_out = WorkerFutexState {
             steal_location: None,
             ..current
         };
-        assert_eq!(
+        prop_assert_eq!(
             futex.clear_outdated_location(current, update, load),
             Ok(expected_out)
         );
-        assert_eq!(futex.load_from_worker(Ordering::Relaxed), expected_out);
+        prop_assert_eq!(futex.load_from_worker(Ordering::Relaxed), expected_out);
+        Ok(())
     }
 
     proptest! {
@@ -672,7 +677,7 @@ mod tests {
             update in rmw_order(),
             load in load_order()
         ) {
-            check_clear_location_success(futex, update, load);
+            check_clear_location_success(futex, update, load)?;
         }
 
         #[test]
@@ -684,13 +689,13 @@ mod tests {
         ) {
             let current = futex.load_from_worker(Ordering::Relaxed);
             if expected.steal_location == current.steal_location {
-                check_clear_location_success(futex, update, load);
+                check_clear_location_success(futex, update, load)?;
             } else {
-                assert_eq!(
+                prop_assert_eq!(
                     futex.clear_outdated_location(expected, update, load),
                     Err(current)
                 );
-                assert_eq!(futex.load_from_worker(Ordering::Relaxed), current);
+                prop_assert_eq!(futex.load_from_worker(Ordering::Relaxed), current);
             }
         }
     }
@@ -736,8 +741,8 @@ mod tests {
             load in load_order(),
         ) {
             let futex = WorkerFutex::with_state(FUTURE_SLEEPY_STATE);
-            assert_eq!(futex.notify_sleepy(FUTURE_SLEEPY_STATE, update, load), Ok(SLEEPY_STATE));
-            assert_eq!(futex.load_from_worker(Ordering::Relaxed), SLEEPY_STATE);
+            prop_assert_eq!(futex.notify_sleepy(FUTURE_SLEEPY_STATE, update, load), Ok(SLEEPY_STATE));
+            prop_assert_eq!(futex.load_from_worker(Ordering::Relaxed), SLEEPY_STATE);
         }
 
         #[test]
@@ -747,11 +752,11 @@ mod tests {
             load in load_order(),
         ) {
             let current = futex.load_from_worker(Ordering::Relaxed);
-            assert_eq!(
+            prop_assert_eq!(
                 futex.notify_sleepy(FUTURE_SLEEPY_STATE, update, load),
                 Err(current)
             );
-            assert_eq!(futex.load_from_worker(Ordering::Relaxed), current);
+            prop_assert_eq!(futex.load_from_worker(Ordering::Relaxed), current);
         }
     }
 
@@ -814,34 +819,37 @@ mod tests {
             worker_idx in  0..WorkerFutex::MAX_WORKERS,
         ) {
             let assert_location1_closer = || {
-                assert!(location1.is_closer(location2, worker_idx));
-                assert!(!location2.is_closer(location1, worker_idx));
+                prop_assert!(location1.is_closer(location2, worker_idx));
+                prop_assert!(!location2.is_closer(location1, worker_idx));
+                Ok(())
             };
             let assert_location2_closer = || {
-                assert!(!location1.is_closer(location2, worker_idx));
-                assert!(location2.is_closer(location1, worker_idx));
+                prop_assert!(!location1.is_closer(location2, worker_idx));
+                prop_assert!(location2.is_closer(location1, worker_idx));
+                Ok(())
             };
             let assert_distance_equal = || {
-                assert!(!location1.is_closer(location2, worker_idx));
-                assert!(!location2.is_closer(location1, worker_idx));
+                prop_assert!(!location1.is_closer(location2, worker_idx));
+                prop_assert!(!location2.is_closer(location1, worker_idx));
+                Ok(())
             };
             match (location1, location2) {
                 (StealLocation::Worker(_), StealLocation::Injector) => {
-                    assert_location1_closer();
+                    assert_location1_closer()?;
                 }
                 (StealLocation::Injector, StealLocation::Injector) => {
-                    assert_distance_equal();
+                    assert_distance_equal()?;
                 }
                 (StealLocation::Injector, StealLocation::Worker(_)) => {
-                    assert_location2_closer();
+                    assert_location2_closer()?;
                 }
                 (StealLocation::Worker(idx1), StealLocation::Worker(idx2)) => {
                     let distance1 = worker_idx.abs_diff(idx1);
                     let distance2 = worker_idx.abs_diff(idx2);
                     match distance1.cmp(&distance2) {
-                        std::cmp::Ordering::Less => assert_location1_closer(),
-                        std::cmp::Ordering::Equal => assert_distance_equal(),
-                        std::cmp::Ordering::Greater => assert_location2_closer(),
+                        std::cmp::Ordering::Less => assert_location1_closer()?,
+                        std::cmp::Ordering::Equal => assert_distance_equal()?,
+                        std::cmp::Ordering::Greater => assert_location2_closer()?,
                     }
                 }
             }
@@ -881,10 +889,11 @@ mod tests {
                 std::thread::sleep(WAIT_FOR_SLEEP);
                 assert_eq!(operation(&futex), expected_result);
             } else {
-                assert_eq!(operation(&futex), expected_result);
+                prop_assert_eq!(operation(&futex), expected_result);
                 start.wait();
             }
-        });
+            Ok(())
+        })?;
     }
 
     proptest! {
@@ -904,8 +913,8 @@ mod tests {
             };
             let suggest = |futex: &WorkerFutex| futex.suggest_steal(proposed_location, worker_idx, update, load);
             if !closer {
-                assert_eq!(suggest(&futex), Err(initial));
-                assert_eq!(futex.load(Ordering::Relaxed), initial);
+                prop_assert_eq!(suggest(&futex), Err(initial));
+                prop_assert_eq!(futex.load(Ordering::Relaxed), initial);
                 return Ok(());
             }
 
