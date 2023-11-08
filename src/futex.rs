@@ -863,7 +863,7 @@ mod tests {
         operation: impl FnOnce(&WorkerFutex) -> R,
         expected_result: R,
         expected_state_change: impl FnOnce(WorkerFutexState) -> WorkerFutexState + Send,
-    ) {
+    ) -> Result<(), TestCaseError> {
         let initial = futex.load(Ordering::Relaxed);
         let start = Barrier::new(2);
         std::thread::scope(|scope| {
@@ -893,7 +893,7 @@ mod tests {
                 start.wait();
             }
             Ok(())
-        })?;
+        })
     }
 
     proptest! {
@@ -929,7 +929,7 @@ mod tests {
                 suggest,
                 Ok(updated),
                 |_initial| updated
-            );
+            )?;
         }
 
         #[test]
@@ -946,7 +946,7 @@ mod tests {
                     sleeping: false,
                     ..initial
                 }
-            );
+            )?;
         }
     }
 
@@ -985,7 +985,7 @@ mod tests {
                     sleeping: false,
                     ..initial
                 }
-            );
+            )?;
         }
     }
 }

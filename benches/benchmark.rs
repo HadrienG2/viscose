@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Bencher, BenchmarkId, Criterion};
-use sched_local::{flags::AtomicFlags, FlatPool};
+use sched_local::{flags::AtomicFlags, pool::FlatPool};
 use std::sync::atomic::Ordering;
 
 fn criterion_benchmark(c: &mut Criterion) {
