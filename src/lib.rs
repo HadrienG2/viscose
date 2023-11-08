@@ -7,7 +7,11 @@ pub mod pool;
 mod worker;
 
 use crate::worker::Scope;
-use std::time::Duration;
+use iterator_ilp::IteratorILP;
+use std::{
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 
 /// Busy-waiting time between declaring sleepiness and falling asleep
 ///
@@ -77,4 +81,260 @@ pub fn fibonacci_flat(scope: &Scope<'_>, n: u64) -> u64 {
     } else {
         n
     }
+}
+
+/// Array of floats that can be split into blocks, where each block tracks which
+/// thread pool worker it is local to
+pub struct LocalFloats<const BLOCK_SIZE: usize> {
+    /// Inner floating-point data (size must be a multiple of BLOCK_SIZE)
+    data: Box<[f32]>,
+
+    /// Per-block tracking of which worker processes data is local to
+    locality: Box<[Option<usize>]>,
+}
+//
+impl<const BLOCK_SIZE: usize> LocalFloats<BLOCK_SIZE> {
+    /// Set up storage for N data blocks
+    pub fn new(num_blocks: usize) -> Self {
+        Self {
+            data: std::iter::repeat(0.0)
+                .take(num_blocks * BLOCK_SIZE)
+                .collect(),
+            locality: std::iter::repeat(None).take(num_blocks).collect(),
+        }
+    }
+
+    /// Acquire a slice covering the whole dataset
+    pub fn as_slice(&mut self) -> LocalFloatsSlice<'_, BLOCK_SIZE> {
+        LocalFloatsSlice {
+            data: &mut self.data[..],
+            locality: &mut self.locality[..],
+        }
+    }
+}
+//
+/// Slice to some LocalFloats
+pub struct LocalFloatsSlice<'target, const BLOCK_SIZE: usize> {
+    /// Slice of the underlying LocalFloats::data
+    data: &'target mut [f32],
+
+    /// Slice of the underlying LocalFloats::locality
+    locality: &'target mut [Option<usize>],
+}
+//
+impl<'target, const BLOCK_SIZE: usize> LocalFloatsSlice<'target, BLOCK_SIZE> {
+    /// Split into two halves and process the halves if this slice more than one
+    /// block long, otherwise process that single block sequentially
+    pub fn process<R: Send>(
+        &mut self,
+        parallel: impl FnOnce([LocalFloatsSlice<'_, BLOCK_SIZE>; 2]) -> R,
+        sequential: impl FnOnce(&mut [f32; BLOCK_SIZE], &mut Option<usize>) -> R,
+        default: R,
+    ) -> R {
+        match self.locality.len() {
+            0 => default,
+            1 => {
+                debug_assert_eq!(self.data.len(), BLOCK_SIZE);
+                let data: *mut [f32; BLOCK_SIZE] = self.data.as_mut_ptr().cast();
+                sequential(unsafe { &mut *data }, &mut self.locality[0])
+            }
+            _ => parallel(self.split()),
+        }
+    }
+
+    /// Split this slice into two halves (second half may be empty)
+    fn split<'self_, 'borrow>(&'self_ mut self) -> [LocalFloatsSlice<'borrow, BLOCK_SIZE>; 2]
+    where
+        'self_: 'borrow,
+        'target: 'borrow, // Probably redundant, but clarifies the safety proof
+    {
+        let num_blocks = self.locality.len();
+        let left_blocks = num_blocks / 2;
+        let right_blocks = num_blocks - left_blocks;
+        // SAFETY: This is basically a double split_at_mut(), but for some
+        //         reason the borrow checker does not accept the safe code that
+        //         calls split_at_mut() twice and shoves the outputs into Self.
+        //
+        //         I believe this to be a false positive because the lifetime
+        //         bounds ensure that...
+        //
+        //         - Since 'self_: 'borrow, self cannot be used as long as the
+        //           output LocalFloatsSlice object is live, Therefore, it is
+        //           impossible to use the original slice as long as the
+        //           reborrowed slice is live, so although there is some &mut
+        //           aliasing, it is harmless just as in split_at_mut()..
+        //         - Since 'target: 'borrow, the output slice cannot outlive the
+        //           source data, so no use-after-free/move is possible.
+        unsafe {
+            [
+                Self {
+                    data: std::slice::from_raw_parts_mut(
+                        self.data.as_mut_ptr(),
+                        left_blocks * BLOCK_SIZE,
+                    ),
+                    locality: std::slice::from_raw_parts_mut(
+                        self.locality.as_mut_ptr(),
+                        left_blocks,
+                    ),
+                },
+                Self {
+                    data: std::slice::from_raw_parts_mut(
+                        self.data.as_mut_ptr().add(left_blocks * BLOCK_SIZE),
+                        right_blocks * BLOCK_SIZE,
+                    ),
+                    locality: std::slice::from_raw_parts_mut(
+                        self.locality.as_mut_ptr().add(left_blocks),
+                        right_blocks,
+                    ),
+                },
+            ]
+        }
+    }
+}
+
+/// Memory-bound recursive squared vector norm computation based on FlatPool
+///
+/// This computation is not written for optimal efficiency (a single-pass
+/// algorithm would be more efficient), but to highlight the importance of NUMA
+/// and cache locality in multi-threaded work. It purposely writes down the
+/// squares of vector elements and then reads them back to assess how the
+/// performance of such memory-bound code is affected by allocation locality.
+#[inline]
+pub fn norm_sqr_flat<
+    const BLOCK_SIZE: usize,
+    const SUM_ILP_STREAMS: usize,
+    const NORM_ILP_STREAMS: usize,
+    const TRACK_MIGRATIONS: bool,
+>(
+    scope: &Scope<'_>,
+    slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
+) -> f32 {
+    let num_migrations = &AtomicUsize::new(0);
+    let num_blocks = slice.locality.len();
+    let result = slice.process(
+        |[mut left, mut right]| {
+            scope.join(
+                || square_impl::<BLOCK_SIZE, TRACK_MIGRATIONS>(scope, &mut left),
+                |scope| square_impl::<BLOCK_SIZE, TRACK_MIGRATIONS>(scope, &mut right),
+            );
+            let (left, right) = scope.join(
+                || {
+                    sum_impl::<BLOCK_SIZE, SUM_ILP_STREAMS, TRACK_MIGRATIONS>(
+                        scope,
+                        &mut left,
+                        num_migrations,
+                    )
+                },
+                move |scope| {
+                    sum_impl::<BLOCK_SIZE, SUM_ILP_STREAMS, TRACK_MIGRATIONS>(
+                        scope,
+                        &mut right,
+                        num_migrations,
+                    )
+                },
+            );
+            left + right
+        },
+        |block, _locality| {
+            block.iter().copied().fold_ilp::<NORM_ILP_STREAMS, f32>(
+                || 0.0,
+                |acc, term| {
+                    if cfg!(target_feature = "fma") {
+                        term.mul_add(term, acc)
+                    } else {
+                        acc + term * term
+                    }
+                },
+                |acc1, acc2| acc1 + acc2,
+            )
+        },
+        0.0,
+    );
+    #[allow(clippy::print_stdout)]
+    if TRACK_MIGRATIONS {
+        println!(
+            "{}/{num_blocks} blocks were used outside of their home locality",
+            num_migrations.load(Ordering::Relaxed),
+        );
+    }
+    result
+}
+
+/// Square each number inside of a LocalFloatsSlice
+#[inline]
+pub fn square_flat<const BLOCK_SIZE: usize>(
+    scope: &Scope<'_>,
+    slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
+) {
+    square_impl::<BLOCK_SIZE, false>(scope, slice)
+}
+
+/// Sum the numbers inside of a LocalFloatSlice
+#[inline]
+pub fn sum_flat<const BLOCK_SIZE: usize, const ILP_STREAMS: usize>(
+    scope: &Scope<'_>,
+    slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
+) -> f32 {
+    sum_impl::<BLOCK_SIZE, ILP_STREAMS, false>(scope, slice, &AtomicUsize::new(0))
+}
+
+/// Implementation of [`square()`] that tracks where data was originally located
+#[inline]
+fn square_impl<const BLOCK_SIZE: usize, const TRACK_MIGRATIONS: bool>(
+    scope: &Scope<'_>,
+    slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
+) {
+    slice.process(
+        |[mut left, mut right]| {
+            scope.join(
+                || square_impl::<BLOCK_SIZE, TRACK_MIGRATIONS>(scope, &mut left),
+                move |scope| square_impl::<BLOCK_SIZE, TRACK_MIGRATIONS>(scope, &mut right),
+            );
+        },
+        |block, locality| {
+            if TRACK_MIGRATIONS {
+                *locality = Some(scope.worker_id());
+            }
+            // TODO: Experiment with pinning allocations, etc
+            block.iter_mut().for_each(|elem| *elem = elem.powi(2));
+        },
+        (),
+    );
+}
+
+/// Implementation of [`sum()`] that tracks if data moved since [`square()`]
+#[inline]
+fn sum_impl<const BLOCK_SIZE: usize, const ILP_STREAMS: usize, const TRACK_MIGRATIONS: bool>(
+    scope: &Scope<'_>,
+    slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
+    num_migrations: &AtomicUsize,
+) -> f32 {
+    slice.process(
+        |[mut left, mut right]| {
+            let (left, right) = scope.join(
+                || {
+                    sum_impl::<BLOCK_SIZE, ILP_STREAMS, TRACK_MIGRATIONS>(
+                        scope,
+                        &mut left,
+                        num_migrations,
+                    )
+                },
+                move |scope| {
+                    sum_impl::<BLOCK_SIZE, ILP_STREAMS, TRACK_MIGRATIONS>(
+                        scope,
+                        &mut right,
+                        num_migrations,
+                    )
+                },
+            );
+            left + right
+        },
+        |block, locality| {
+            if TRACK_MIGRATIONS && locality.unwrap() != scope.worker_id() {
+                num_migrations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            block.iter().copied().sum_ilp::<ILP_STREAMS, f32>()
+        },
+        0.0,
+    )
 }

@@ -9,6 +9,7 @@ edition = "2021"
 atomic-wait = { version = "1.1.0", default-features = false }
 crossbeam = { version = "0.8.2", features = ["crossbeam-deque"] }
 hwlocality = { git = "https://github.com/HadrienG2/hwlocality.git" }
+iterator_ilp = "2.0"
 itertools = "0.11"
 
 [dev-dependencies]
@@ -21,7 +22,19 @@ rayon = { version = "1.8.0", default-features = false }
 bench = false
 
 [[bench]]
-name = "benchmark"
+name = "flags"
+harness = false
+
+[[bench]]
+name = "fibonacci"
+harness = false
+
+[[bench]]
+name = "square"
+harness = false
+
+[[bench]]
+name = "sum"
 harness = false
 
 [profile.bench]
