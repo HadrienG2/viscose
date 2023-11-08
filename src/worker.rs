@@ -195,7 +195,7 @@ impl<'pool> Worker<'pool> {
                         // ...then truly fall asleep after a while
                         //
                         // Synchronize with other threads manipulating the futex
-                        // during out sleep.
+                        // during our sleep.
                         let _new_futex_state = self.futex.wait_for_change(
                             futex_state,
                             Ordering::Release,
@@ -210,7 +210,7 @@ impl<'pool> Worker<'pool> {
                     self.sleepy_state.set(Some((1, Instant::now())));
                     let _new_futex_state =
                         self.futex
-                            .notify_sleepy(futex_state, Ordering::Release, Ordering::Acquire);
+                            .notify_sleepy(futex_state, Ordering::Release, Ordering::Relaxed);
                 }
             } else {
                 // No work available for now and no more work expected, nothing
