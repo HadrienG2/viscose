@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Bencher, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, Bencher, BenchmarkId, Criterion, Throughput};
 use sched_local::{flags::AtomicFlags, pool::FlatPool};
 use std::sync::atomic::Ordering;
 
@@ -18,10 +18,12 @@ fn bench_flags(c: &mut Criterion) {
             c: &mut Criterion,
             flags: &AtomicFlags,
             group_name: &str,
+            num_inner_ops: usize,
             mut op: impl FnMut(&AtomicFlags, usize) -> R,
         ) {
             use pessimize::hide;
             let mut group = c.benchmark_group(group_name);
+            group.throughput(Throughput::Elements(num_inner_ops as _));
             group.bench_function("first", |b| b.iter(|| op(hide(flags), hide(0))));
             group.bench_function("center", |b| {
                 let center = flags.len() / 2;
@@ -34,23 +36,35 @@ fn bench_flags(c: &mut Criterion) {
         }
 
         // Operations that test a single bit
-        bench_indexed_op(c, &flags, &format!("{header}/is_set"), |flags, pos| {
+        bench_indexed_op(c, &flags, &format!("{header}/is_set"), 1, |flags, pos| {
             flags.is_set(pos, Ordering::Relaxed)
         });
-        bench_indexed_op(c, &flags, &format!("{header}/fetch_set"), |flags, pos| {
-            flags.fetch_set(pos, Ordering::Relaxed)
-        });
-        bench_indexed_op(c, &flags, &format!("{header}/fetch_clear"), |flags, pos| {
-            flags.fetch_clear(pos, Ordering::Relaxed)
-        });
+        bench_indexed_op(
+            c,
+            &flags,
+            &format!("{header}/fetch_set"),
+            1,
+            |flags, pos| flags.fetch_set(pos, Ordering::Relaxed),
+        );
+        bench_indexed_op(
+            c,
+            &flags,
+            &format!("{header}/fetch_clear"),
+            1,
+            |flags, pos| flags.fetch_clear(pos, Ordering::Relaxed),
+        );
 
         // Operations that set all bits to the same value
-        c.bench_function(&format!("{header}/set_all"), |b| {
-            b.iter(|| pessimize::hide(&flags).set_all(Ordering::Relaxed))
-        });
-        c.bench_function(&format!("{header}/clear_all"), |b| {
-            b.iter(|| pessimize::hide(&flags).clear_all(Ordering::Relaxed))
-        });
+        {
+            let mut group = c.benchmark_group(&format!("{header}/all/"));
+            group.throughput(Throughput::Elements(flags.len() as _));
+            group.bench_function(&format!("{header}/set_all"), |b| {
+                b.iter(|| pessimize::hide(&flags).set_all(Ordering::Relaxed))
+            });
+            group.bench_function(&format!("{header}/clear_all"), |b| {
+                b.iter(|| pessimize::hide(&flags).clear_all(Ordering::Relaxed))
+            });
+        }
 
         // Benchark the iterators over set and unset indices
         fn bench_iterator<Item>(
@@ -61,11 +75,23 @@ fn bench_flags(c: &mut Criterion) {
             count: impl Fn(&AtomicFlags, usize) -> usize,
         ) {
             flags.set_all(Ordering::Relaxed);
-            bench_indexed_op(c, flags, &format!("{name_header}/ones/once"), &next);
-            bench_indexed_op(c, flags, &format!("{name_header}/ones/all"), &count);
+            bench_indexed_op(c, flags, &format!("{name_header}/ones/once"), 1, &next);
+            bench_indexed_op(
+                c,
+                flags,
+                &format!("{name_header}/ones/all"),
+                flags.len(),
+                &count,
+            );
             flags.clear_all(Ordering::Relaxed);
-            bench_indexed_op(c, flags, &format!("{name_header}/zeroes/once"), &next);
-            bench_indexed_op(c, flags, &format!("{name_header}/zeroes/all"), &count);
+            bench_indexed_op(c, flags, &format!("{name_header}/zeroes/once"), 1, &next);
+            bench_indexed_op(
+                c,
+                flags,
+                &format!("{name_header}/zeroes/all"),
+                flags.len(),
+                &count,
+            );
         }
         bench_iterator(
             c,
