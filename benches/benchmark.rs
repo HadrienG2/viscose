@@ -71,11 +71,17 @@ fn bench_flags(c: &mut Criterion) {
             c,
             &flags,
             &format!("{header}/iter_set_around/inclusive"),
-            |flags, pos| flags.iter_set_around::<true>(pos, Ordering::Relaxed).next(),
             |flags, pos| {
                 flags
                     .iter_set_around::<true>(pos, Ordering::Relaxed)
-                    .count()
+                    .map(|mut it| it.next())
+                    .unwrap_or(None)
+            },
+            |flags, pos| {
+                flags
+                    .iter_set_around::<true>(pos, Ordering::Relaxed)
+                    .map(Iterator::count)
+                    .unwrap_or(0)
             },
         );
         bench_iterator(
@@ -85,12 +91,14 @@ fn bench_flags(c: &mut Criterion) {
             |flags, pos| {
                 flags
                     .iter_set_around::<false>(pos, Ordering::Relaxed)
-                    .next()
+                    .map(|mut it| it.next())
+                    .unwrap_or(None)
             },
             |flags, pos| {
                 flags
                     .iter_set_around::<false>(pos, Ordering::Relaxed)
-                    .count()
+                    .map(Iterator::count)
+                    .unwrap_or(0)
             },
         );
         bench_iterator(
@@ -100,12 +108,14 @@ fn bench_flags(c: &mut Criterion) {
             |flags, pos| {
                 flags
                     .iter_unset_around::<true>(pos, Ordering::Relaxed)
-                    .next()
+                    .map(|mut it| it.next())
+                    .unwrap_or(None)
             },
             |flags, pos| {
                 flags
                     .iter_unset_around::<true>(pos, Ordering::Relaxed)
-                    .count()
+                    .map(Iterator::count)
+                    .unwrap_or(0)
             },
         );
         bench_iterator(
@@ -115,12 +125,14 @@ fn bench_flags(c: &mut Criterion) {
             |flags, pos| {
                 flags
                     .iter_unset_around::<false>(pos, Ordering::Relaxed)
-                    .next()
+                    .map(|mut it| it.next())
+                    .unwrap_or(None)
             },
             |flags, pos| {
                 flags
                     .iter_unset_around::<false>(pos, Ordering::Relaxed)
-                    .count()
+                    .map(Iterator::count)
+                    .unwrap_or(0)
             },
         );
     }

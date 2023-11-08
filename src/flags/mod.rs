@@ -104,20 +104,22 @@ impl AtomicFlags {
     ///
     /// The underlying words are read with the specified ordering, but beware
     /// that not every bit readout requires a word readout.
+    ///
+    /// Returns None if it can be proven early that iteration will yield no bit
     pub fn iter_set_around<const INCLUDE_CENTER: bool>(
         &self,
         center_bit_idx: usize,
         order: Ordering,
-    ) -> impl Iterator<Item = usize> + '_ {
+    ) -> Option<impl Iterator<Item = usize> + '_> {
         iter::NearestFlagIterator::<true, INCLUDE_CENTER>::new(self, center_bit_idx, order)
     }
 
-    /// Like iter_set_around, but for unset flags
+    /// Like iter_set_around, but looks for unset flags instead of set flags
     pub fn iter_unset_around<const INCLUDE_CENTER: bool>(
         &self,
         center_bit_idx: usize,
         order: Ordering,
-    ) -> impl Iterator<Item = usize> + '_ {
+    ) -> Option<impl Iterator<Item = usize> + '_> {
         iter::NearestFlagIterator::<false, INCLUDE_CENTER>::new(self, center_bit_idx, order)
     }
 

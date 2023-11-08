@@ -278,13 +278,18 @@ impl SharedState {
         task_location: StealLocation,
         update: Ordering,
     ) {
+        // Check if there are job-less neighbors to submit work to
+        let Some(asleep_neighbors) = self
+            .work_availability
+            .iter_unset_around::<INCLUDE_CENTER>(local_worker, Ordering::Acquire)
+        else {
+            return;
+        };
+
         // Iterate over increasingly remote job-less neighbors
         //
         // Need Acquire ordering so the futex is read after the status flag
-        for closest_asleep in self
-            .work_availability
-            .iter_unset_around::<INCLUDE_CENTER>(local_worker, Ordering::Acquire)
-        {
+        for closest_asleep in asleep_neighbors {
             // Update their futex recommendation as appropriate
             let accepted = self.workers[closest_asleep].futex.suggest_steal(
                 task_location,

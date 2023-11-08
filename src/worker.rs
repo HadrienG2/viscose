@@ -287,16 +287,19 @@ impl<'pool> Worker<'pool> {
     /// Return from which source work was stolen (if any), using the conventions
     /// of `self.futex`, so that `self.futex` can be updated if appropriate.
     fn steal_from_anyone(&self) -> Option<StealLocation> {
-        // Try to steal from other workers at increasing distances
-        //
-        // Need Acquire so stealing happens after checking work availability.
-        for idx in self
+        // Are there other workers we could steal work from?
+        if let Some(neighbors_with_work) = self
             .shared
             .work_availability
             .iter_set_around::<false>(self.idx, Ordering::Acquire)
         {
-            if self.steal_from_worker(idx) {
-                return Some(StealLocation::Worker(idx));
+            // Try to steal from other workers at increasing distances
+            //
+            // Need Acquire so stealing happens after checking work availability.
+            for idx in neighbors_with_work {
+                if self.steal_from_worker(idx) {
+                    return Some(StealLocation::Worker(idx));
+                }
             }
         }
 
