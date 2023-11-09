@@ -94,18 +94,10 @@ fn norm_sqr_rayon<const BLOCK_SIZE: usize, const REDUCE_ILP_STREAMS: usize>(
             );
             left + right
         },
-        |block, _locality| {
-            block.iter().copied().fold_ilp::<REDUCE_ILP_STREAMS, f32>(
-                || 0.0,
-                |acc, elem| {
-                    if cfg!(target_feature = "fma") {
-                        elem.mul_add(elem, acc)
-                    } else {
-                        acc + elem * elem
-                    }
-                },
-                |acc1, acc2| acc1 + acc2,
-            )
+        |mut block, _locality| {
+            block.iter_mut().for_each(|elem| *elem = elem.powi(2));
+            block = pessimize::hide(block);
+            block.iter().copied().sum_ilp::<REDUCE_ILP_STREAMS, f32>()
         },
         0.0,
     )

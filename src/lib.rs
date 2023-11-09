@@ -7,6 +7,7 @@ mod state;
 mod worker;
 
 use crate::worker::Scope;
+use crossbeam::utils::CachePadded;
 use iterator_ilp::IteratorILP;
 use std::time::Duration;
 
@@ -87,7 +88,7 @@ pub struct LocalFloats<const BLOCK_SIZE: usize> {
     data: Box<[f32]>,
 
     /// Per-block tracking of which worker processes data is local to
-    locality: Box<[Option<usize>]>,
+    locality: Box<[CachePadded<Option<usize>>]>,
 }
 //
 impl<const BLOCK_SIZE: usize> LocalFloats<BLOCK_SIZE> {
@@ -97,7 +98,9 @@ impl<const BLOCK_SIZE: usize> LocalFloats<BLOCK_SIZE> {
             data: std::iter::repeat(0.0)
                 .take(num_blocks * BLOCK_SIZE)
                 .collect(),
-            locality: std::iter::repeat(None).take(num_blocks).collect(),
+            locality: std::iter::repeat(CachePadded::new(None))
+                .take(num_blocks)
+                .collect(),
         }
     }
 
@@ -116,7 +119,7 @@ pub struct LocalFloatsSlice<'target, const BLOCK_SIZE: usize> {
     data: &'target mut [f32],
 
     /// Slice of the underlying LocalFloats::locality
-    locality: &'target mut [Option<usize>],
+    locality: &'target mut [CachePadded<Option<usize>>],
 }
 //
 impl<'target, const BLOCK_SIZE: usize> LocalFloatsSlice<'target, BLOCK_SIZE> {
@@ -213,18 +216,12 @@ pub fn norm_sqr_flat<const BLOCK_SIZE: usize, const REDUCE_ILP_STREAMS: usize>(
             );
             left + right
         },
-        |block, _locality| {
-            block.iter().copied().fold_ilp::<REDUCE_ILP_STREAMS, _>(
-                || 0.0,
-                |acc, term| {
-                    if cfg!(target_feature = "fma") {
-                        term.mul_add(term, acc)
-                    } else {
-                        acc + term * term
-                    }
-                },
-                |acc1, acc2| acc1 + acc2,
-            )
+        |mut block, locality| {
+            *locality = Some(scope.worker_id());
+            // TODO: Experiment with pinning allocations, etc
+            block.iter_mut().for_each(|elem| *elem = elem.powi(2));
+            block = pessimize::hide(block);
+            block.iter().copied().sum_ilp::<REDUCE_ILP_STREAMS, f32>()
         },
         0.0,
     )
