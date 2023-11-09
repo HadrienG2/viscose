@@ -29,7 +29,6 @@ impl<'flags, const FIND_SET: bool, const INCLUDE_CENTER: bool>
     NearestFlagIterator<'flags, FIND_SET, INCLUDE_CENTER>
 {
     /// Start iterating over set/uset bits around a central position
-    #[inline(always)]
     pub(crate) fn new(
         flags: &'flags AtomicFlags,
         center_bit_idx: usize,
@@ -56,7 +55,6 @@ impl<'flags, const FIND_SET: bool, const INCLUDE_CENTER: bool> Iterator
 {
     type Item = usize;
 
-    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         // Yield the central index first
         if INCLUDE_CENTER && self.yield_center {
@@ -126,7 +124,6 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
     }
 
     /// Start iteration from a prepared initial state
-    #[inline]
     pub(crate) fn from_initial_state(initial: InitialState<'flags>) -> Self {
         let InitialState {
             shared,
@@ -152,7 +149,6 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
 
     /// Go to the next occurence of the bit value of interest in the flags, or
     /// to the end of iteration.
-    #[inline(always)]
     fn find_next_bit(&mut self) -> Option<()> {
         self.seek_in_word(1)
             .and_then(|()| self.find_bit_in_word())
@@ -301,7 +297,6 @@ impl<const FIND_SET: bool, const GOING_LEFT: bool> Iterator
 {
     type Item = usize;
 
-    #[inline(always)]
     fn next(&mut self) -> Option<usize> {
         let bit_idx = self.peek()?;
         self.find_next_bit();
@@ -393,7 +388,6 @@ impl<'flags> InitialState<'flags> {
     }
 
     /// Subset of the iteration work that's independent of FIND_SET
-    #[inline]
     fn set_independent_init(
         flags: &'flags AtomicFlags,
         start_bit_idx: usize,

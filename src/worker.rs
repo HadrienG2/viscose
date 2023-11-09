@@ -398,7 +398,6 @@ impl<'scope> Scope<'scope> {
     /// notification has not been received. This entails in particular that all
     /// code including spawn_unchecked until the point where the remote task has
     /// signaled completion should translate unwinding panics to aborts.
-    #[inline]
     unsafe fn spawn_unchecked(&self, job: DynJob) {
         // Schedule the work to be executed
         self.0.work_queue.push(job);

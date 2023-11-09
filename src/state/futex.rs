@@ -210,7 +210,6 @@ impl WorkerFutex {
     ///
     /// Note that unlike `compare_exchange`, this returns the _updated_ futex
     /// state when the state has been successfully updated.
-    #[inline]
     pub fn suggest_steal(
         &self,
         proposed_location: StealLocation,
