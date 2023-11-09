@@ -12,6 +12,7 @@ use hwlocality::{
     topology::Topology,
 };
 use std::{
+    borrow::Borrow,
     collections::HashMap,
     sync::{
         atomic::{self, AtomicBool, Ordering},
@@ -37,11 +38,18 @@ pub struct FlatPool {
 }
 //
 impl FlatPool {
-    /// Create a thread pool
+    /// Create a thread pool that uses all system CPU cores
     pub fn new() -> Self {
-        // Probe the hwloc topology
         let topology = Arc::new(Topology::new().unwrap());
-        let cpuset = topology.cpuset();
+        Self::with_affinity(topology, CpuSet::full())
+    }
+
+    /// Create a thread pool with certain CPU affinity
+    ///
+    /// Only CPU cores that belong to this CpuSet will be used.
+    pub fn with_affinity(topology: Arc<Topology>, affinity: impl Borrow<CpuSet>) -> Self {
+        // Determine which CPUs we can use
+        let cpuset = topology.cpuset() & affinity;
 
         // Set up the shared state and work queues
         let (shared, work_queues) = SharedState::with_work_queues(cpuset.weight().unwrap());
