@@ -394,7 +394,8 @@ impl<'flags> InitialState<'flags> {
         order: Ordering,
     ) -> (SharedState<'flags>, usize, u32, Word) {
         let (word_idx, bit_shift) = flags.word_idx_and_bit_shift(start_bit_idx);
-        let word = flags.words[word_idx].load(order);
+        // SAFETY: word_idx_and_bit_shift does the bounds checking
+        let word = unsafe { flags.words.get_unchecked(word_idx).load(order) };
         (SharedState { flags, order }, word_idx, bit_shift, word)
     }
 }

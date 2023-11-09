@@ -69,7 +69,7 @@ impl SharedState {
         task_location: StealLocation,
         update: Ordering,
     ) {
-        // Check if there are job-less neighbors to submit work to
+        // Check if there are job-less neighbors to submit work to...
         let Some(asleep_neighbors) = self
             .work_availability
             .iter_unset_around::<INCLUDE_CENTER>(local_worker, Ordering::Acquire)
@@ -77,21 +77,38 @@ impl SharedState {
             return;
         };
 
-        // Iterate over increasingly remote job-less neighbors
-        //
-        // Need Acquire ordering so the futex is read after the status flag
-        for closest_asleep in asleep_neighbors {
-            // Update their futex recommendation as appropriate
-            let accepted = self.workers[closest_asleep].futex.suggest_steal(
-                task_location,
-                local_worker,
-                update,
-                Ordering::Relaxed,
-            );
-            if accepted.is_ok() {
-                return;
+        // ...and if so, wake them up
+        #[cold]
+        fn unlikely(
+            workers: &[CachePadded<WorkerInterface>],
+            asleep_neighbors: impl Iterator<Item = usize>,
+            local_worker: usize,
+            task_location: StealLocation,
+            update: Ordering,
+        ) {
+            // Iterate over increasingly remote job-less neighbors
+            //
+            // Need Acquire ordering so the futex is read after the status flag
+            for closest_asleep in asleep_neighbors {
+                // Update their futex recommendation as appropriate
+                let accepted = workers[closest_asleep].futex.suggest_steal(
+                    task_location,
+                    local_worker,
+                    update,
+                    Ordering::Relaxed,
+                );
+                if accepted.is_ok() {
+                    return;
+                }
             }
         }
+        unlikely(
+            &self.workers[..],
+            asleep_neighbors,
+            local_worker,
+            task_location,
+            update,
+        )
     }
 }
 

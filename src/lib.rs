@@ -14,10 +14,10 @@ use std::time::Duration;
 ///
 /// This is a compromise between avoiding sleep and wakeup latency on one side,
 /// and keeping idle threads asleep on the other side.
-const SLEEPY_DURATION: Duration = Duration::from_nanos(10);
+const SLEEPY_DURATION: Duration = Duration::from_nanos(1);
 
 /// Maximal number of spinning iterations before starting to sleep
-const MAX_SPIN_ITERS: usize = 1 << 5;
+const MAX_SPIN_ITERS: usize = 1 << 7;
 
 /// Sleep duration used for busy waiting
 ///

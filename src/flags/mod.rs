@@ -67,6 +67,7 @@ impl AtomicFlags {
 
     /// Set the Nth flag with certain atomic ordering, tell whether that flag
     /// was set beforehand
+    #[cold]
     pub fn fetch_set(&self, bit_idx: usize, order: Ordering) -> bool {
         let (word, bit) = self.word_and_bit(bit_idx);
         word.fetch_or(bit, order) & bit != 0
@@ -74,12 +75,14 @@ impl AtomicFlags {
 
     /// Clear the Nth flag with certain atomic ordering, tell whether that flag
     /// was set beforehand
+    #[cold]
     pub fn fetch_clear(&self, bit_idx: usize, order: Ordering) -> bool {
         let (word, bit) = self.word_and_bit(bit_idx);
         word.fetch_and(!bit, order) & bit != 0
     }
 
     /// Set all the flags
+    #[cold]
     pub fn set_all(&self, order: Ordering) {
         if order != Ordering::Relaxed {
             atomic::fence(order);
@@ -90,6 +93,7 @@ impl AtomicFlags {
     }
 
     /// Clear all the flags
+    #[cold]
     pub fn clear_all(&self, order: Ordering) {
         if order != Ordering::Relaxed {
             atomic::fence(order);
