@@ -1,6 +1,9 @@
 use criterion::{criterion_group, criterion_main, Bencher, Criterion};
 use iterator_ilp::IteratorILP;
-use sched_local::{pool::FlatPool, LocalFloats, LocalFloatsSlice};
+use sched_local::{
+    bench::{self, LocalFloats, LocalFloatsSlice},
+    pool::FlatPool,
+};
 
 fn criterion_benchmark(c: &mut Criterion) {
     fn bench_backend<const BLOCK_SIZE: usize>(
@@ -66,7 +69,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                 |b: &mut Bencher, slice| {
                     pool.run(|scope| {
                         b.iter(|| {
-                            sched_local::sum_flat::<BLOCK_SIZE, ILP_STREAMS>(
+                            bench::sum_flat::<BLOCK_SIZE, ILP_STREAMS>(
                                 scope,
                                 pessimize::hide(slice),
                             )

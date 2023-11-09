@@ -1,5 +1,8 @@
 use criterion::{criterion_group, criterion_main, Bencher, Criterion};
-use sched_local::{pool::FlatPool, LocalFloats, LocalFloatsSlice};
+use sched_local::{
+    bench::{self, LocalFloats, LocalFloatsSlice},
+    pool::FlatPool,
+};
 
 fn criterion_benchmark(c: &mut Criterion) {
     fn bench_backend<const BLOCK_SIZE: usize>(
@@ -38,7 +41,7 @@ fn criterion_benchmark(c: &mut Criterion) {
 
                 let pool = FlatPool::new();
                 bench_backend::<BLOCK_SIZE>(c, "square/flat", |b: &mut Bencher, slice| {
-                    pool.run(|scope| b.iter(|| sched_local::square_flat(scope, pessimize::hide(slice))))
+                    pool.run(|scope| b.iter(|| bench::square_flat(scope, pessimize::hide(slice))))
                 });
             }
         )*};

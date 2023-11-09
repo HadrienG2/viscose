@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Bencher, BenchmarkId, Criterion};
-use sched_local::pool::FlatPool;
+use sched_local::{bench, pool::FlatPool};
 
 fn criterion_benchmark(c: &mut Criterion) {
     fn bench_backend(
@@ -26,7 +26,7 @@ fn criterion_benchmark(c: &mut Criterion) {
 
     let pool = FlatPool::new();
     bench_backend(c, "flat", |b: &mut Bencher, size| {
-        pool.run(|scope| b.iter(|| sched_local::fibonacci_flat(scope, pessimize::hide(size))))
+        pool.run(|scope| b.iter(|| bench::fibonacci_flat(scope, pessimize::hide(size))))
     })
 }
 

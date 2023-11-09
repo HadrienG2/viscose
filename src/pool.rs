@@ -230,14 +230,4 @@ mod tests {
         // Check that thread pool initializes and shuts down correctly
         FlatPool::new();
     }
-
-    #[test]
-    fn fibonacci() {
-        let flat = FlatPool::new();
-        flat.run(|scope| {
-            for i in 0..=34 {
-                assert_eq!(crate::fibonacci_flat(scope, i), crate::fibonacci_ref(i));
-            }
-        });
-    }
 }
