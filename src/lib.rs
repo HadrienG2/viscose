@@ -1,9 +1,9 @@
 #![warn(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
 pub mod flags;
-mod futex;
 mod job;
 pub mod pool;
+mod state;
 mod worker;
 
 use crate::worker::Scope;

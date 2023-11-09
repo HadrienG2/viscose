@@ -1,9 +1,11 @@
 //! Single thread pool worker
 
 use crate::{
-    futex::{StealLocation, WorkerFutex},
     job::{DynJob, Job, Notify},
-    pool::SharedState,
+    state::{
+        futex::{StealLocation, WorkerFutex},
+        SharedState,
+    },
     AbortGuard, Work, MAX_SPIN_ITERS, SLEEPY_DURATION, YIELD_DURATION,
 };
 use crossbeam::deque::{self, Steal};
