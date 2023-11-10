@@ -102,7 +102,7 @@ impl<'flags, const CACHE_ITER_MASKS: bool> BitRef<'flags, CACHE_ITER_MASKS> {
         debug_assert!(self.belongs_to(flags));
         let word: *const AtomicWord = self.word;
         let start = flags.words.as_ptr();
-        word.offset_from(start) as usize
+        usize::try_from(word.offset_from(start)).unwrap_unchecked()
     }
 
     /// Index of this bit within the word of interest
