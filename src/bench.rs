@@ -5,12 +5,15 @@ use criterion::{Bencher, Criterion};
 use crossbeam::utils::CachePadded;
 use hwlocality::{cpu::binding::CpuBindingFlags, object::types::ObjectType, Topology};
 use iterator_ilp::IteratorILP;
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, OnceLock},
+};
 
 /// Run a benchmark for all interesting named CPU localities
 pub fn for_each_locality(mut bench: impl FnMut(&str, rayon::ThreadPool, &str, FlatPool)) {
     let topology = topology();
-    let mut last_affinity = None;
+    let mut seen_affinities = BTreeSet::new();
     for ty in [
         ObjectType::L1Cache,
         ObjectType::L3Cache,
@@ -34,12 +37,9 @@ pub fn for_each_locality(mut bench: impl FnMut(&str, rayon::ThreadPool, &str, Fl
             }
 
             // Check if this is the same as the last affinity we processed
-            if let Some(last_affinity) = &last_affinity {
-                if affinity == last_affinity {
-                    continue;
-                }
+            if !seen_affinities.insert(affinity.clone()) {
+                continue;
             }
-            last_affinity = Some(affinity.clone());
 
             // Help rayon at CPU affinity ;)
             topology
