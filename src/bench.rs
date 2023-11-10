@@ -11,7 +11,14 @@ use std::{
 };
 
 /// Run a benchmark for all interesting named CPU localities
-pub fn for_each_locality(mut bench: impl FnMut(&str, rayon::ThreadPool, &str, FlatPool)) {
+pub fn for_each_locality(
+    mut bench: impl FnMut(
+        &str,
+        Box<dyn FnMut() -> rayon::ThreadPool>,
+        &str,
+        Box<dyn FnMut() -> FlatPool>,
+    ),
+) {
     let topology = topology();
     let mut seen_affinities = BTreeSet::new();
     for ty in [
@@ -50,19 +57,22 @@ pub fn for_each_locality(mut bench: impl FnMut(&str, rayon::ThreadPool, &str, Fl
                 .unwrap();
 
             // Build thread pools
-            let flat_pool = FlatPool::with_affinity(topology.clone(), &affinity);
-            let rayon_pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(affinity.weight().unwrap())
-                .thread_name(|idx| format!("Rayon worker #{idx}"))
-                .build()
-                .unwrap();
+            let affinity2 = affinity.clone();
+            let make_flat_pool = move || FlatPool::with_affinity(topology.clone(), &affinity2);
+            let make_rayon_pool = move || {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(affinity.weight().unwrap())
+                    .thread_name(|idx| format!("Rayon worker #{idx}"))
+                    .build()
+                    .unwrap()
+            };
 
             // Run the benchmark
             bench(
                 &format!("{locality_name}/rayon"),
-                rayon_pool,
+                Box::new(make_rayon_pool),
                 &format!("{locality_name}/flat"),
-                flat_pool,
+                Box::new(make_flat_pool),
             )
         }
     }

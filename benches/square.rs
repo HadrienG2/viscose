@@ -2,8 +2,9 @@ use criterion::{criterion_group, criterion_main, Bencher, Criterion};
 use sched_local::bench::{self, bench_local_floats};
 
 fn criterion_benchmark(c: &mut Criterion) {
-    bench::for_each_locality(|rayon_name, rayon_pool, flat_name, flat_pool| {
-        macro_rules! bench_square {
+    bench::for_each_locality(
+        |rayon_name, mut make_rayon_pool, flat_name, mut make_flat_pool| {
+            macro_rules! bench_square {
             () => {
                 // I picked these values because...
                 // - Each float is 4 bytes
@@ -14,17 +15,24 @@ fn criterion_benchmark(c: &mut Criterion) {
             ($($block_size_pow2:expr),*) => {$(
                 {
                     const BLOCK_SIZE: usize = 1usize << $block_size_pow2;
-                    bench_local_floats::<BLOCK_SIZE>(c, "square", rayon_name, |b: &mut Bencher, slice| {
-                        rayon_pool.install(|| b.iter(|| bench::square_rayon(pessimize::hide(slice))))
-                    });
-                    bench_local_floats::<BLOCK_SIZE>(c, "square", flat_name, |b: &mut Bencher, slice| {
-                        flat_pool.run(|scope| b.iter(|| bench::square_flat(scope, pessimize::hide(slice))))
-                    });
+                    {
+                        let rayon_pool = make_rayon_pool();
+                        bench_local_floats::<BLOCK_SIZE>(c, "square", rayon_name, |b: &mut Bencher, slice| {
+                            rayon_pool.install(|| b.iter(|| bench::square_rayon(pessimize::hide(slice))))
+                        });
+                    }
+                    {
+                        let flat_pool = make_flat_pool();
+                        bench_local_floats::<BLOCK_SIZE>(c, "square", flat_name, |b: &mut Bencher, slice| {
+                            flat_pool.run(|scope| b.iter(|| bench::square_flat(scope, pessimize::hide(slice))))
+                        });
+                    }
                 }
             )*};
         }
-        bench_square!();
-    });
+            bench_square!();
+        },
+    );
 }
 
 criterion_group!(benches, criterion_benchmark);

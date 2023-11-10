@@ -2,8 +2,9 @@ use criterion::{criterion_group, criterion_main, Bencher, Criterion};
 use sched_local::bench::{self, bench_local_floats};
 
 fn criterion_benchmark(c: &mut Criterion) {
-    bench::for_each_locality(|rayon_name, rayon_pool, flat_name, flat_pool| {
-        macro_rules! bench_sum {
+    bench::for_each_locality(
+        |rayon_name, mut make_rayon_pool, flat_name, mut make_flat_pool| {
+            macro_rules! bench_sum {
             () => {
                 // I picked these values because...
                 // - 4 is the sweet spot for hyperthreaded SSE
@@ -26,39 +27,46 @@ fn criterion_benchmark(c: &mut Criterion) {
                 const BLOCK_SIZE: usize = 1usize << $block_size_pow2;
                 const ILP_STREAMS: usize = $ilp_streams;
                 let bench_name = &format!("sum/ilp{ILP_STREAMS}");
-                bench_local_floats::<BLOCK_SIZE>(
-                    c,
-                    bench_name,
-                    rayon_name,
-                    |b: &mut Bencher, slice| {
-                        rayon_pool.install(|| {
-                            b.iter(|| {
-                                bench::sum_rayon::<BLOCK_SIZE, ILP_STREAMS>(
-                                    pessimize::hide(slice)
-                                )
+                {
+                    let rayon_pool = make_rayon_pool();
+                    bench_local_floats::<BLOCK_SIZE>(
+                        c,
+                        bench_name,
+                        rayon_name,
+                        |b: &mut Bencher, slice| {
+                            rayon_pool.install(|| {
+                                b.iter(|| {
+                                    bench::sum_rayon::<BLOCK_SIZE, ILP_STREAMS>(
+                                        pessimize::hide(slice)
+                                    )
+                                })
                             })
-                        })
-                    },
-                );
-                bench_local_floats::<BLOCK_SIZE>(
-                    c,
-                    bench_name,
-                    flat_name,
-                    |b: &mut Bencher, slice| {
-                        flat_pool.run(|scope| {
-                            b.iter(|| {
-                                bench::sum_flat::<BLOCK_SIZE, ILP_STREAMS>(
-                                    scope,
-                                    pessimize::hide(slice),
-                                )
+                        },
+                    );
+                }
+                {
+                    let flat_pool = make_flat_pool();
+                    bench_local_floats::<BLOCK_SIZE>(
+                        c,
+                        bench_name,
+                        flat_name,
+                        |b: &mut Bencher, slice| {
+                            flat_pool.run(|scope| {
+                                b.iter(|| {
+                                    bench::sum_flat::<BLOCK_SIZE, ILP_STREAMS>(
+                                        scope,
+                                        pessimize::hide(slice),
+                                    )
+                                })
                             })
-                        })
-                    },
-                );
+                        },
+                    );
+                }
             })*};
         }
-        bench_sum!();
-    });
+            bench_sum!();
+        },
+    );
 }
 
 criterion_group!(benches, criterion_benchmark);
