@@ -54,11 +54,15 @@ fn criterion_benchmark(c: &mut Criterion) {
             let mut group = c.benchmark_group(group_name);
             group.throughput(Throughput::Elements(num_inner_ops as _));
             let first = flags.bit(0);
-            group.bench_function("first", |b| b.iter(|| op(hide(flags), hide(&first))));
+            group.bench_function("first/uncached", |b| {
+                b.iter(|| op(hide(flags), hide(&first)))
+            });
             let center = flags.bit(flags.len() / 2);
-            group.bench_function("center", |b| b.iter(|| op(hide(flags), hide(&center))));
+            group.bench_function("center/uncached", |b| {
+                b.iter(|| op(hide(flags), hide(&center)))
+            });
             let last = flags.bit(flags.len() - 1);
-            group.bench_function("last", |b| b.iter(|| op(hide(flags), hide(&last))));
+            group.bench_function("last/uncached", |b| b.iter(|| op(hide(flags), hide(&last))));
         }
         fn bench_ref_op_cached<R>(
             c: &mut Criterion,
@@ -71,11 +75,13 @@ fn criterion_benchmark(c: &mut Criterion) {
             let mut group = c.benchmark_group(group_name);
             group.throughput(Throughput::Elements(num_inner_ops as _));
             let first = flags.bit_with_cache(0);
-            group.bench_function("first", |b| b.iter(|| op(hide(flags), hide(&first))));
+            group.bench_function("first/cached", |b| b.iter(|| op(hide(flags), hide(&first))));
             let center = flags.bit_with_cache(flags.len() / 2);
-            group.bench_function("center", |b| b.iter(|| op(hide(flags), hide(&center))));
+            group.bench_function("center/cached", |b| {
+                b.iter(|| op(hide(flags), hide(&center)))
+            });
             let last = flags.bit_with_cache(flags.len() - 1);
-            group.bench_function("last", |b| b.iter(|| op(hide(flags), hide(&last))));
+            group.bench_function("last/cached", |b| b.iter(|| op(hide(flags), hide(&last))));
         }
 
         // Operations that test a single bit
@@ -114,8 +120,8 @@ fn criterion_benchmark(c: &mut Criterion) {
             c: &mut Criterion,
             flags: &AtomicFlags,
             name_header: &str,
-            next_uncached: impl Fn(&AtomicFlags, &BitRef<'_, false>),
-            next_cached: impl Fn(&AtomicFlags, &BitRef<'_, true>),
+            has_next_uncached: impl Fn(&AtomicFlags, &BitRef<'_, false>) -> bool,
+            has_next_cached: impl Fn(&AtomicFlags, &BitRef<'_, true>) -> bool,
             count_uncached: impl Fn(&AtomicFlags, &BitRef<'_, false>) -> usize,
             count_cached: impl Fn(&AtomicFlags, &BitRef<'_, true>) -> usize,
         ) {
@@ -125,14 +131,14 @@ fn criterion_benchmark(c: &mut Criterion) {
                 flags,
                 &format!("{name_header}/ones/once"),
                 1,
-                &next_uncached,
+                &has_next_uncached,
             );
             bench_ref_op_cached(
                 c,
                 flags,
                 &format!("{name_header}/ones/once"),
                 1,
-                &next_cached,
+                &has_next_cached,
             );
             bench_ref_op_uncached(
                 c,
@@ -154,14 +160,14 @@ fn criterion_benchmark(c: &mut Criterion) {
                 flags,
                 &format!("{name_header}/zeroes/once"),
                 1,
-                &next_uncached,
+                &has_next_uncached,
             );
             bench_ref_op_cached(
                 c,
                 flags,
                 &format!("{name_header}/zeroes/once"),
                 1,
-                &next_cached,
+                &has_next_cached,
             );
             bench_ref_op_uncached(
                 c,
@@ -183,20 +189,18 @@ fn criterion_benchmark(c: &mut Criterion) {
             &flags,
             &format!("{header}/iter_set_around/inclusive"),
             |flags, pos| {
-                pessimize::consume(
-                    &flags
-                        .iter_set_around::<true, false>(pos, Ordering::Relaxed)
-                        .map(|mut it| it.next())
-                        .unwrap_or(None),
-                )
+                flags
+                    .iter_set_around::<true, false>(pos, Ordering::Relaxed)
+                    .map(|mut it| it.next())
+                    .unwrap_or(None)
+                    .is_some()
             },
             |flags, pos| {
-                pessimize::consume(
-                    &flags
-                        .iter_set_around::<true, true>(pos, Ordering::Relaxed)
-                        .map(|mut it| it.next())
-                        .unwrap_or(None),
-                )
+                flags
+                    .iter_set_around::<true, true>(pos, Ordering::Relaxed)
+                    .map(|mut it| it.next())
+                    .unwrap_or(None)
+                    .is_some()
             },
             |flags, pos| {
                 flags
@@ -216,20 +220,18 @@ fn criterion_benchmark(c: &mut Criterion) {
             &flags,
             &format!("{header}/iter_set_around/exclusive"),
             |flags, pos| {
-                pessimize::consume(
-                    &flags
-                        .iter_set_around::<false, false>(pos, Ordering::Relaxed)
-                        .map(|mut it| it.next())
-                        .unwrap_or(None),
-                )
+                flags
+                    .iter_set_around::<false, false>(pos, Ordering::Relaxed)
+                    .map(|mut it| it.next())
+                    .unwrap_or(None)
+                    .is_some()
             },
             |flags, pos| {
-                pessimize::consume(
-                    &flags
-                        .iter_set_around::<false, true>(pos, Ordering::Relaxed)
-                        .map(|mut it| it.next())
-                        .unwrap_or(None),
-                )
+                flags
+                    .iter_set_around::<false, true>(pos, Ordering::Relaxed)
+                    .map(|mut it| it.next())
+                    .unwrap_or(None)
+                    .is_some()
             },
             |flags, pos| {
                 flags
@@ -249,20 +251,18 @@ fn criterion_benchmark(c: &mut Criterion) {
             &flags,
             &format!("{header}/iter_unset_around/inclusive"),
             |flags, pos| {
-                pessimize::consume(
-                    &flags
-                        .iter_unset_around::<true, false>(pos, Ordering::Relaxed)
-                        .map(|mut it| it.next())
-                        .unwrap_or(None),
-                )
+                flags
+                    .iter_unset_around::<true, false>(pos, Ordering::Relaxed)
+                    .map(|mut it| it.next())
+                    .unwrap_or(None)
+                    .is_some()
             },
             |flags, pos| {
-                pessimize::consume(
-                    &flags
-                        .iter_unset_around::<true, true>(pos, Ordering::Relaxed)
-                        .map(|mut it| it.next())
-                        .unwrap_or(None),
-                )
+                flags
+                    .iter_unset_around::<true, true>(pos, Ordering::Relaxed)
+                    .map(|mut it| it.next())
+                    .unwrap_or(None)
+                    .is_some()
             },
             |flags, pos| {
                 flags
@@ -282,20 +282,18 @@ fn criterion_benchmark(c: &mut Criterion) {
             &flags,
             &format!("{header}/iter_unset_around/exclusive"),
             |flags, pos| {
-                pessimize::consume(
-                    &flags
-                        .iter_unset_around::<false, false>(pos, Ordering::Relaxed)
-                        .map(|mut it| it.next())
-                        .unwrap_or(None),
-                )
+                flags
+                    .iter_unset_around::<false, false>(pos, Ordering::Relaxed)
+                    .map(|mut it| it.next())
+                    .unwrap_or(None)
+                    .is_some()
             },
             |flags, pos| {
-                pessimize::consume(
-                    &flags
-                        .iter_unset_around::<false, true>(pos, Ordering::Relaxed)
-                        .map(|mut it| it.next())
-                        .unwrap_or(None),
-                )
+                flags
+                    .iter_unset_around::<false, true>(pos, Ordering::Relaxed)
+                    .map(|mut it| it.next())
+                    .unwrap_or(None)
+                    .is_some()
             },
             |flags, pos| {
                 flags
