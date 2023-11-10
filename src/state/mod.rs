@@ -2,7 +2,10 @@
 pub(crate) mod futex;
 
 use self::futex::{StealLocation, WorkerFutex};
-use crate::{flags::AtomicFlags, job::DynJob};
+use crate::{
+    flags::{bitref::BitRef, AtomicFlags},
+    job::DynJob,
+};
 use crossbeam::{
     deque::{self, Injector, Stealer},
     utils::CachePadded,
@@ -57,41 +60,37 @@ impl SharedState {
 
     /// Recommend that the work-less thread closest to a certain originating
     /// locality steal a task from the specified location
-    ///
-    /// # Panics
-    ///
-    /// `task_location` must not be `WORK_OVER` nor `WORK_NOWHERE`, since these
-    /// are not actual task locations. The code will panic upon encountering.
-    /// these location values.
-    pub fn recommend_steal<const INCLUDE_CENTER: bool>(
-        &self,
-        local_worker: usize,
+    pub fn recommend_steal<'self_, const INCLUDE_CENTER: bool, const CACHE_ITER_MASKS: bool>(
+        &'self_ self,
+        local_worker: &BitRef<'self_, CACHE_ITER_MASKS>,
         task_location: StealLocation,
         update: Ordering,
     ) {
         // Check if there are job-less neighbors to submit work to...
         let Some(asleep_neighbors) = self
             .work_availability
-            .iter_unset_around::<INCLUDE_CENTER>(local_worker, Ordering::Acquire)
+            .iter_unset_around::<INCLUDE_CENTER, CACHE_ITER_MASKS>(local_worker, Ordering::Acquire)
         else {
             return;
         };
 
         // ...and if so, wake them up
         #[cold]
-        fn unlikely(
-            workers: &[CachePadded<WorkerInterface>],
-            asleep_neighbors: impl Iterator<Item = usize>,
-            local_worker: usize,
+        fn unlikely<'self_, const CACHE_ITER_MASKS: bool>(
+            self_: &'self_ SharedState,
+            asleep_neighbors: impl Iterator<Item = BitRef<'self_, false>>,
+            local_worker: &BitRef<'self_, CACHE_ITER_MASKS>,
             task_location: StealLocation,
             update: Ordering,
         ) {
             // Iterate over increasingly remote job-less neighbors
             //
             // Need Acquire ordering so the futex is read after the status flag
+            let local_worker = local_worker.linear_idx(&self_.work_availability);
             for closest_asleep in asleep_neighbors {
                 // Update their futex recommendation as appropriate
-                let accepted = workers[closest_asleep].futex.suggest_steal(
+                let closest_asleep = closest_asleep.linear_idx(&self_.work_availability);
+                let accepted = self_.workers[closest_asleep].futex.suggest_steal(
                     task_location,
                     local_worker,
                     update,
@@ -102,13 +101,7 @@ impl SharedState {
                 }
             }
         }
-        unlikely(
-            &self.workers[..],
-            asleep_neighbors,
-            local_worker,
-            task_location,
-            update,
-        )
+        unlikely(self, asleep_neighbors, local_worker, task_location, update)
     }
 }
 

@@ -173,8 +173,8 @@ impl FlatPool {
         // Find the nearest available thread and recommend it to process this
         //
         // Need Release ordering to make sure they see the pushed work
-        self.shared.recommend_steal::<true>(
-            best_worker_idx,
+        self.shared.recommend_steal::<true, false>(
+            &self.shared.work_availability.bit(best_worker_idx),
             StealLocation::Injector,
             Ordering::Release,
         );

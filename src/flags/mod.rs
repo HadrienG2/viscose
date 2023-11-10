@@ -1,5 +1,6 @@
 //! Set of flags that can be atomically set, checked or unset
 
+pub mod bitref;
 mod iter;
 
 #[cfg(test)]
@@ -8,21 +9,23 @@ use std::{
     fmt::{self, Debug, Write},
     hash::{Hash, Hasher},
     iter::FusedIterator,
+    num::NonZeroUsize,
     sync::atomic::{self, AtomicUsize, Ordering},
     write,
 };
+
+use self::bitref::BitRef;
 
 /// Word::BITS but it's a Word
 const WORD_BITS: usize = Word::BITS as usize;
 
 /// Atomic flags
-#[derive(Default)]
 pub struct AtomicFlags {
     /// Concrete flags data
     words: Box<[AtomicWord]>,
 
     /// Mask of the significant bits in the last word of the flags
-    end_bits_mask: Word,
+    last_significant_bits: NonZeroWord,
 
     /// Number of actually meaningful bits
     len: usize,
@@ -35,18 +38,22 @@ impl AtomicFlags {
             words: std::iter::repeat_with(|| AtomicWord::new(0))
                 .take(len.div_ceil(WORD_BITS))
                 .collect(),
-            end_bits_mask: Self::end_bits_mask(len % WORD_BITS),
+            last_significant_bits: Self::significant_mask((len % WORD_BITS) as u32),
             len,
         }
     }
 
-    /// end_bits_mask for a given number of trailing bits
-    fn end_bits_mask(trailing_bits: usize) -> Word {
-        if trailing_bits == 0 {
-            Word::MAX
-        } else {
-            (1 << trailing_bits) - 1
-        }
+    /// Access a bit within the flags
+    pub fn bit(&self, bit_idx: usize) -> BitRef<'_, false> {
+        BitRef::new(self, bit_idx).expect("requested bit is out of bounds")
+    }
+
+    /// Access a bit within the flags and cache iterator initial state
+    ///
+    /// This can speed up `iter_(set|unset)_around` if you keep this `BitRef`
+    /// around and do lots of iteration around it.
+    pub fn bit_with_cache(&self, bit_idx: usize) -> BitRef<'_, true> {
+        self.bit(bit_idx).with_cache(self)
     }
 
     /// Check how many flags there are in there
@@ -57,28 +64,6 @@ impl AtomicFlags {
     /// Truth that there is at least one flag in there
     pub fn is_empty(&self) -> bool {
         self.len == 0
-    }
-
-    /// Check if the Nth flag is set with certain atomic ordering
-    pub fn is_set(&self, bit_idx: usize, order: Ordering) -> bool {
-        let (word, bit) = self.word_and_bit(bit_idx);
-        word.load(order) & bit != 0
-    }
-
-    /// Set the Nth flag with certain atomic ordering, tell whether that flag
-    /// was set beforehand
-    #[cold]
-    pub fn fetch_set(&self, bit_idx: usize, order: Ordering) -> bool {
-        let (word, bit) = self.word_and_bit(bit_idx);
-        word.fetch_or(bit, order) & bit != 0
-    }
-
-    /// Clear the Nth flag with certain atomic ordering, tell whether that flag
-    /// was set beforehand
-    #[cold]
-    pub fn fetch_clear(&self, bit_idx: usize, order: Ordering) -> bool {
-        let (word, bit) = self.word_and_bit(bit_idx);
-        word.fetch_and(!bit, order) & bit != 0
     }
 
     /// Set all the flags
@@ -110,41 +95,21 @@ impl AtomicFlags {
     /// that not every bit readout requires a word readout.
     ///
     /// Returns None if it can be proven early that iteration will yield no bit
-    pub fn iter_set_around<const INCLUDE_CENTER: bool>(
-        &self,
-        center_bit_idx: usize,
+    pub fn iter_set_around<'self_, const INCLUDE_CENTER: bool, const CACHE_ITER_MASKS: bool>(
+        &'self_ self,
+        center: &BitRef<'self_, CACHE_ITER_MASKS>,
         order: Ordering,
-    ) -> Option<impl Iterator<Item = usize> + '_> {
-        iter::NearestFlagIterator::<true, INCLUDE_CENTER>::new(self, center_bit_idx, order)
+    ) -> Option<impl Iterator<Item = BitRef<'self_, false>> + 'self_> {
+        iter::NearestBitIterator::<true, INCLUDE_CENTER>::new(self, center, order)
     }
 
     /// Like iter_set_around, but looks for unset flags instead of set flags
-    pub fn iter_unset_around<const INCLUDE_CENTER: bool>(
-        &self,
-        center_bit_idx: usize,
+    pub fn iter_unset_around<'self_, const INCLUDE_CENTER: bool, const CACHE_ITER_MASKS: bool>(
+        &'self_ self,
+        center: &BitRef<'self_, CACHE_ITER_MASKS>,
         order: Ordering,
-    ) -> Option<impl Iterator<Item = usize> + '_> {
-        iter::NearestFlagIterator::<false, INCLUDE_CENTER>::new(self, center_bit_idx, order)
-    }
-
-    /// Convert a global flag index into a (word, subword bit) pair
-    fn word_and_bit(&self, bit_idx: usize) -> (&AtomicWord, Word) {
-        let (word_idx, bit) = self.word_idx_and_bit(bit_idx);
-        (&self.words[word_idx], bit)
-    }
-
-    /// Convert a global flag index into a (word idx, subword bit) pair
-    fn word_idx_and_bit(&self, bit_idx: usize) -> (usize, Word) {
-        let (word_idx, bit_shift) = self.word_idx_and_bit_shift(bit_idx);
-        (word_idx, 1 << bit_shift)
-    }
-
-    /// Convert a global flag index into a (word idx, bit shift) pair
-    fn word_idx_and_bit_shift(&self, bit_idx: usize) -> (usize, u32) {
-        assert!(bit_idx < self.len, "requested flag is out of bounds");
-        let word_idx = bit_idx / WORD_BITS;
-        let bit_shift = (bit_idx % WORD_BITS) as u32;
-        (word_idx, bit_shift)
+    ) -> Option<impl Iterator<Item = BitRef<'self_, false>> + 'self_> {
+        iter::NearestBitIterator::<false, INCLUDE_CENTER>::new(self, center, order)
     }
 
     /// Iterate over the value of inner words
@@ -157,11 +122,20 @@ impl AtomicFlags {
     }
 
     /// Mask of significant bits in a given word of the flags
-    fn bits_mask(&self, word_idx: usize) -> Word {
+    fn significant_bits(&self, word_idx: usize) -> NonZeroWord {
         if word_idx == self.words.len() - 1 {
-            self.end_bits_mask
+            self.last_significant_bits
         } else {
-            Word::MAX
+            NonZeroWord::MAX
+        }
+    }
+
+    /// Word mask for a given number of significant bits
+    fn significant_mask(num_bits: u32) -> NonZeroWord {
+        if num_bits == 0 {
+            NonZeroWord::MAX
+        } else {
+            NonZeroWord::new((1 << num_bits) - 1).unwrap()
         }
     }
 }
@@ -198,7 +172,7 @@ impl Arbitrary for AtomicFlags {
             // Emit final flags
             Self {
                 words: words.into_boxed_slice(),
-                end_bits_mask: AtomicFlags::end_bits_mask(current_bit),
+                last_significant_bits: AtomicFlags::significant_mask(current_bit as u32),
                 len,
             }
         })
@@ -213,7 +187,7 @@ impl Clone for AtomicFlags {
             .collect();
         Self {
             words,
-            end_bits_mask: self.end_bits_mask,
+            last_significant_bits: self.last_significant_bits,
             len: self.len,
         }
     }
@@ -279,6 +253,9 @@ type Word = usize;
 /// Atomic version of Word
 type AtomicWord = AtomicUsize;
 
+/// NonZero version of Word
+type NonZeroWord = NonZeroUsize;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -322,41 +299,30 @@ pub(crate) mod tests {
         fn op_idx((flags, bit_idx) in flags_and_bit_idx()) {
             let initial_flags = flags.clone();
 
-            let (word_idx, bit) = flags.word_idx_and_bit(bit_idx);
+            let bit_ref = flags.bit(bit_idx);
+            let word_idx = bit_ref.word_idx(&flags);
+            let bit = bit_ref.bit_mask();
             prop_assert_eq!(word_idx, bit_idx / WORD_BITS);
             prop_assert_eq!(bit, 1 << (bit_idx % WORD_BITS));
             prop_assert_eq!(&flags, &initial_flags);
 
-            let (word, bit2) = flags.word_and_bit(bit_idx);
-            prop_assert!(std::ptr::eq(word, &flags.words[word_idx]));
-            prop_assert_eq!(bit, bit2);
-            prop_assert_eq!(&flags, &initial_flags);
-
-            let is_set = flags.is_set(bit_idx, Ordering::Relaxed);
-            prop_assert_eq!(
-                is_set,
-                word.load(Ordering::Relaxed) & bit != 0
-            );
-            prop_assert_eq!(&flags, &initial_flags);
-
+            let is_set = bit_ref.is_set(Ordering::Relaxed);
             if is_set {
-                let was_set = flags.fetch_set(bit_idx, Ordering::Relaxed);
+                let was_set = bit_ref.fetch_set(Ordering::Relaxed);
                 prop_assert!(was_set);
                 prop_assert_eq!(&flags, &initial_flags);
 
-                let was_set = flags.fetch_clear(bit_idx, Ordering::Relaxed);
+                let was_set = bit_ref.fetch_clear(Ordering::Relaxed);
                 prop_assert!(was_set);
-                word.fetch_or(bit, Ordering::Relaxed);
-                prop_assert_eq!(&flags, &initial_flags);
+                prop_assert!(!bit_ref.is_set(Ordering::Relaxed));
             } else {
-                let was_set = flags.fetch_clear(bit_idx, Ordering::Relaxed);
+                let was_set = bit_ref.fetch_clear(Ordering::Relaxed);
                 prop_assert!(!was_set);
                 prop_assert_eq!(&flags, &initial_flags);
 
-                let was_set = flags.fetch_set(bit_idx, Ordering::Relaxed);
+                let was_set = bit_ref.fetch_set(Ordering::Relaxed);
                 prop_assert!(!was_set);
-                word.fetch_and(!bit, Ordering::Relaxed);
-                prop_assert_eq!(&flags, &initial_flags);
+                prop_assert!(bit_ref.is_set(Ordering::Relaxed));
             }
         }
     }

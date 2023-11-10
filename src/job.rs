@@ -57,7 +57,7 @@ impl<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify> Job<Res, ImplWork, Impl
                 panic!("Job result shouldn't be collected before completion notification")
             }
             JobState::Finished(result) => crate::result_or_panic(result),
-            JobState::Collected => unreachable!(),
+            JobState::Collected => unreachable!("prevented by consuming self"),
         }
     }
 }
@@ -80,11 +80,22 @@ enum JobState<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify> {
 impl<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify> JobState<Res, ImplWork, ImplNotify> {
     /// Run the job
     ///
-    /// This should only be called once, failure to do so will result in at
-    /// least a panic and likely a full program abort.
-    fn run(&mut self, scope: &Scope<'_>) {
-        let Self::Scheduled(notify, work) = std::mem::replace(self, Self::Running) else {
-            panic!("attempted to execute a Job in an invalid state");
+    /// # Safety
+    ///
+    /// This should only be called once, on a job fresh from the work queue.
+    unsafe fn run(&mut self, scope: &Scope<'_>) {
+        let (notify, work) = match std::mem::replace(self, Self::Running) {
+            Self::Scheduled(notify, work) => (notify, work),
+            other => {
+                if cfg!(debug_assertions) {
+                    panic!("attempted to execute a Job in an invalid state");
+                } else {
+                    std::mem::forget(other);
+                    // SAFETY: Initial job state is Scheduled and Job contract
+                    //         ensures we'll only see it in that state.
+                    unsafe { std::hint::unreachable_unchecked() }
+                }
+            }
         };
         *self = Self::Finished(std::panic::catch_unwind(AssertUnwindSafe(|| work(scope))));
         notify.notify()

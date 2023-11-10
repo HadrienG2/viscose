@@ -1,6 +1,7 @@
 //! Single thread pool worker
 
 use crate::{
+    flags::bitref::BitRef,
     job::{DynJob, Job, Notify},
     state::{
         futex::{StealLocation, WorkerFutex},
@@ -24,18 +25,21 @@ pub(crate) struct Worker<'pool> {
     /// Index of this thread in the shared state tables
     idx: usize,
 
+    /// Bit of this thread in `SharedState::work_availability`
+    work_available_bit: BitRef<'pool, true>,
+
+    /// Truth that `work_available_bit` is currently set
+    ///
+    /// This ensures that in the happy path, we don't need to access any shared
+    /// variable subjected to concurrent access cache contention, besides the
+    /// state of our work queue.
+    work_available_set: Cell<bool>,
+
     /// Quick access to this thread's futex
     futex: &'pool WorkerFutex,
 
     /// Work queue
     work_queue: deque::Worker<DynJob>,
-
-    /// Private copy of our bit in the shared work_availability flags
-    ///
-    /// This ensures that in the happy path, we don't need to access any shared
-    /// variable subjected to concurrent access cache contention, besides the
-    /// state of our work queue.
-    work_available: Cell<bool>,
 
     /// Sleepy state variables
     ///
@@ -54,12 +58,14 @@ impl<'pool> Worker<'pool> {
     /// Set up and run the worker
     pub fn run(shared: &'pool SharedState, idx: usize, work_queue: deque::Worker<DynJob>) {
         let futex = &shared.workers[idx].futex;
+        let bit = shared.work_availability.bit_with_cache(idx);
         let worker = Self {
             shared,
             idx,
+            work_available_bit: bit,
             futex,
             work_queue,
-            work_available: Cell::new(false),
+            work_available_set: Cell::new(false),
             sleepy_state: Cell::new(None),
             work_over: Cell::new(false),
         };
@@ -76,7 +82,7 @@ impl<'pool> Worker<'pool> {
     /// Single step of the main worker loop
     fn step(&self) {
         // If we have recorded work in our private work queue...
-        if self.work_available.get() {
+        if self.work_available_set.get() {
             // Process work from our private work queue, if still there
             if let Some(task) = self.work_queue.pop() {
                 self.process_task(task);
@@ -86,10 +92,8 @@ impl<'pool> Worker<'pool> {
                 //
                 // Use Release ordering to make sure this happens after emptying
                 // the work queue.
-                self.shared
-                    .work_availability
-                    .fetch_clear(self.idx, Ordering::Release);
-                self.work_available.set(false);
+                self.work_available_bit.fetch_clear(Ordering::Release);
+                self.work_available_set.set(false);
             }
         }
 
@@ -207,6 +211,7 @@ impl<'pool> Worker<'pool> {
     /// Try to steal work from one worker, identified by index in shared tables
     ///
     /// Return truth that a task was successfully stolen and run.
+    #[inline(always)]
     fn steal_from_worker(&self, idx: usize) -> bool {
         // NOTE: It may seem that upon failure to steal, we should clear the
         // corresponding work_availability flag to tell other workers that there
@@ -268,6 +273,7 @@ impl<'pool> Worker<'pool> {
     /// Try to steal work from the global task injector
     ///
     /// Return truth that a task was successfully stolen and run.
+    #[inline(always)]
     fn steal_from_injector(&self) -> bool {
         self.steal(|| self.shared.injector.steal())
     }
@@ -281,12 +287,13 @@ impl<'pool> Worker<'pool> {
         if let Some(neighbors_with_work) = self
             .shared
             .work_availability
-            .iter_set_around::<false>(self.idx, Ordering::Acquire)
+            .iter_set_around::<false, true>(&self.work_available_bit, Ordering::Acquire)
         {
             // Try to steal from other workers at increasing distances
             //
             // Need Acquire so stealing happens after checking work availability.
-            for idx in neighbors_with_work {
+            for bit in neighbors_with_work {
+                let idx = bit.linear_idx(&self.shared.work_availability);
                 if self.steal_from_worker(idx) {
                     return Some(StealLocation::Worker(idx));
                 }
@@ -409,17 +416,17 @@ impl<'scope> Scope<'scope> {
 
         // ...tell the world that we now have work available to steal if they
         // didn't know about it before...
-        let shared = &self.0.shared;
-        let me = self.0.idx;
-        if !self.0.work_available.get() {
-            self.0.work_available.set(true);
-            shared.work_availability.fetch_set(me, Ordering::Relaxed);
+        if !self.0.work_available_set.get() {
+            self.0.work_available_set.set(true);
+            self.0.work_available_bit.fetch_set(Ordering::Relaxed);
         }
 
         // ...and personally notify the closest starving thread about it
-        self.0
-            .shared
-            .recommend_steal::<false>(me, StealLocation::Worker(me), Ordering::Relaxed);
+        self.0.shared.recommend_steal::<false, true>(
+            &self.0.work_available_bit,
+            StealLocation::Worker(self.0.idx),
+            Ordering::Relaxed,
+        );
     }
 }
 //

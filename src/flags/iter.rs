@@ -1,6 +1,6 @@
 //! [`AtomicFlags`] iterator
 
-use super::{AtomicFlags, Word, WORD_BITS};
+use super::{bitref::BitRef, AtomicFlags, Word, WORD_BITS};
 use std::{
     debug_assert,
     fmt::{self, Debug},
@@ -8,88 +8,91 @@ use std::{
     sync::atomic::Ordering,
 };
 
-/// Iterator over the position of set/unset bits at increasing distances from a
-/// certain central point
+/// Iterator over set/unset bits at increasing distances from a central point
 #[derive(Debug, Clone)]
-pub(crate) struct NearestFlagIterator<'flags, const FIND_SET: bool, const INCLUDE_CENTER: bool> {
+pub(crate) struct NearestBitIterator<'flags, const FIND_SET: bool, const INCLUDE_CENTER: bool> {
+    /// Flags that we're iterating over
+    flags: &'flags AtomicFlags,
+
     /// Iterator going towards higher-order bits via left shifts
-    left_indices: FlagIdxIterator<'flags, FIND_SET, true>,
+    left_bits: BitIterator<'flags, FIND_SET, true>,
 
-    /// Center bit position
-    center_bit_idx: usize,
+    /// Reference to the center bit
+    center: BitRef<'flags, false>,
 
-    /// Truth that center_bit_idx must be yielded and hasn't been yielded yet
+    /// Truth that center must be yielded and hasn't been yielded yet
     yield_center: bool,
 
     /// Iterator going towards lower-order bits via right shifts
-    right_indices: FlagIdxIterator<'flags, FIND_SET, false>,
+    right_bits: BitIterator<'flags, FIND_SET, false>,
 }
 //
 impl<'flags, const FIND_SET: bool, const INCLUDE_CENTER: bool>
-    NearestFlagIterator<'flags, FIND_SET, INCLUDE_CENTER>
+    NearestBitIterator<'flags, FIND_SET, INCLUDE_CENTER>
 {
     /// Start iterating over set/uset bits around a central position
-    pub(crate) fn new(
+    pub(crate) fn new<const CACHE_ITER_MASKS: bool>(
         flags: &'flags AtomicFlags,
-        center_bit_idx: usize,
+        center: &BitRef<'flags, CACHE_ITER_MASKS>,
         order: Ordering,
     ) -> Option<Self> {
         let initial_state =
-            InitialState::new::<FIND_SET, INCLUDE_CENTER>(flags, center_bit_idx, order)?;
-        let left_indices =
-            FlagIdxIterator::<'flags, FIND_SET, true>::from_initial_state(initial_state);
-        let right_indices =
-            FlagIdxIterator::<'flags, FIND_SET, false>::from_initial_state(initial_state);
-        let yield_center = INCLUDE_CENTER && (flags.is_set(center_bit_idx, order) == FIND_SET);
+            InitialState::new::<FIND_SET, INCLUDE_CENTER, CACHE_ITER_MASKS>(flags, center, order)?;
+        let left_bits = BitIterator::<'flags, FIND_SET, true>::from_initial_state(initial_state);
+        let right_bits = BitIterator::<'flags, FIND_SET, false>::from_initial_state(initial_state);
+        let yield_center = INCLUDE_CENTER && (center.is_set(order) == FIND_SET);
         Some(Self {
-            left_indices,
-            center_bit_idx,
+            flags,
+            left_bits,
+            center: center.without_cache(),
             yield_center,
-            right_indices,
+            right_bits,
         })
     }
 }
 //
 impl<'flags, const FIND_SET: bool, const INCLUDE_CENTER: bool> Iterator
-    for NearestFlagIterator<'flags, FIND_SET, INCLUDE_CENTER>
+    for NearestBitIterator<'flags, FIND_SET, INCLUDE_CENTER>
 {
-    type Item = usize;
+    type Item = BitRef<'flags, false>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // Yield the central index first
         if INCLUDE_CENTER && self.yield_center {
             self.yield_center = false;
-            return Some(self.center_bit_idx);
+            return Some(self.center.clone());
         }
 
         // Otherwise, yield the closest of the next left and right bits
-        match (self.left_indices.peek(), self.right_indices.peek()) {
-            (Some(left_idx), Some(right_idx)) => {
-                if left_idx - self.center_bit_idx <= self.center_bit_idx - right_idx {
-                    self.left_indices.next()
+        match (self.left_bits.peek(), self.right_bits.peek()) {
+            (Some(left), Some(right)) => {
+                let center = &self.center;
+                let flags = self.flags;
+                if left.distance(center, flags) <= center.distance(&right, flags) {
+                    self.left_bits.next()
                 } else {
-                    self.right_indices.next()
+                    self.right_bits.next()
                 }
             }
-            (Some(_), None) => self.left_indices.next(),
-            (None, Some(_)) => self.right_indices.next(),
+            (Some(_), None) => self.left_bits.next(),
+            (None, Some(_)) => self.right_bits.next(),
             (None, None) => None,
         }
     }
 }
 //
 impl<const FIND_SET: bool, const INCLUDE_CENTER: bool> FusedIterator
-    for NearestFlagIterator<'_, FIND_SET, INCLUDE_CENTER>
+    for NearestBitIterator<'_, FIND_SET, INCLUDE_CENTER>
 {
 }
 
-/// Iterator over the position of set/unset bits in a specific direction
+/// Iterator over set/unset bits in a specific direction
 ///
 /// - `FIND_SET` tells whether we're looking at bits that are set or unset
 /// - `GOING_LEFT` tells whether we're going towards high-order bits (left side)
 ///   or towards low-order bits (right side)
 #[derive(Clone)]
-struct FlagIdxIterator<'flags, const FIND_SET: bool, const GOING_LEFT: bool> {
+struct BitIterator<'flags, const FIND_SET: bool, const GOING_LEFT: bool> {
     /// Shared iteration state
     shared: SharedState<'flags>,
 
@@ -112,14 +115,18 @@ struct FlagIdxIterator<'flags, const FIND_SET: bool, const GOING_LEFT: bool> {
 }
 //
 impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
-    FlagIdxIterator<'flags, FIND_SET, GOING_LEFT>
+    BitIterator<'flags, FIND_SET, GOING_LEFT>
 {
     /// Start iteration
     ///
-    /// The bit at initial position `after_bit_idx` will not be emitted.
+    /// The bit at initial position `after` will not be emitted.
     #[cfg(test)]
-    pub fn new(flags: &'flags AtomicFlags, after_bit_idx: usize, order: Ordering) -> Option<Self> {
-        let initial = InitialState::new::<FIND_SET, false>(flags, after_bit_idx, order)?;
+    pub fn new<const CACHE_ITER_MASKS: bool>(
+        flags: &'flags AtomicFlags,
+        after: &BitRef<'flags, CACHE_ITER_MASKS>,
+        order: Ordering,
+    ) -> Option<Self> {
+        let initial = InitialState::new::<FIND_SET, false, CACHE_ITER_MASKS>(flags, after, order)?;
         Some(Self::from_initial_state(initial))
     }
 
@@ -142,9 +149,9 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
     }
 
     /// Peek next iterator element without advancing the iterator
-    pub fn peek(&self) -> Option<usize> {
-        let bit_idx = self.word_idx * WORD_BITS + self.bit_shift as usize;
-        (bit_idx < self.shared.flags.len).then_some(bit_idx)
+    pub fn peek(&self) -> Option<BitRef<'flags, false>> {
+        let linear_idx = self.word_idx * WORD_BITS + self.bit_shift as usize;
+        (linear_idx < self.shared.flags.len).then(|| self.shared.flags.bit(linear_idx))
     }
 
     /// Go to the next occurence of the bit value of interest in the flags, or
@@ -276,11 +283,9 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
     }
 }
 //
-impl<const FIND_SET: bool, const GOING_LEFT: bool> Debug
-    for FlagIdxIterator<'_, FIND_SET, GOING_LEFT>
-{
+impl<const FIND_SET: bool, const GOING_LEFT: bool> Debug for BitIterator<'_, FIND_SET, GOING_LEFT> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FlagIdxIterator")
+        f.debug_struct("BitIterator")
             .field("shared", &self.shared)
             .field("word_idx", &self.word_idx)
             .field("bit_shift", &self.bit_shift)
@@ -292,12 +297,12 @@ impl<const FIND_SET: bool, const GOING_LEFT: bool> Debug
     }
 }
 //
-impl<const FIND_SET: bool, const GOING_LEFT: bool> Iterator
-    for FlagIdxIterator<'_, FIND_SET, GOING_LEFT>
+impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool> Iterator
+    for BitIterator<'flags, FIND_SET, GOING_LEFT>
 {
-    type Item = usize;
+    type Item = BitRef<'flags, false>;
 
-    fn next(&mut self) -> Option<usize> {
+    fn next(&mut self) -> Option<Self::Item> {
         let bit_idx = self.peek()?;
         self.find_next_bit();
         Some(bit_idx)
@@ -305,7 +310,7 @@ impl<const FIND_SET: bool, const GOING_LEFT: bool> Iterator
 }
 //
 impl<const FIND_SET: bool, const GOING_LEFT: bool> FusedIterator
-    for FlagIdxIterator<'_, FIND_SET, GOING_LEFT>
+    for BitIterator<'_, FIND_SET, GOING_LEFT>
 {
 }
 
@@ -351,31 +356,26 @@ impl<'flags> InitialState<'flags> {
     ///
     /// This will return None if it can be cheaply proven at this stage that no
     /// iteration is possible.
-    pub fn new<const FIND_SET: bool, const INCLUDE_START: bool>(
+    pub fn new<const FIND_SET: bool, const INCLUDE_START: bool, const CACHE_ITER_MASKS: bool>(
         flags: &'flags AtomicFlags,
-        start_bit_idx: usize,
+        start: &BitRef<'flags, CACHE_ITER_MASKS>,
         order: Ordering,
     ) -> Option<Self> {
         // Part that's independent of FIND_SET
-        let (shared, word_idx, bit_shift, word) =
-            Self::set_independent_init(flags, start_bit_idx, order);
+        let (shared, word_idx, bit_shift, word) = Self::set_independent_init(flags, start, order);
 
-        // Truth that the bit value we're looking for does not appear in the
-        // useful part of the initial word
-        let mut bits_mask = flags.bits_mask(word_idx);
-        if !INCLUDE_START {
-            bits_mask &= !(1 << bit_shift);
-        }
-        let word_empty = if FIND_SET {
-            word & bits_mask == Word::MIN
-        } else {
-            word | !bits_mask == Word::MAX
-        };
-
-        // If that's the only word in the flags, we can skip iteration entirely
-        if flags.words.len() == 1 && word_empty {
-            debug_assert_eq!(word_idx, 0);
-            return None;
+        // If that's the only word in the flags and the bit value we're looking
+        // for doesn't appear in it, we can skip iteration entirely
+        if flags.words.len() == 1 {
+            let mask = start.iter_mask::<FIND_SET, INCLUDE_START>(flags);
+            let word_empty = if FIND_SET {
+                word & mask == Word::MIN
+            } else {
+                word | mask == Word::MAX
+            };
+            if word_empty {
+                return None;
+            }
         }
 
         // Otherwise, normalize by FIND_SET and return
@@ -388,15 +388,37 @@ impl<'flags> InitialState<'flags> {
     }
 
     /// Subset of the iteration work that's independent of FIND_SET
-    fn set_independent_init(
+    fn set_independent_init<const CACHE_ITER_MASKS: bool>(
         flags: &'flags AtomicFlags,
-        start_bit_idx: usize,
+        start: &BitRef<'flags, CACHE_ITER_MASKS>,
         order: Ordering,
     ) -> (SharedState<'flags>, usize, u32, Word) {
-        let (word_idx, bit_shift) = flags.word_idx_and_bit_shift(start_bit_idx);
-        // SAFETY: word_idx_and_bit_shift does the bounds checking
+        let word_idx = start.word_idx(flags);
+        let bit_shift = start.bit_shift();
+        // SAFETY: word_idx does the bounds checking
         let word = unsafe { flags.words.get_unchecked(word_idx).load(order) };
         (SharedState { flags, order }, word_idx, bit_shift, word)
+    }
+}
+
+/// Mask to be used when evaluating whether single-word flags are empty
+pub(crate) fn init_mask<
+    'flags,
+    const FIND_SET: bool,
+    const INCLUDE_START: bool,
+    const CACHE_ITER_MASKS: bool,
+>(
+    flags: &'flags AtomicFlags,
+    start: &BitRef<'flags, CACHE_ITER_MASKS>,
+) -> Word {
+    let word_idx = start.word_idx(flags);
+    let significant = Word::from(flags.significant_bits(word_idx));
+    let bit = start.bit_mask();
+    match [FIND_SET, INCLUDE_START] {
+        [false, false] => !significant | bit,
+        [false, true] => !significant,
+        [true, false] => significant & !bit,
+        [true, true] => significant,
     }
 }
 
@@ -411,16 +433,17 @@ mod tests {
         flags: &AtomicFlags,
         start_idx: usize,
     ) -> Result<(), TestCaseError> {
-        let iterator =
-            FlagIdxIterator::<FIND_SET, GOING_LEFT>::new(flags, start_idx, Ordering::Relaxed);
+        let start = flags.bit(start_idx);
+        let iterator = BitIterator::<FIND_SET, GOING_LEFT>::new(flags, &start, Ordering::Relaxed);
         let bit_indices: Box<dyn Iterator<Item = usize>> = if GOING_LEFT {
             Box::new((start_idx..flags.len()).skip(1))
         } else {
             Box::new((0..start_idx).rev())
         };
-        let check_bit = |bit_idx: usize, iterator: &mut FlagIdxIterator<FIND_SET, GOING_LEFT>| {
-            if flags.is_set(bit_idx, Ordering::Relaxed) == FIND_SET {
-                prop_assert_eq!(iterator.next(), Some(bit_idx));
+        let check_bit = |bit_idx: usize, iterator: &mut BitIterator<FIND_SET, GOING_LEFT>| {
+            let bit = flags.bit(bit_idx);
+            if bit.is_set(Ordering::Relaxed) == FIND_SET {
+                prop_assert_eq!(iterator.next(), Some(bit));
             }
             Ok(())
         };
@@ -431,7 +454,8 @@ mod tests {
             prop_assert_eq!(iterator.next(), None);
         } else {
             for bit_idx in bit_indices {
-                prop_assert_ne!(flags.is_set(bit_idx, Ordering::Relaxed), FIND_SET);
+                let bit = flags.bit(bit_idx);
+                prop_assert_ne!(bit.is_set(Ordering::Relaxed), FIND_SET);
             }
         }
         Ok(())
@@ -442,11 +466,9 @@ mod tests {
         flags: &AtomicFlags,
         center_idx: usize,
     ) -> Result<(), TestCaseError> {
-        let iterator = NearestFlagIterator::<FIND_SET, INCLUDE_CENTER>::new(
-            flags,
-            center_idx,
-            Ordering::Relaxed,
-        );
+        let center = flags.bit(center_idx);
+        let iterator =
+            NearestBitIterator::<FIND_SET, INCLUDE_CENTER>::new(flags, &center, Ordering::Relaxed);
         let left_indices = (center_idx..flags.len()).skip(1);
         let right_indices = (0..center_idx).rev();
         let bit_indices = std::iter::once(center_idx)
@@ -454,15 +476,24 @@ mod tests {
             .skip(usize::from(!INCLUDE_CENTER));
         if let Some(mut iterator) = iterator {
             for bit_idx in bit_indices {
-                if flags.is_set(bit_idx, Ordering::Relaxed) == FIND_SET {
-                    prop_assert_eq!(iterator.next(), Some(bit_idx));
+                let bit = flags.bit(bit_idx);
+                if bit.is_set(Ordering::Relaxed) == FIND_SET {
+                    prop_assert_eq!(
+                        iterator.next(),
+                        Some(bit),
+                        "upon reaching bit {} of check_nearest<FIND_SET={}, INCLUDE_CENTER={}>",
+                        bit_idx,
+                        FIND_SET,
+                        INCLUDE_CENTER,
+                    );
                 }
             }
             prop_assert_eq!(iterator.next(), None);
         } else {
             for bit_idx in bit_indices {
+                let bit = flags.bit(bit_idx);
                 prop_assert_ne!(
-                    flags.is_set(bit_idx, Ordering::Relaxed),
+                    bit.is_set(Ordering::Relaxed),
                     FIND_SET,
                     "failed for FIND_SET={} and INCLUDE_CENTER={}",
                     FIND_SET,

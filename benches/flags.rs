@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use sched_local::flags::AtomicFlags;
+use sched_local::flags::{bitref::BitRef, AtomicFlags};
 use std::sync::atomic::Ordering;
 
 fn criterion_benchmark(c: &mut Criterion) {
@@ -30,23 +30,71 @@ fn criterion_benchmark(c: &mut Criterion) {
             });
         }
 
-        // Operations that test a single bit
-        bench_indexed_op(c, &flags, &format!("{header}/is_set"), 1, |flags, pos| {
-            flags.is_set(pos, Ordering::Relaxed)
+        // Querying a flag
+        bench_indexed_op(c, &flags, &format!("{header}/bit"), 1, |flags, pos| {
+            pessimize::consume(&flags.bit(pos))
         });
         bench_indexed_op(
             c,
             &flags,
+            &format!("{header}/bit_with_cache"),
+            1,
+            |flags, pos| pessimize::consume(&flags.bit_with_cache(pos)),
+        );
+
+        // General logic for benchmarks that target a specific BitRef
+        fn bench_ref_op_uncached<R>(
+            c: &mut Criterion,
+            flags: &AtomicFlags,
+            group_name: &str,
+            num_inner_ops: usize,
+            mut op: impl FnMut(&AtomicFlags, &BitRef<'_, false>) -> R,
+        ) {
+            use pessimize::hide;
+            let mut group = c.benchmark_group(group_name);
+            group.throughput(Throughput::Elements(num_inner_ops as _));
+            let first = flags.bit(0);
+            group.bench_function("first", |b| b.iter(|| op(hide(flags), hide(&first))));
+            let center = flags.bit(flags.len() / 2);
+            group.bench_function("center", |b| b.iter(|| op(hide(flags), hide(&center))));
+            let last = flags.bit(flags.len() - 1);
+            group.bench_function("last", |b| b.iter(|| op(hide(flags), hide(&last))));
+        }
+        fn bench_ref_op_cached<R>(
+            c: &mut Criterion,
+            flags: &AtomicFlags,
+            group_name: &str,
+            num_inner_ops: usize,
+            mut op: impl FnMut(&AtomicFlags, &BitRef<'_, true>) -> R,
+        ) {
+            use pessimize::hide;
+            let mut group = c.benchmark_group(group_name);
+            group.throughput(Throughput::Elements(num_inner_ops as _));
+            let first = flags.bit_with_cache(0);
+            group.bench_function("first", |b| b.iter(|| op(hide(flags), hide(&first))));
+            let center = flags.bit_with_cache(flags.len() / 2);
+            group.bench_function("center", |b| b.iter(|| op(hide(flags), hide(&center))));
+            let last = flags.bit_with_cache(flags.len() - 1);
+            group.bench_function("last", |b| b.iter(|| op(hide(flags), hide(&last))));
+        }
+
+        // Operations that test a single bit
+        bench_ref_op_uncached(c, &flags, &format!("{header}/is_set"), 1, |_flags, bit| {
+            bit.is_set(Ordering::Relaxed)
+        });
+        bench_ref_op_uncached(
+            c,
+            &flags,
             &format!("{header}/fetch_set"),
             1,
-            |flags, pos| flags.fetch_set(pos, Ordering::Relaxed),
+            |_flags, bit| bit.fetch_set(Ordering::Relaxed),
         );
-        bench_indexed_op(
+        bench_ref_op_uncached(
             c,
             &flags,
             &format!("{header}/fetch_clear"),
             1,
-            |flags, pos| flags.fetch_clear(pos, Ordering::Relaxed),
+            |_flags, bit| bit.fetch_clear(Ordering::Relaxed),
         );
 
         // Operations that set all bits to the same value
@@ -62,30 +110,72 @@ fn criterion_benchmark(c: &mut Criterion) {
         }
 
         // Benchark the iterators over set and unset indices
-        fn bench_iterator<Item>(
+        fn bench_iterator(
             c: &mut Criterion,
             flags: &AtomicFlags,
             name_header: &str,
-            next: impl Fn(&AtomicFlags, usize) -> Option<Item>,
-            count: impl Fn(&AtomicFlags, usize) -> usize,
+            next_uncached: impl Fn(&AtomicFlags, &BitRef<'_, false>),
+            next_cached: impl Fn(&AtomicFlags, &BitRef<'_, true>),
+            count_uncached: impl Fn(&AtomicFlags, &BitRef<'_, false>) -> usize,
+            count_cached: impl Fn(&AtomicFlags, &BitRef<'_, true>) -> usize,
         ) {
             flags.set_all(Ordering::Relaxed);
-            bench_indexed_op(c, flags, &format!("{name_header}/ones/once"), 1, &next);
-            bench_indexed_op(
+            bench_ref_op_uncached(
+                c,
+                flags,
+                &format!("{name_header}/ones/once"),
+                1,
+                &next_uncached,
+            );
+            bench_ref_op_cached(
+                c,
+                flags,
+                &format!("{name_header}/ones/once"),
+                1,
+                &next_cached,
+            );
+            bench_ref_op_uncached(
                 c,
                 flags,
                 &format!("{name_header}/ones/all"),
                 flags.len(),
-                &count,
+                &count_uncached,
+            );
+            bench_ref_op_cached(
+                c,
+                flags,
+                &format!("{name_header}/ones/all"),
+                flags.len(),
+                &count_cached,
             );
             flags.clear_all(Ordering::Relaxed);
-            bench_indexed_op(c, flags, &format!("{name_header}/zeroes/once"), 1, &next);
-            bench_indexed_op(
+            bench_ref_op_uncached(
+                c,
+                flags,
+                &format!("{name_header}/zeroes/once"),
+                1,
+                &next_uncached,
+            );
+            bench_ref_op_cached(
+                c,
+                flags,
+                &format!("{name_header}/zeroes/once"),
+                1,
+                &next_cached,
+            );
+            bench_ref_op_uncached(
                 c,
                 flags,
                 &format!("{name_header}/zeroes/all"),
                 flags.len(),
-                &count,
+                &count_uncached,
+            );
+            bench_ref_op_cached(
+                c,
+                flags,
+                &format!("{name_header}/zeroes/all"),
+                flags.len(),
+                &count_cached,
             );
         }
         bench_iterator(
@@ -93,14 +183,30 @@ fn criterion_benchmark(c: &mut Criterion) {
             &flags,
             &format!("{header}/iter_set_around/inclusive"),
             |flags, pos| {
-                flags
-                    .iter_set_around::<true>(pos, Ordering::Relaxed)
-                    .map(|mut it| it.next())
-                    .unwrap_or(None)
+                pessimize::consume(
+                    &flags
+                        .iter_set_around::<true, false>(pos, Ordering::Relaxed)
+                        .map(|mut it| it.next())
+                        .unwrap_or(None),
+                )
+            },
+            |flags, pos| {
+                pessimize::consume(
+                    &flags
+                        .iter_set_around::<true, true>(pos, Ordering::Relaxed)
+                        .map(|mut it| it.next())
+                        .unwrap_or(None),
+                )
             },
             |flags, pos| {
                 flags
-                    .iter_set_around::<true>(pos, Ordering::Relaxed)
+                    .iter_set_around::<true, false>(pos, Ordering::Relaxed)
+                    .map(Iterator::count)
+                    .unwrap_or(0)
+            },
+            |flags, pos| {
+                flags
+                    .iter_set_around::<true, true>(pos, Ordering::Relaxed)
                     .map(Iterator::count)
                     .unwrap_or(0)
             },
@@ -110,14 +216,30 @@ fn criterion_benchmark(c: &mut Criterion) {
             &flags,
             &format!("{header}/iter_set_around/exclusive"),
             |flags, pos| {
-                flags
-                    .iter_set_around::<false>(pos, Ordering::Relaxed)
-                    .map(|mut it| it.next())
-                    .unwrap_or(None)
+                pessimize::consume(
+                    &flags
+                        .iter_set_around::<false, false>(pos, Ordering::Relaxed)
+                        .map(|mut it| it.next())
+                        .unwrap_or(None),
+                )
+            },
+            |flags, pos| {
+                pessimize::consume(
+                    &flags
+                        .iter_set_around::<false, true>(pos, Ordering::Relaxed)
+                        .map(|mut it| it.next())
+                        .unwrap_or(None),
+                )
             },
             |flags, pos| {
                 flags
-                    .iter_set_around::<false>(pos, Ordering::Relaxed)
+                    .iter_set_around::<false, false>(pos, Ordering::Relaxed)
+                    .map(Iterator::count)
+                    .unwrap_or(0)
+            },
+            |flags, pos| {
+                flags
+                    .iter_set_around::<false, true>(pos, Ordering::Relaxed)
                     .map(Iterator::count)
                     .unwrap_or(0)
             },
@@ -127,14 +249,30 @@ fn criterion_benchmark(c: &mut Criterion) {
             &flags,
             &format!("{header}/iter_unset_around/inclusive"),
             |flags, pos| {
-                flags
-                    .iter_unset_around::<true>(pos, Ordering::Relaxed)
-                    .map(|mut it| it.next())
-                    .unwrap_or(None)
+                pessimize::consume(
+                    &flags
+                        .iter_unset_around::<true, false>(pos, Ordering::Relaxed)
+                        .map(|mut it| it.next())
+                        .unwrap_or(None),
+                )
+            },
+            |flags, pos| {
+                pessimize::consume(
+                    &flags
+                        .iter_unset_around::<true, true>(pos, Ordering::Relaxed)
+                        .map(|mut it| it.next())
+                        .unwrap_or(None),
+                )
             },
             |flags, pos| {
                 flags
-                    .iter_unset_around::<true>(pos, Ordering::Relaxed)
+                    .iter_unset_around::<true, false>(pos, Ordering::Relaxed)
+                    .map(Iterator::count)
+                    .unwrap_or(0)
+            },
+            |flags, pos| {
+                flags
+                    .iter_unset_around::<true, true>(pos, Ordering::Relaxed)
                     .map(Iterator::count)
                     .unwrap_or(0)
             },
@@ -144,14 +282,30 @@ fn criterion_benchmark(c: &mut Criterion) {
             &flags,
             &format!("{header}/iter_unset_around/exclusive"),
             |flags, pos| {
-                flags
-                    .iter_unset_around::<false>(pos, Ordering::Relaxed)
-                    .map(|mut it| it.next())
-                    .unwrap_or(None)
+                pessimize::consume(
+                    &flags
+                        .iter_unset_around::<false, false>(pos, Ordering::Relaxed)
+                        .map(|mut it| it.next())
+                        .unwrap_or(None),
+                )
+            },
+            |flags, pos| {
+                pessimize::consume(
+                    &flags
+                        .iter_unset_around::<false, true>(pos, Ordering::Relaxed)
+                        .map(|mut it| it.next())
+                        .unwrap_or(None),
+                )
             },
             |flags, pos| {
                 flags
-                    .iter_unset_around::<false>(pos, Ordering::Relaxed)
+                    .iter_unset_around::<false, false>(pos, Ordering::Relaxed)
+                    .map(Iterator::count)
+                    .unwrap_or(0)
+            },
+            |flags, pos| {
+                flags
+                    .iter_unset_around::<false, true>(pos, Ordering::Relaxed)
                     .map(Iterator::count)
                     .unwrap_or(0)
             },
