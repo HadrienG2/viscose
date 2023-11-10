@@ -7,7 +7,8 @@ use crate::{
         futex::{StealLocation, WorkerFutex},
         SharedState,
     },
-    AbortGuard, Work, MAX_SPIN_ITERS, SLEEPY_DURATION, YIELD_DURATION,
+    AbortGuard, Work, MAX_SPIN_ITERS_PER_CHECK, OS_WAIT_DELAY, SPIN_ITERS_BEFORE_YIELD,
+    YIELD_DURATION,
 };
 use crossbeam::deque::{self, Steal};
 use std::{
@@ -41,11 +42,14 @@ pub(crate) struct Worker<'pool> {
     /// Work queue
     work_queue: deque::Worker<DynJob>,
 
-    /// Sleepy state variables
-    ///
-    /// First is the current number of suggested spin-wait iterations, second is
-    /// the time at which we declared ourselves sleepy.
-    sleepy_state: Cell<Option<(usize, Instant)>>,
+    /// Timestamp at which we entered the sleepy state, assuming we're sleepy
+    sleepy_start: Cell<Option<Instant>>,
+
+    /// Number of spin-loop iterations since we last yielded to the OS
+    spin_iters_since_yield: Cell<usize>,
+
+    /// Number of spin-loop iterations between attempts to look for work
+    spin_iters_per_check: Cell<u8>,
 
     /// Truth that we reached the end of observable work and expect no more work
     ///
@@ -66,7 +70,9 @@ impl<'pool> Worker<'pool> {
             futex,
             work_queue,
             work_available_set: Cell::new(false),
-            sleepy_state: Cell::new(None),
+            sleepy_start: Cell::new(None),
+            spin_iters_since_yield: Cell::new(0),
+            spin_iters_per_check: Cell::new(1),
             work_over: Cell::new(false),
         };
         worker.main();
@@ -121,8 +127,8 @@ impl<'pool> Worker<'pool> {
 
         // Any futex event clears the futex sleepy flag, which we should
         // acknowledge by resetting our internal sleepy state.
-        if self.sleepy_state.get().is_some() && !futex_state.is_sleepy() {
-            self.sleepy_state.set(None);
+        if self.sleepy_start.get().is_some() && !futex_state.is_sleepy() {
+            self.sleepy_start.set(None);
         }
 
         // Check if we've been recommended to steal from one specific location
@@ -168,14 +174,20 @@ impl<'pool> Worker<'pool> {
                 // coming, just wait for it after warning others
                 if futex_state.is_sleepy() {
                     // Start with some busy waiting...
-                    let (spin_iters, sleepy_start) = self.sleepy_state.get().unwrap();
-                    if spin_iters <= MAX_SPIN_ITERS {
-                        for _ in 0..spin_iters {
+                    let mut spin_iters_per_check = self.spin_iters_per_check.get();
+                    let spin_iters_since_yield = self.spin_iters_since_yield.get();
+                    if spin_iters_since_yield <= SPIN_ITERS_BEFORE_YIELD {
+                        if spin_iters_per_check < MAX_SPIN_ITERS_PER_CHECK {
+                            spin_iters_per_check =
+                                (2 * spin_iters_per_check).min(MAX_SPIN_ITERS_PER_CHECK);
+                            self.spin_iters_per_check.set(spin_iters_per_check);
+                        }
+                        for _ in 0..spin_iters_per_check {
                             std::hint::spin_loop()
                         }
-                        self.sleepy_state.set(Some((2 * spin_iters, sleepy_start)));
-                    } else if sleepy_start.elapsed() < SLEEPY_DURATION {
-                        std::thread::sleep(YIELD_DURATION)
+                    } else if self.sleepy_start.get().unwrap().elapsed() < OS_WAIT_DELAY {
+                        std::thread::sleep(YIELD_DURATION);
+                        self.spin_iters_since_yield.set(0);
                     } else {
                         // ...then truly fall asleep after a while
                         //
@@ -192,7 +204,9 @@ impl<'pool> Worker<'pool> {
                     // nothing happens soon + start associated timer.
                     //
                     // Synchronize with other threads manipulating the futex.
-                    self.sleepy_state.set(Some((1, Instant::now())));
+                    self.sleepy_start.set(Some(Instant::now()));
+                    self.spin_iters_since_yield.set(0);
+                    self.spin_iters_per_check.set(1);
                     let _new_futex_state =
                         self.futex
                             .notify_sleepy(futex_state, Ordering::Release, Ordering::Relaxed);
@@ -273,7 +287,6 @@ impl<'pool> Worker<'pool> {
     /// Try to steal work from the global task injector
     ///
     /// Return truth that a task was successfully stolen and run.
-    #[inline(always)]
     fn steal_from_injector(&self) -> bool {
         self.steal(|| self.shared.injector.steal())
     }
@@ -308,6 +321,7 @@ impl<'pool> Worker<'pool> {
     /// Try to steal work using the specified procedure
     ///
     /// Return truth that a task was successfully stolen and run.
+    #[inline(always)]
     fn steal(&self, mut attempt: impl FnMut() -> Steal<DynJob>) -> bool {
         loop {
             match attempt() {
@@ -406,7 +420,7 @@ impl<'scope> Scope<'scope> {
     /// notification has not been received. This entails in particular that all
     /// code including spawn_unchecked until the point where the remote task has
     /// signaled completion should translate unwinding panics to aborts.
-    #[inline]
+    #[inline(always)]
     unsafe fn spawn_unchecked(&self, job: DynJob) {
         // Schedule the work to be executed
         self.0.work_queue.push(job);

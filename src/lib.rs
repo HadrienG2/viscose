@@ -10,19 +10,22 @@ mod worker;
 use crate::worker::Scope;
 use std::time::Duration;
 
-/// Busy-waiting time between declaring sleepiness and falling asleep
+/// Minimal busy-waiting time between declaring sleepiness and falling asleep
 ///
 /// This is a compromise between avoiding sleep and wakeup latency on one side,
 /// and keeping idle threads asleep on the other side.
-const SLEEPY_DURATION: Duration = Duration::from_nanos(1);
+const OS_WAIT_DELAY: Duration = Duration::from_nanos(1000);
 
-/// Maximal number of spinning iterations before starting to sleep
-const MAX_SPIN_ITERS: usize = 1 << 7;
-
-/// Sleep duration used for busy waiting
+/// Sleep duration used to yield the CPU to the OS
 ///
-/// Need a non-zero sleep duration to trigger a scheduler yield on Linux.
+/// Need a non-zero sleep duration to trigger a true scheduler yield on Linux.
 const YIELD_DURATION: Duration = Duration::from_nanos(1);
+
+/// Maximal number of spinning iterations between starting to yield to the os
+const SPIN_ITERS_BEFORE_YIELD: usize = 1 << 7;
+
+/// Maximal number of spinning iterations between attempts to look for work
+const MAX_SPIN_ITERS_PER_CHECK: u8 = 8;
 
 /// Function that can be scheduled for execution by the thread pool
 ///
