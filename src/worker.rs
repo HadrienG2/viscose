@@ -87,6 +87,7 @@ impl<'pool> Worker<'pool> {
     }
 
     /// Single step of the main worker loop
+    #[inline(always)]
     fn step(&self) {
         // If we have recorded work in our private work queue...
         if self.work_available_set.get() {
