@@ -98,16 +98,16 @@ impl<'pool> Worker<'pool> {
             } else {
                 // Otherwise notify others that our work queue is now empty
                 //
-                // Use Release ordering to make sure this happens after emptying
-                // the work queue.
+                // Use Release ordering to make sure this is perceived to happen
+                // after emptying the work queue.
                 let was_set = self.work_available_bit.fetch_clear(Ordering::Release);
                 debug_assert!(was_set);
                 self.work_available_set.set(false);
             }
         }
 
-        // Look for work elsewhere using our trusty futex as a guide
-        self.look_for_work();
+        // No work in our private work queue, figure out what to do next
+        self.handle_starvation();
     }
 
     /// Process one incoming task
@@ -119,120 +119,83 @@ impl<'pool> Worker<'pool> {
         unsafe { job.run(&scope) };
     }
 
-    /// Look for work using our futex as a guide
+    /// Handle absence of work in our private work queue
     #[cold]
-    fn look_for_work(&self) {
-        // Need an up-to-date futex readout as steal location can evolve
+    fn handle_starvation(&self) {
+        // Learn more about the state of the world using our futex
         //
-        // Acquire ordering ensures we see the world like the previous threads
-        // that updated the futex.
+        // Acquire ordering ensures we see the world like the previous thread
+        // that updated the futex did.
         let futex_state = self.futex.load_from_worker(Ordering::Acquire);
 
-        // Reset waiting state when we stop waiting
-        if !futex_state.is_waiting() {
-            self.waiting_start.set(None);
+        // Try to steal work from other workers and the global injector, and
+        // update our waiting/non-waiting state accordingly.
+        if self.steal_work(&futex_state) {
+            self.stop_waiting();
+            return;
+        } else if !self.is_waiting() {
+            self.start_waiting();
         }
 
-        // Check if we've been recommended to steal from one specific location
-        if let Some(location) = futex_state.steal_location() {
-            // Try to steal from that recommended location
-            let successful = match location {
-                StealLocation::Worker(idx) => self.steal_from_worker(idx),
-                StealLocation::Injector => crate::unlikely(|| self.steal_from_injector()),
-            };
-
-            // Once stealing starts to fail, the recommandation has become
-            // outdated, so discard it: we'll try exhaustive search next unless
-            // another recommendation has come up in meantime.
-            //
-            // Here we can use Relaxed because no one else should read from our
-            // recommended stealing location, we're just talking to ourself.
-            if !successful {
-                let _new_futex_state = self.futex.clear_outdated_location(
-                    futex_state,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                );
-            }
+        // At this point, we've failed to find more work. Figure out if more
+        // work could still be coming up.
+        if futex_state.work_incoming() {
+            // If there isn't any work to steal anywhere, but more work
+            // might still be coming up, wait for more work to come up
+            self.wait_for_work(&futex_state);
         } else {
-            // No particular recommended stealing location, try to steal a task
-            // from all possible locations
-            if let Some(location) = self.steal_from_anyone() {
-                // Record any place where we found work so we can try to steal
-                // from there right away next time, unless a better
-                // recommendation has concurrently come up.
-                //
-                // Can use Relaxed because we are talking to ourselves.
-                let _new_futex_state = self.futex.suggest_steal(
-                    location,
-                    self.idx,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                );
-            } else if futex_state.work_incoming() {
-                // If there isn't any work to steal anywhere, but more work
-                // might still be coming up, wait for more work to come up
-                self.wait_for_work(&futex_state);
+            // No work available for now and no more work expected, nothing
+            // to do (this should only be a transient state when we are
+            // waiting for a signal that will be sent by other workers
+            // processing their own work)
+            if !self.work_over.get() {
+                self.work_over.set(true);
             } else {
-                // No work available for now and no more work expected, nothing
-                // to do (this should only be a transient state when we are
-                // waiting for a signal that will be sent by other workers
-                // processing their own work)
-                if !self.work_over.get() {
-                    self.work_over.set(true);
-                } else {
-                    std::thread::sleep(YIELD_DURATION)
-                }
+                std::thread::sleep(YIELD_DURATION)
             }
         }
     }
 
-    /// Wait for more work to come up
-    #[cold]
-    fn wait_for_work(&self, futex_state: &WorkerFutexState) {
-        // Have we already initialized the waiting-related state?
-        if let Some(waiting_start) = self.waiting_start.get() {
-            // Restore waiting state
-            let mut spin_iters_per_check = self.spin_iters_per_check.get();
-            let spin_iters_since_yield = self.spin_iters_since_yield.get();
-
-            // Start with some busy waiting in user space...
-            if spin_iters_since_yield <= SPIN_ITERS_BEFORE_YIELD {
-                if spin_iters_per_check < MAX_SPIN_ITERS_PER_CHECK {
-                    spin_iters_per_check = (2 * spin_iters_per_check).min(MAX_SPIN_ITERS_PER_CHECK);
-                    self.spin_iters_per_check.set(spin_iters_per_check);
-                }
-                for _ in 0..spin_iters_per_check {
-                    std::hint::spin_loop()
-                }
-            } else if waiting_start.elapsed() < OS_WAIT_DELAY {
-                // ...periodically yielding to the kernel scheduler...
-                std::thread::sleep(YIELD_DURATION);
-                self.spin_iters_since_yield.set(0);
-            } else {
-                // ...then completely fall asleep after a while
-                //
-                // Make sure other threads manipulating the futex can faithfully
-                // observe our pre-sleep state.
-                let _new_futex_state =
-                    self.futex
-                        .wait_for_change(*futex_state, Ordering::Release, Ordering::Relaxed);
+    /// Try to steal work, return truth that we managed to steal and run a task
+    fn steal_work(&self, futex_state: &WorkerFutexState) -> bool {
+        // Try to steal from the recommended location, if any
+        let recommended_location = futex_state.steal_location();
+        if let Some(location) = recommended_location {
+            let successful = match location {
+                StealLocation::Worker(idx) => self.steal_from_worker(idx),
+                StealLocation::Injector => crate::unlikely(|| self.steal_from_injector()),
+            };
+            if successful {
+                return true;
             }
-        } else {
-            // Initialize waiting-related state
-            self.waiting_start.set(Some(Instant::now()));
-            self.spin_iters_since_yield.set(0);
-            self.spin_iters_per_check.set(1);
+        }
 
-            // Tell other threads we're going to busy-wait and then sleep if
-            // nothing happens soon + start associated timer.
+        // If there is no recommendation, or if the recommendation is outdated,
+        // try to steal from all the possible sources of work
+        if let Some(location) = self.steal_from_anyone() {
+            // Record any place where we found work so we can try to steal from
+            // there again next time, unless a better recommendation has
+            // concurrently come up from another thread.
             //
-            // Make sure other threads manipulating the futex can faithfully
-            // observe our pre-wait state.
+            // Can use Relaxed because we are talking to ourselves.
             let _new_futex_state =
                 self.futex
-                    .notify_waiting(*futex_state, Ordering::Release, Ordering::Relaxed);
+                    .suggest_steal(location, self.idx, Ordering::Relaxed, Ordering::Relaxed);
+            return true;
         }
+
+        // No work available anywhere at the moment, just clear our
+        // recommended stealing location and enter the waiting state.
+        //
+        // Can use Relaxed because we are talking to ourselves.
+        if recommended_location.is_some() {
+            let _new_futex_state = self.futex.clear_outdated_location(
+                *futex_state,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+        false
     }
 
     /// Try to steal work from one worker, identified by index in shared tables
@@ -294,7 +257,7 @@ impl<'pool> Worker<'pool> {
         // while the worker finishes processing its current task, but it seems
         // like a fair price to pay in exchange for a clean synchronization
         // protocol and a cheap happy path when every worker stays fed.
-        self.steal(|| self.shared.workers[idx].stealer.steal())
+        self.steal_with(|| self.shared.workers[idx].stealer.steal())
     }
 
     /// Try to steal work from the global task injector
@@ -302,7 +265,7 @@ impl<'pool> Worker<'pool> {
     /// Return truth that a task was successfully stolen and run.
     #[inline(always)]
     fn steal_from_injector(&self) -> bool {
-        self.steal(|| self.shared.injector.steal())
+        self.steal_with(|| self.shared.injector.steal())
     }
 
     /// Try to steal work from all possible sources
@@ -336,7 +299,7 @@ impl<'pool> Worker<'pool> {
     ///
     /// Return truth that a task was successfully stolen and run.
     #[inline(always)]
-    fn steal(&self, mut attempt: impl FnMut() -> Steal<DynJob>) -> bool {
+    fn steal_with(&self, mut attempt: impl FnMut() -> Steal<DynJob>) -> bool {
         loop {
             match attempt() {
                 Steal::Success(task) => {
@@ -346,6 +309,57 @@ impl<'pool> Worker<'pool> {
                 Steal::Empty => return false,
                 Steal::Retry => continue,
             }
+        }
+    }
+
+    /// Start waiting for work
+    #[cold]
+    fn start_waiting(&self) {
+        self.waiting_start.set(Some(Instant::now()));
+        self.spin_iters_since_yield.set(0);
+        self.spin_iters_per_check.set(1);
+    }
+
+    /// Truth that we are presently waiting for work
+    fn is_waiting(&self) -> bool {
+        self.waiting_start.get().is_some()
+    }
+
+    /// Stop waiting for work
+    #[cold]
+    fn stop_waiting(&self) {
+        self.waiting_start.set(None);
+    }
+
+    /// Keep waiting for more work to come up
+    #[cold]
+    fn wait_for_work(&self, futex_state: &WorkerFutexState) {
+        // Initialize or restore waiting state
+        debug_assert!(self.is_waiting());
+        let mut spin_iters_per_check = self.spin_iters_per_check.get();
+        let spin_iters_since_yield = self.spin_iters_since_yield.get();
+
+        // Start with some busy waiting in user space...
+        if spin_iters_since_yield <= SPIN_ITERS_BEFORE_YIELD {
+            if spin_iters_per_check < MAX_SPIN_ITERS_PER_CHECK {
+                spin_iters_per_check = (2 * spin_iters_per_check).min(MAX_SPIN_ITERS_PER_CHECK);
+                self.spin_iters_per_check.set(spin_iters_per_check);
+            }
+            for _ in 0..spin_iters_per_check {
+                std::hint::spin_loop()
+            }
+        } else if self.waiting_start.get().unwrap().elapsed() < OS_WAIT_DELAY {
+            // ...periodically yielding to the kernel scheduler...
+            std::thread::sleep(YIELD_DURATION);
+            self.spin_iters_since_yield.set(0);
+        } else {
+            // ...then completely fall asleep after a while
+            //
+            // Make sure other threads manipulating the futex can faithfully
+            // observe our pre-sleep state.
+            let _new_futex_state =
+                self.futex
+                    .wait_for_change(*futex_state, Ordering::Release, Ordering::Relaxed);
         }
     }
 }
