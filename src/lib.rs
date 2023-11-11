@@ -50,6 +50,7 @@ impl Drop for AbortGuard {
 }
 
 /// Extract the result or propagate the panic from a `thread::Result`
+#[track_caller]
 fn result_or_panic<R>(result: std::thread::Result<R>) -> R {
     match result {
         Ok(result) => result,
