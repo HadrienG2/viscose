@@ -109,6 +109,7 @@ pub fn fibonacci_flat(scope: &Scope<'_>, n: u64) -> u64 {
 
 /// Array of floats that can be split into blocks, where each block tracks which
 /// thread pool worker it is local to
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct LocalFloats<const BLOCK_SIZE: usize> {
     /// Inner floating-point data (size must be a multiple of BLOCK_SIZE)
     data: Box<[f32]>,
@@ -140,6 +141,7 @@ impl<const BLOCK_SIZE: usize> LocalFloats<BLOCK_SIZE> {
 }
 //
 /// Slice to some LocalFloats
+#[derive(Debug, PartialEq)]
 pub struct LocalFloatsSlice<'target, const BLOCK_SIZE: usize> {
     /// Slice of the underlying LocalFloats::data
     data: &'target mut [f32],

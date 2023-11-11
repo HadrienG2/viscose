@@ -23,6 +23,7 @@ use std::{
 
 /// Simple flat pinned thread pool, used to check hypothesis that pinning and
 /// avoidance of TLS alone won't let us significantly outperform rayon
+#[derive(Debug)]
 pub struct FlatPool {
     /// Shared state
     shared: Arc<SharedState>,
@@ -204,6 +205,7 @@ impl Drop for FlatPool {
 }
 
 /// Job completion notification that unparks a thread
+#[derive(Clone, Debug)]
 struct NotifyParked<'flag> {
     /// Flag to be set to notify completion
     finished: &'flag AtomicBool,

@@ -19,7 +19,8 @@ use std::{
     time::Instant,
 };
 
-/// Worker thread
+/// Worker thread state
+#[derive(Debug)]
 pub(crate) struct Worker<'pool> {
     /// Access to the shared state
     shared: &'pool SharedState,
@@ -344,6 +345,7 @@ impl<'pool> Worker<'pool> {
 /// This is a token which attests that work is executing within the context of a
 /// worker thread in the thread pool, and can be used to schedule work on said
 /// thread pool.
+#[derive(Debug)]
 pub struct Scope<'scope>(AssertUnwindSafe<&'scope Worker<'scope>>);
 //
 impl<'scope> Scope<'scope> {
@@ -452,6 +454,7 @@ impl<'scope> Scope<'scope> {
 //       that they are all finished before returning.
 
 /// Mechanism to notify worker threads of join() completion
+#[derive(Copy, Clone, Debug)]
 struct NotifyFutex<'stack> {
     /// Flag to be set once the remote job of this join() is finished
     remote_finished: &'stack AtomicBool,

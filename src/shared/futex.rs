@@ -354,7 +354,7 @@ impl Debug for WorkerFutex {
 }
 
 /// Current worker futex state
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct WorkerFutexState {
     /// Location from which this worker is recommended to steal
     steal_location: Option<StealLocation>,
@@ -495,7 +495,7 @@ impl Default for WorkerFutexState {
 }
 
 /// Recommended work-stealing location
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum StealLocation {
     /// Steal from this worker thread
     Worker(usize),

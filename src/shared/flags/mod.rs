@@ -227,6 +227,12 @@ impl Debug for AtomicFlags {
     }
 }
 //
+impl Default for AtomicFlags {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+//
 impl Eq for AtomicFlags {}
 //
 impl Hash for AtomicFlags {

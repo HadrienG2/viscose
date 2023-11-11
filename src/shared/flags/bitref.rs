@@ -4,6 +4,7 @@ use super::{iter, AtomicFlags, AtomicWord, NonZeroWord, Word, WORD_BITS};
 use std::{
     debug_assert,
     fmt::{self, Debug},
+    hash::{Hash, Hasher},
     sync::atomic::Ordering,
 };
 
@@ -165,6 +166,14 @@ impl<'flags, const CACHE_ITER_MASKS: bool> Debug for BitRef<'flags, CACHE_ITER_M
 }
 //
 impl<'flags, const CACHE_ITER_MASKS: bool> Eq for BitRef<'flags, CACHE_ITER_MASKS> {}
+//
+impl<'flags, const CACHE_ITER_MASKS: bool> Hash for BitRef<'flags, CACHE_ITER_MASKS> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let word: *const AtomicWord = self.word;
+        word.hash(state);
+        self.bit_shift.hash(state);
+    }
+}
 //
 impl<'flags, const LEFT_CACHED: bool, const RIGHT_CACHED: bool>
     PartialEq<BitRef<'flags, RIGHT_CACHED>> for BitRef<'flags, LEFT_CACHED>

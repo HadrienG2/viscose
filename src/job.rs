@@ -63,6 +63,7 @@ impl<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify> Job<Res, ImplWork, Impl
 }
 
 /// [`Job`] state machine
+#[derive(Debug)]
 enum JobState<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify> {
     /// Job has not started executing yet
     Scheduled(ImplNotify, ImplWork),
@@ -103,6 +104,7 @@ impl<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify> JobState<Res, ImplWork,
 }
 
 /// Type-erased handle to a [`Job`]
+#[derive(Debug, Eq, Hash, PartialEq)]
 pub(crate) struct DynJob {
     /// Type-erased `&mut JobState<...>` pointer
     state: *mut (),

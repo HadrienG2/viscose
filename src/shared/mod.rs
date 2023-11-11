@@ -15,6 +15,7 @@ use std::sync::{atomic::Ordering, Arc};
 
 /// State that is shared between users of the thread pool and all thread pool
 /// workers
+#[derive(Debug, Default)]
 pub(crate) struct SharedState {
     /// Global work injector
     pub injector: Injector<DynJob>,
@@ -107,6 +108,7 @@ impl SharedState {
 }
 
 /// External interface to a single worker in a thread pool
+#[derive(Debug)]
 pub(crate) struct WorkerInterface {
     /// A way to steal from the worker
     pub stealer: Stealer<DynJob>,
