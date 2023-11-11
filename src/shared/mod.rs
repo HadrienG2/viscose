@@ -69,7 +69,7 @@ impl SharedState {
         update: Ordering,
     ) {
         // Check if there are job-less neighbors to submit work to...
-        let Some(asleep_neighbors) = self
+        let Some(mut asleep_neighbors) = self
             .work_availability
             .iter_unset_around::<INCLUDE_CENTER, CACHE_ITER_MASKS>(local_worker, Ordering::Acquire)
         else {
@@ -103,7 +103,13 @@ impl SharedState {
                 }
             }
         }
-        unlikely(self, asleep_neighbors, local_worker, task_location, update)
+        unlikely(
+            self,
+            &mut asleep_neighbors,
+            local_worker,
+            task_location,
+            update,
+        )
     }
 }
 
