@@ -1,6 +1,6 @@
 [package]
 name = "viscose"
-description = "Experimental demonstrator of locality-aware scheduling in rayon"
+description = "Prototyping locality-aware fork-join task scheduling"
 version = "0.1.0"
 edition = "2021"
 
