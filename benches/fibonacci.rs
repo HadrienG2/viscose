@@ -10,7 +10,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                 mut bench_impl: impl FnMut(&mut Bencher, u64),
             ) {
                 let mut group = c.benchmark_group(&format!("{backend_name}/fibonacci"));
-                for size in [1, 2, 4, 8, 12, 16, 20, 24, 28, 30, 32, 34] {
+                for size in [1, 2, 4, 8, 12, 16, 20, 24, 28, 30, 32] {
                     let phi = (1.0 + 5.0f64.sqrt()) / 2.0;
                     group.throughput(criterion::Throughput::Elements(
                         phi.powi(i32::try_from(size).unwrap()) as u64,

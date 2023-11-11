@@ -4,7 +4,7 @@ use crate::{
     job::{DynJob, Job, Notify},
     shared::{
         flags::bitref::BitRef,
-        futex::{StealLocation, WorkerFutex},
+        futex::{StealLocation, WorkerFutex, WorkerFutexState},
         SharedState,
     },
     AbortGuard, Work, MAX_SPIN_ITERS_PER_CHECK, OS_WAIT_DELAY, SPIN_ITERS_BEFORE_YIELD,
@@ -44,8 +44,8 @@ pub(crate) struct Worker<'pool> {
     /// Quick access to this thread's futex
     futex: &'pool WorkerFutex,
 
-    /// Timestamp at which we entered the sleepy state, assuming we're sleepy
-    sleepy_start: Cell<Option<Instant>>,
+    /// Timestamp at which we entered the waiting state, assuming we're in it
+    waiting_start: Cell<Option<Instant>>,
 
     /// Number of spin-loop iterations since we last yielded to the OS
     spin_iters_since_yield: Cell<usize>,
@@ -72,7 +72,7 @@ impl<'pool> Worker<'pool> {
             work_available_bit,
             futex,
             work_available_set: Cell::new(false),
-            sleepy_start: Cell::new(None),
+            waiting_start: Cell::new(None),
             spin_iters_since_yield: Cell::new(0),
             spin_iters_per_check: Cell::new(1),
             work_over: Cell::new(false),
@@ -128,10 +128,9 @@ impl<'pool> Worker<'pool> {
         // that updated the futex.
         let futex_state = self.futex.load_from_worker(Ordering::Acquire);
 
-        // Any futex event clears the futex sleepy flag, which we should
-        // acknowledge by resetting our internal sleepy state.
-        if self.sleepy_start.get().is_some() && !futex_state.is_sleepy() {
-            self.sleepy_start.set(None);
+        // Reset waiting state when we stop waiting
+        if !futex_state.is_waiting() {
+            self.waiting_start.set(None);
         }
 
         // Check if we've been recommended to steal from one specific location
@@ -147,8 +146,7 @@ impl<'pool> Worker<'pool> {
             // another recommendation has come up in meantime.
             //
             // Here we can use Relaxed because no one else should read from our
-            // futex location (we're just talking to ourself) and we aren't
-            // using the updated futex state at the moment.
+            // recommended stealing location, we're just talking to ourself.
             if !successful {
                 let _new_futex_state = self.futex.clear_outdated_location(
                     futex_state,
@@ -164,8 +162,7 @@ impl<'pool> Worker<'pool> {
                 // from there right away next time, unless a better
                 // recommendation has concurrently come up.
                 //
-                // Can use Relaxed because we are talking to ourselves and we
-                // aren't using the updated futex state at the moment.
+                // Can use Relaxed because we are talking to ourselves.
                 let _new_futex_state = self.futex.suggest_steal(
                     location,
                     self.idx,
@@ -173,55 +170,67 @@ impl<'pool> Worker<'pool> {
                     Ordering::Relaxed,
                 );
             } else if futex_state.work_incoming() {
-                // No work available for now, but more work might still be
-                // coming, just wait for it after warning others
-                if futex_state.is_sleepy() {
-                    // Start with some busy waiting...
-                    let mut spin_iters_per_check = self.spin_iters_per_check.get();
-                    let spin_iters_since_yield = self.spin_iters_since_yield.get();
-                    if spin_iters_since_yield <= SPIN_ITERS_BEFORE_YIELD {
-                        if spin_iters_per_check < MAX_SPIN_ITERS_PER_CHECK {
-                            spin_iters_per_check =
-                                (2 * spin_iters_per_check).min(MAX_SPIN_ITERS_PER_CHECK);
-                            self.spin_iters_per_check.set(spin_iters_per_check);
-                        }
-                        for _ in 0..spin_iters_per_check {
-                            std::hint::spin_loop()
-                        }
-                    } else if self.sleepy_start.get().unwrap().elapsed() < OS_WAIT_DELAY {
-                        std::thread::sleep(YIELD_DURATION);
-                        self.spin_iters_since_yield.set(0);
-                    } else {
-                        // ...then truly fall asleep after a while
-                        //
-                        // Synchronize with other threads manipulating the futex
-                        // during our sleep.
-                        let _new_futex_state = self.futex.wait_for_change(
-                            futex_state,
-                            Ordering::Release,
-                            Ordering::Relaxed,
-                        );
-                    }
-                } else {
-                    // Tell others we're going to busy-wait and then sleep if
-                    // nothing happens soon + start associated timer.
-                    //
-                    // Synchronize with other threads manipulating the futex.
-                    self.sleepy_start.set(Some(Instant::now()));
-                    self.spin_iters_since_yield.set(0);
-                    self.spin_iters_per_check.set(1);
-                    let _new_futex_state =
-                        self.futex
-                            .notify_sleepy(futex_state, Ordering::Release, Ordering::Relaxed);
-                }
+                // If there isn't any work to steal anywhere, but more work
+                // might still be coming up, wait for more work to come up
+                self.wait_for_work(&futex_state);
             } else {
                 // No work available for now and no more work expected, nothing
                 // to do (this should only be a transient state when we are
                 // waiting for a signal that will be sent by other workers
                 // processing their own work)
-                self.work_over.set(true);
-                std::thread::sleep(YIELD_DURATION)
+                if !self.work_over.get() {
+                    self.work_over.set(true);
+                } else {
+                    std::thread::sleep(YIELD_DURATION)
+                }
             }
+        }
+    }
+
+    /// Wait for more work to come up
+    fn wait_for_work(&self, futex_state: &WorkerFutexState) {
+        // Have we already initialized the waiting-related state?
+        if let Some(waiting_start) = self.waiting_start.get() {
+            // Restore waiting state
+            let mut spin_iters_per_check = self.spin_iters_per_check.get();
+            let spin_iters_since_yield = self.spin_iters_since_yield.get();
+
+            // Start with some busy waiting in user space...
+            if spin_iters_since_yield <= SPIN_ITERS_BEFORE_YIELD {
+                if spin_iters_per_check < MAX_SPIN_ITERS_PER_CHECK {
+                    spin_iters_per_check = (2 * spin_iters_per_check).min(MAX_SPIN_ITERS_PER_CHECK);
+                    self.spin_iters_per_check.set(spin_iters_per_check);
+                }
+                for _ in 0..spin_iters_per_check {
+                    std::hint::spin_loop()
+                }
+            } else if waiting_start.elapsed() < OS_WAIT_DELAY {
+                // ...periodically yielding to the kernel scheduler...
+                std::thread::sleep(YIELD_DURATION);
+                self.spin_iters_since_yield.set(0);
+            } else {
+                // ...then completely fall asleep after a while
+                //
+                // Make sure other threads manipulating the futex can faithfully
+                // observe our pre-sleep state.
+                let _new_futex_state =
+                    self.futex
+                        .wait_for_change(*futex_state, Ordering::Release, Ordering::Relaxed);
+            }
+        } else {
+            // Initialize waiting-related state
+            self.waiting_start.set(Some(Instant::now()));
+            self.spin_iters_since_yield.set(0);
+            self.spin_iters_per_check.set(1);
+
+            // Tell other threads we're going to busy-wait and then sleep if
+            // nothing happens soon + start associated timer.
+            //
+            // Make sure other threads manipulating the futex can faithfully
+            // observe our pre-wait state.
+            let _new_futex_state =
+                self.futex
+                    .notify_waiting(*futex_state, Ordering::Release, Ordering::Relaxed);
         }
     }
 
@@ -308,7 +317,7 @@ impl<'pool> Worker<'pool> {
         {
             // Try to steal from other workers at increasing distances
             //
-            // Need Acquire so stealing happens after checking work availability.
+            // Need Acquire so stealing happens after observing available work.
             for bit in neighbors_with_work {
                 let idx = bit.linear_idx(&self.shared.work_availability);
                 if self.steal_from_worker(idx) {
