@@ -1,10 +1,10 @@
 //! Thread pool-wide interfaces
 
 use crate::{
-    job::{DynJob, Job, Notify},
+    job::{AbortOnUnwind, DynJob, Job, Notify},
     shared::{futex::StealLocation, SharedState},
     worker::Worker,
-    AbortGuard, Work,
+    Work,
 };
 use hwlocality::{
     bitmap::BitmapIndex,
@@ -128,7 +128,7 @@ impl FlatPool {
             // SAFETY: We wait for the job to complete before letting it go out
             //         of scope or otherwise touching it in any way, and panics
             //         are translated to aborts until it's done executing.
-            let abort = AbortGuard;
+            let abort_on_unwind = AbortOnUnwind;
             unsafe { self.spawn_unchecked(job.as_dyn()) };
 
             // Wait for the end of job execution then synchronize
@@ -136,7 +136,7 @@ impl FlatPool {
                 std::thread::park();
             }
             atomic::fence(Ordering::Acquire);
-            std::mem::forget(abort);
+            std::mem::forget(abort_on_unwind);
         }
         // SAFETY: We waited for the job to finish before collecting the result
         //         and used an Acquire barrier to synchronize

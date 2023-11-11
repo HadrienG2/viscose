@@ -1,7 +1,20 @@
 //! Thread pool job
 
-use crate::{Scope, Work};
+use crate::{worker::Scope, Work};
 use std::{cell::UnsafeCell, panic::AssertUnwindSafe};
+
+/// Aborts the process if dropped
+///
+/// Create one of these at the start of code sections where unwinding panics
+/// must not be allowed to escape the current stack frame, and `mem::forget()`
+/// it at the end of the danger zone.
+pub(crate) struct AbortOnUnwind;
+//
+impl Drop for AbortOnUnwind {
+    fn drop(&mut self) {
+        std::process::abort()
+    }
+}
 
 /// [`Work`] that has been prepared for execution by the thread pool
 ///
@@ -15,9 +28,11 @@ use std::{cell::UnsafeCell, panic::AssertUnwindSafe};
 /// - Until the job completion signal is received, do not exit the current stack
 ///   frame or interact with the Job in any way, including but not limited to...
 ///     - Moving or dropping the job
-///     - Calling any Job method
+///     - Calling any Job or DynJob method
+///     - Letting a panic unwind the stack (use [`AbortOnUnwind`] for this)
 /// - Once a job completion signal has been received with Acquire memory
-///   ordering, you may extract the result and propagate panics with `result()`.
+///   ordering, you may extract the result and propagate panics with
+///   `result_or_panic()`.
 pub(crate) struct Job<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify>(
     UnsafeCell<JobState<Res, ImplWork, ImplNotify>>,
 );
@@ -51,6 +66,7 @@ impl<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify> Job<Res, ImplWork, Impl
     ///
     /// Should only be called after the job completion notification has been
     /// received.
+    #[track_caller]
     pub unsafe fn result_or_panic(mut self) -> Res {
         match std::mem::replace(self.0.get_mut(), JobState::Collected) {
             JobState::Scheduled(_, _) | JobState::Running => {

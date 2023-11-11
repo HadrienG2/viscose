@@ -1,14 +1,13 @@
 //! Single thread pool worker
 
 use crate::{
-    job::{DynJob, Job, Notify},
+    job::{AbortOnUnwind, DynJob, Job, Notify},
     shared::{
         flags::bitref::BitRef,
         futex::{StealLocation, WorkerFutex, WorkerFutexState},
         SharedState,
     },
-    AbortGuard, Work, MAX_SPIN_ITERS_PER_CHECK, OS_WAIT_DELAY, SPIN_ITERS_BEFORE_YIELD,
-    YIELD_DURATION,
+    Work, MAX_SPIN_ITERS_PER_CHECK, OS_WAIT_DELAY, SPIN_ITERS_BEFORE_YIELD, YIELD_DURATION,
 };
 use crossbeam::deque::{self, Steal};
 use std::{
@@ -138,7 +137,7 @@ impl<'pool> Worker<'pool> {
             // Try to steal from that recommended location
             let successful = match location {
                 StealLocation::Worker(idx) => self.steal_from_worker(idx),
-                StealLocation::Injector => self.steal_from_injector(),
+                StealLocation::Injector => crate::unlikely(|| self.steal_from_injector()),
             };
 
             // Once stealing starts to fail, the recommandation has become
@@ -300,6 +299,7 @@ impl<'pool> Worker<'pool> {
     /// Try to steal work from the global task injector
     ///
     /// Return truth that a task was successfully stolen and run.
+    #[inline(always)]
     fn steal_from_injector(&self) -> bool {
         self.steal(|| self.shared.injector.steal())
     }
@@ -388,7 +388,7 @@ impl<'scope> Scope<'scope> {
             // SAFETY: We wait for the job to complete before letting it go out
             //         of scope or otherwise touching it in any way, and panics
             //         are translated to aborts until it's done executing.
-            let abort = AbortGuard;
+            let abort_on_unwind = AbortOnUnwind;
             unsafe { self.spawn_unchecked(remote_job.as_dyn()) };
 
             // Run local task
@@ -400,7 +400,7 @@ impl<'scope> Scope<'scope> {
                 self.0.step();
             }
             atomic::fence(Ordering::Acquire);
-            std::mem::forget(abort);
+            std::mem::forget(abort_on_unwind);
             local_result
         };
 

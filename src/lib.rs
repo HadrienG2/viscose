@@ -39,15 +39,6 @@ where
 {
 }
 
-/// Aborts if dropped, used to translate panics to aborts
-struct AbortGuard;
-//
-impl Drop for AbortGuard {
-    fn drop(&mut self) {
-        std::process::abort()
-    }
-}
-
 /// Extract the result or propagate the panic from a `thread::Result`
 #[track_caller]
 fn result_or_panic<R>(result: std::thread::Result<R>) -> R {
@@ -55,4 +46,12 @@ fn result_or_panic<R>(result: std::thread::Result<R>) -> R {
         Ok(result) => result,
         Err(payload) => std::panic::resume_unwind(payload),
     }
+}
+
+/// Tell the optimizer that a code path is unlikely to be taken and should be
+/// out-lined into a separate function call.
+#[cold]
+#[inline(never)]
+fn unlikely<T>(f: impl FnOnce() -> T) -> T {
+    f()
 }

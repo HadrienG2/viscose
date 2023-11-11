@@ -12,11 +12,11 @@ criterion = { version = "0.5.1", default-features = false }
 crossbeam = { version = "0.8.2", features = ["crossbeam-deque"] }
 hwlocality = { git = "https://github.com/HadrienG2/hwlocality.git", features = ["hwloc-2_2_0"] }
 iterator_ilp = "2.0"
-itertools = "0.11"
 pessimize = { git = "https://github.com/HadrienG2/pessimize.git" }
 rayon = { version = "1.8.0", default-features = false }
 
 [dev-dependencies]
+itertools = "0.11"
 proptest = "1.3"
 
 [lib]
