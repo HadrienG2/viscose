@@ -429,7 +429,7 @@ pub(crate) fn init_mask<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flags::tests::flags_and_bit_idx;
+    use crate::shared::flags::tests::flags_and_bit_idx;
     use proptest::prelude::*;
 
     /// Check outcome of iterating over FlagIdxIterator

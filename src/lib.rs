@@ -1,10 +1,9 @@
 #![warn(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
 pub mod bench;
-pub mod flags;
 mod job;
 pub mod pool;
-mod shared;
+pub mod shared;
 mod worker;
 
 use crate::worker::Scope;

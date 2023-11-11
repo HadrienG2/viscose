@@ -1,9 +1,9 @@
 //! Single thread pool worker
 
 use crate::{
-    flags::bitref::BitRef,
     job::{DynJob, Job, Notify},
     shared::{
+        flags::bitref::BitRef,
         futex::{StealLocation, WorkerFutex},
         SharedState,
     },
@@ -13,6 +13,7 @@ use crate::{
 use crossbeam::deque::{self, Steal};
 use std::{
     cell::Cell,
+    debug_assert,
     panic::AssertUnwindSafe,
     sync::atomic::{self, AtomicBool, Ordering},
     time::Instant,
@@ -25,6 +26,9 @@ pub(crate) struct Worker<'pool> {
 
     /// Index of this thread in the shared state tables
     idx: usize,
+
+    /// Work queue
+    work_queue: deque::Worker<DynJob>,
 
     /// Bit of this thread in `SharedState::work_availability`
     work_available_bit: BitRef<'pool, true>,
@@ -39,9 +43,6 @@ pub(crate) struct Worker<'pool> {
     /// Quick access to this thread's futex
     futex: &'pool WorkerFutex,
 
-    /// Work queue
-    work_queue: deque::Worker<DynJob>,
-
     /// Timestamp at which we entered the sleepy state, assuming we're sleepy
     sleepy_start: Cell<Option<Instant>>,
 
@@ -53,8 +54,8 @@ pub(crate) struct Worker<'pool> {
 
     /// Truth that we reached the end of observable work and expect no more work
     ///
-    /// This will lead the thread to shut down once all pending join() have been
-    /// fully processed.
+    /// This will lead the thread to shut down once all pending `join()`s have
+    /// been fully processed.
     work_over: Cell<bool>,
 }
 //
@@ -62,13 +63,13 @@ impl<'pool> Worker<'pool> {
     /// Set up and run the worker
     pub fn run(shared: &'pool SharedState, idx: usize, work_queue: deque::Worker<DynJob>) {
         let futex = &shared.workers[idx].futex;
-        let bit = shared.work_availability.bit_with_cache(idx);
+        let work_available_bit = shared.work_availability.bit_with_cache(idx);
         let worker = Self {
             shared,
             idx,
-            work_available_bit: bit,
-            futex,
             work_queue,
+            work_available_bit,
+            futex,
             work_available_set: Cell::new(false),
             sleepy_start: Cell::new(None),
             spin_iters_since_yield: Cell::new(0),
@@ -98,7 +99,8 @@ impl<'pool> Worker<'pool> {
                 //
                 // Use Release ordering to make sure this happens after emptying
                 // the work queue.
-                self.work_available_bit.fetch_clear(Ordering::Release);
+                let was_set = self.work_available_bit.fetch_clear(Ordering::Release);
+                debug_assert!(was_set);
                 self.work_available_set.set(false);
             }
         }
@@ -287,6 +289,7 @@ impl<'pool> Worker<'pool> {
     /// Try to steal work from the global task injector
     ///
     /// Return truth that a task was successfully stolen and run.
+    #[cold]
     fn steal_from_injector(&self) -> bool {
         self.steal(|| self.shared.injector.steal())
     }
