@@ -144,6 +144,7 @@ impl WorkerFutex {
     ///
     /// Should have announced intent to sleep with `notify_waiting()` and
     /// busy-waited for a reasonable amount of time before calling this method.
+    #[cold]
     pub fn wait_for_change(
         &self,
         initial: WorkerFutexState,
@@ -289,6 +290,7 @@ impl WorkerFutex {
 
     /// Notify the worker that the thread pool is shutting down and won't be
     /// accepting any more work
+    #[cold]
     pub fn notify_shutdown(&self, order: Ordering) {
         // Record pool shutdown and cancel any impeding attempt to sleep
         //

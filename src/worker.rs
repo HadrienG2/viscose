@@ -188,6 +188,7 @@ impl<'pool> Worker<'pool> {
     }
 
     /// Wait for more work to come up
+    #[cold]
     fn wait_for_work(&self, futex_state: &WorkerFutexState) {
         // Have we already initialized the waiting-related state?
         if let Some(waiting_start) = self.waiting_start.get() {
