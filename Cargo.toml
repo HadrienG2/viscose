@@ -1,5 +1,6 @@
 [package]
-name = "sched-local"
+name = "viscose"
+description = "Experimental demonstrator of locality-aware scheduling in rayon"
 version = "0.1.0"
 edition = "2021"
 

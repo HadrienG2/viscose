@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Bencher, Criterion};
-use sched_local::bench::{self, bench_local_floats};
+use viscose::bench::{self, bench_local_floats};
 
 fn criterion_benchmark(c: &mut Criterion) {
     bench::for_each_locality(

@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use sched_local::flags::{bitref::BitRef, AtomicFlags};
 use std::sync::atomic::Ordering;
+use viscose::flags::{bitref::BitRef, AtomicFlags};
 
 fn criterion_benchmark(c: &mut Criterion) {
     for len_pow2 in 0..=8 {
