@@ -4,7 +4,7 @@ pub mod bench;
 pub mod flags;
 mod job;
 pub mod pool;
-mod state;
+mod shared;
 mod worker;
 
 use crate::worker::Scope;

@@ -3,7 +3,7 @@
 use crate::{
     flags::bitref::BitRef,
     job::{DynJob, Job, Notify},
-    state::{
+    shared::{
         futex::{StealLocation, WorkerFutex},
         SharedState,
     },

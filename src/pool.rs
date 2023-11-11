@@ -2,7 +2,7 @@
 
 use crate::{
     job::{DynJob, Job, Notify},
-    state::{futex::StealLocation, SharedState},
+    shared::{futex::StealLocation, SharedState},
     worker::Worker,
     AbortGuard, Work,
 };
