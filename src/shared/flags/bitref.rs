@@ -74,9 +74,9 @@ impl<'flags, const CACHE_ITER_MASKS: bool> BitRef<'flags, CACHE_ITER_MASKS> {
         self.word.fetch_and(!bit, order) & bit != 0
     }
 
-    /// Distance from this bit to another bit
-    pub fn distance(&self, other: &Self, flags: &'flags AtomicFlags) -> usize {
-        self.linear_idx(flags).abs_diff(other.linear_idx(flags))
+    /// Number of left bit shift from `origin` to `self`
+    pub fn offset_from(&self, origin: &Self, flags: &'flags AtomicFlags) -> usize {
+        self.linear_idx(flags) - origin.linear_idx(flags)
     }
 
     /// Check that this bit does belong to the specified flags

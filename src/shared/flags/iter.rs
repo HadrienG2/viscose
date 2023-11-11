@@ -70,7 +70,7 @@ impl<'flags, const FIND_SET: bool, const INCLUDE_CENTER: bool> Iterator
             (Some(left), Some(right)) => {
                 let center = &self.center;
                 let flags = self.flags;
-                if left.distance(center, flags) <= center.distance(&right, flags) {
+                if left.offset_from(center, flags) <= center.offset_from(&right, flags) {
                     self.left_bits.next()
                 } else {
                     self.right_bits.next()
