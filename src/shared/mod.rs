@@ -76,7 +76,7 @@ impl SharedState {
             return;
         };
 
-        // ...and if so, wake them up
+        // ...and if so, tell the closest one about our newly submitted job
         #[cold]
         fn unlikely<'self_, const CACHE_ITER_MASKS: bool>(
             self_: &'self_ SharedState,

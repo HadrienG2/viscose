@@ -300,7 +300,6 @@ impl<'pool> Worker<'pool> {
     /// Try to steal work from the global task injector
     ///
     /// Return truth that a task was successfully stolen and run.
-    #[cold]
     fn steal_from_injector(&self) -> bool {
         self.steal(|| self.shared.injector.steal())
     }

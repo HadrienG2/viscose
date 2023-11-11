@@ -306,6 +306,7 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool> Iterator
 {
     type Item = BitRef<'flags, false>;
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         let bit_idx = self.peek()?;
         self.find_next_bit();
