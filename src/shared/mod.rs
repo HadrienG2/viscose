@@ -1,12 +1,14 @@
-pub mod flags;
-/// Thread pool shared state
+//! State shared between the thread pool and all of its workers
+
+pub(crate) mod flags;
 pub(crate) mod futex;
+pub(crate) mod job;
 
 use self::{
     flags::{bitref::BitRef, AtomicFlags},
     futex::{StealLocation, WorkerFutex},
+    job::DynJob,
 };
-use crate::job::DynJob;
 use crossbeam::{
     deque::{self, Injector, Stealer},
     utils::CachePadded,

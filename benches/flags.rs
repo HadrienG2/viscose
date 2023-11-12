@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use std::sync::atomic::Ordering;
-use viscose::shared::flags::{bitref::BitRef, AtomicFlags};
+use viscose::bench::{AtomicFlags, BitRef};
 
 fn criterion_benchmark(c: &mut Criterion) {
     for len_pow2 in 0..=8 {

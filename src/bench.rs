@@ -1,6 +1,6 @@
 //! Benchmarking utilities
 
-use crate::{pool::FlatPool, worker::Scope};
+use crate::{pool::FlatPool, worker::scope::Scope};
 use criterion::{Bencher, Criterion};
 use crossbeam::utils::CachePadded;
 use hwlocality::{cpu::binding::CpuBindingFlags, object::types::ObjectType, Topology};
@@ -9,6 +9,9 @@ use std::{
     collections::BTreeSet,
     sync::{Arc, OnceLock},
 };
+
+/// Re-export atomic flags for benchmarking
+pub use crate::shared::flags::{bitref::BitRef, AtomicFlags};
 
 /// Run a benchmark for all interesting named CPU localities
 pub fn for_each_locality(

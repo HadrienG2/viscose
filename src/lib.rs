@@ -1,13 +1,14 @@
 #![warn(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
 pub mod bench;
-mod job;
 pub mod pool;
-pub mod shared;
-mod worker;
+mod shared;
+pub mod worker;
 
-use crate::worker::Scope;
 use std::time::Duration;
+
+/// Token used by tasks executing on the thread pool to interact with it
+pub use crate::worker::scope::Scope;
 
 /// Minimal busy-waiting time between declaring sleepiness and falling asleep
 ///

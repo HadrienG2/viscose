@@ -1,6 +1,6 @@
 //! Thread pool job
 
-use crate::{worker::Scope, Work};
+use crate::{worker::scope::Scope, Work};
 use std::{cell::UnsafeCell, panic::AssertUnwindSafe};
 
 /// Aborts the process if dropped
@@ -154,7 +154,8 @@ unsafe impl Send for DynJob {}
 /// # Safety
 ///
 /// No notification should be received until `self.notify()` is called, and the
-/// notification process must feature an `Ordering::Release` memory barrier.
+/// notification process must feature an `Ordering::Release` memory barrier at
+/// the point where work completion becomes observable.
 pub(crate) unsafe trait Notify {
     /// Send in the notification
     fn notify(self);
