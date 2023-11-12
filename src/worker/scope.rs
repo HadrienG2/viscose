@@ -3,6 +3,8 @@
 //! Used by tasks running on the thread pool to interact with the worker thread
 //! that's running them, and by extension with the thread pool at large.
 
+use crossbeam::utils::CachePadded;
+
 use super::Worker;
 use crate::{
     shared::{
@@ -12,8 +14,9 @@ use crate::{
     Work,
 };
 use std::{
+    debug_assert_eq,
     panic::AssertUnwindSafe,
-    sync::atomic::{self, AtomicBool, Ordering},
+    sync::atomic::{self, AtomicBool, AtomicU8, Ordering},
 };
 
 /// Scope for executing parallel work
@@ -42,11 +45,7 @@ impl<'scope> Scope<'scope> {
         RemoteRes: Send,
     {
         // Set up remote job and its completion notification mechanism
-        let remote_finished = AtomicBool::new(false);
-        let notify = NotifyFutex {
-            remote_finished: &remote_finished,
-            futex: self.0.futex,
-        };
+        let notify = NotifyJoin::new(&self.0);
         let mut remote_job = Job::new(notify, remote);
 
         // No unwinding panics allowed until the remote task has completed
@@ -90,6 +89,77 @@ impl<'scope> Scope<'scope> {
         Self(AssertUnwindSafe(worker))
     }
 
+    /// Allocate a new join ID
+    fn new_join_id(&self) -> JoinID {
+        // Query the ID used for the last join
+        let last_join_id = self.0.last_join_id.get();
+
+        // Join IDs are basically the indices of bytes in the
+        // `Worker::join_statuses` table
+        let join_statuses = &self.0.join_statuses;
+        let mut next_join_idx = usize::from(last_join_id);
+        let next_join_idx = || {
+            // Pick a status byte on the same byte of the next cache line to
+            // avoid false sharing between join()s started in short succession
+            const BYTES_PER_CACHE_LINE: usize = std::mem::align_of::<CachePadded<u8>>();
+            next_join_idx += BYTES_PER_CACHE_LINE;
+            if next_join_idx < join_statuses.len() {
+                return next_join_idx;
+            }
+
+            // Once we're done iterating over the same byte of all cache lines,
+            // move to the next byte of all cache lines and iterate again.
+            next_join_idx -= join_statuses.len() - 1;
+            if next_join_idx < BYTES_PER_CACHE_LINE.min(join_statuses.len()) {
+                return next_join_idx;
+            }
+
+            // Once we've probed all bytes of all cache lines, go back to the
+            // first status byte of `join_statuses`.
+            next_join_idx = 0;
+            next_join_idx
+        };
+
+        // Most of the time, the first join ID we end up using should be unused.
+        // Try to allocate it for this join with a single eager RMW.
+        let first_join_idx = next_join_idx();
+        let first_status =
+            join_statuses[first_join_idx].swap(JOIN_STATUS_RUNNING, Ordering::Acquire);
+        let join_idx = if first_status = JOIN_STATUS_FINISHED {
+            first_join_idx
+        } else {
+            // If next join ID is busy, try to all other IDs more cautiously
+            #[cold]
+            fn probe_all_join_statuses(
+                first_join_idx: usize,
+                join_statuses: &[AtomicJoinStatus],
+                mut next_join_idx: impl FnMut() -> usize,
+            ) -> usize {
+                loop {
+                    // Iterate until we've went through all join indices
+                    let curr_join_idx = next_join_idx();
+                    if curr_join_idx == first_join_idx {
+                        panic!("exceeded implementation join() concurrency limit");
+                    }
+
+                    // Try to use the current join status byte
+                    let join_status = &join_statuses[curr_join_idx];
+                    if join_status.load(Ordering::Relaxed) == JOIN_STATUS_FINISHED {
+                        let old_status = join_status.swap(JOIN_STATUS_RUNNING, Ordering::Acquire);
+                        debug_assert_eq!(old_status, JOIN_STATUS_FINISHED);
+                        return curr_join_idx;
+                    }
+                }
+            }
+            probe_all_join_statuses(first_join_idx, join_statuses, &mut next_join_idx)
+        };
+
+        // Report freshly allocated join ID
+        let first_join_id = u16::try_from(first_join_idx).unwrap();
+        self.0.last_join_id.set(first_join_id);
+        first_join_id
+    }
+
     /// Schedule work for execution on the thread pool, without lifetime checks
     ///
     /// The work is scheduled on the active worker's thread work queue, but it
@@ -129,21 +199,150 @@ impl<'scope> Scope<'scope> {
 //       of spawned tasks and make the function that created the scope ensure
 //       that they are all finished before returning.
 
+/// Unique identifier of an ongoing [`Scope::join()`] operation
+pub(crate) type JoinID = u16;
+
+/// Join status byte
+pub(super) type JoinStatus = u8;
+
+/// Atomic version of [`JoinStatus`]
+pub(super) type AtomicJoinStatus = AtomicU8;
+
+/// [`JoinStatus`] value used for joins where the remote task is running
+pub(super) const JOIN_STATUS_RUNNING: JoinStatus = 0;
+
+/// [`JoinStatus`] value used for joins where the remote task has completed but
+/// the join completion notification hasn't been sent to the worker futex and
+/// thus the associated JoinID should not be reused yet.
+pub(super) const JOIN_STATUS_NOTIFYING: JoinStatus = 1;
+
+/// [`JoinStatus`] value used for joins where the remote task is done using the
+/// JoinID and it can be reallocated to another join.
+pub(super) const JOIN_STATUS_FINISHED: JoinStatus = 2;
+
 /// Mechanism to notify worker threads of join() completion
 #[derive(Copy, Clone, Debug)]
-struct NotifyFutex<'stack> {
-    /// Flag to be set once the remote job of this join() is finished
-    remote_finished: &'stack AtomicBool,
+struct NotifyJoin<'worker> {
+    /// Access to the worker state
+    worker: &'worker Worker<'worker>,
 
-    /// Futex of the worker thread to be awakened, if sleeping
-    futex: &'stack WorkerFutex,
+    /// Unique identifier of this join
+    join_id: JoinID,
 }
 //
-// SAFETY: remote_finished is set with Release ordering and is the signal that
-//         the worker uses to synchronize.
-unsafe impl Notify for NotifyFutex<'_> {
+// SAFETY: join_status is set with Release ordering and is the main signal that
+//         the worker uses to detect job completion.
+unsafe impl<'worker> Notify for NotifyJoin<'worker> {
+    /// Set up a join completion notification channel
+    fn new(worker: &'worker Worker<'worker>) {
+        let join_id = Self::allocate_join_id(worker);
+        Self { worker, join_id }
+    }
+
+    /// Allocate a JoinID for this new join
+    fn allocate_join_id(worker: &Worker<'_>) -> JoinID {
+        // Query the ID used for the last join
+        let last_join_id = worker.last_join_id.get();
+
+        // Join IDs are basically the indices of bytes in the
+        // `Worker::join_statuses` table
+        let join_statuses = &worker.join_statuses;
+        let mut next_join_idx = usize::from(last_join_id);
+        let next_join_idx = || {
+            // Pick a status byte on the same byte of the next cache line to
+            // avoid false sharing between join()s started in short succession
+            const BYTES_PER_CACHE_LINE: usize = std::mem::align_of::<CachePadded<u8>>();
+            next_join_idx += BYTES_PER_CACHE_LINE;
+            if next_join_idx < join_statuses.len() {
+                return next_join_idx;
+            }
+
+            // Once we're done iterating over the same byte of all cache lines,
+            // move to the next byte of all cache lines and iterate again.
+            next_join_idx -= join_statuses.len() - 1;
+            if next_join_idx < BYTES_PER_CACHE_LINE.min(join_statuses.len()) {
+                return next_join_idx;
+            }
+
+            // Once we've probed all bytes of all cache lines, go back to the
+            // first status byte of `join_statuses`.
+            next_join_idx = 0;
+            next_join_idx
+        };
+
+        // Most of the time, the first join ID we end up using should be unused.
+        // Try to allocate it for this join with a single eager RMW.
+        let first_join_idx = next_join_idx();
+        let first_status =
+            join_statuses[first_join_idx].swap(JOIN_STATUS_RUNNING, Ordering::Acquire);
+        let join_idx = if first_status = JOIN_STATUS_FINISHED {
+            first_join_idx
+        } else {
+            // If next join ID is busy, try to all other IDs more cautiously
+            #[cold]
+            fn probe_all_join_statuses(
+                first_join_idx: usize,
+                join_statuses: &[AtomicJoinStatus],
+                mut next_join_idx: impl FnMut() -> usize,
+            ) -> usize {
+                loop {
+                    // Iterate until we've went through all join indices
+                    let curr_join_idx = next_join_idx();
+                    if curr_join_idx == first_join_idx {
+                        panic!("exceeded implementation join() concurrency limit");
+                    }
+
+                    // Try to use the current join status byte
+                    let join_status = &join_statuses[curr_join_idx];
+                    if join_status.load(Ordering::Relaxed) == JOIN_STATUS_FINISHED {
+                        let old_status = join_status.swap(JOIN_STATUS_RUNNING, Ordering::Acquire);
+                        debug_assert_eq!(old_status, JOIN_STATUS_FINISHED);
+                        return curr_join_idx;
+                    }
+                }
+            }
+            probe_all_join_statuses(first_join_idx, join_statuses, &mut next_join_idx)
+        };
+
+        // Report freshly allocated join ID
+        let first_join_id = u16::try_from(first_join_idx).unwrap();
+        worker.last_join_id.set(first_join_id);
+        first_join_id
+    }
+
     fn notify(self) {
-        self.remote_finished.store(true, Ordering::Release);
-        self.futex.wake(Ordering::Release);
+        // Access the status byte for this join
+        let join_status = &self.worker.join_statuses[usize::from(self.join_id)];
+
+        // First, announce job completion. This must be Release, as per the
+        // NotifyFutex contract, so it's not reordered before job completion.
+        if cfg!(debug_assertions) {
+            assert_eq!(
+                join_status.swap(JOIN_STATUS_NOTIFYING, Ordering::Release),
+                JOIN_STATUS_RUNNING,
+            );
+        } else {
+            join_status.store(JOIN_STATUS_NOTIFYING, Ordering::Release);
+        }
+
+        // Wake the worker if it was asleep or going ot sleep by updating its
+        // "latest join ID" to our join ID. This may cause the worker to miss
+        // previous join notifications, but that's okay: since we're using
+        // AcqRel ordering, a worker that sees our join_id with Acquire ordering
+        // transitively sees all memory updates performed by previous joins.
+        self.worker
+            .futex
+            .notify_join(self.join_id, Ordering::AcqRel);
+
+        // Tell the worker that we're done using this join_id and it can be
+        // reclaimed for use by a future join().
+        if cfg!(debug_assertions) {
+            assert_eq!(
+                join_status.swap(JOIN_STATUS_FINISHED, Ordering::Release),
+                JOIN_STATUS_NOTIFYING,
+            );
+        } else {
+            join_status.store(JOIN_STATUS_FINISHED, Ordering::Release);
+        }
     }
 }

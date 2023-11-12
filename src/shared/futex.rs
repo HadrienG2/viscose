@@ -1,5 +1,6 @@
 //! Futex used for blocking worker synchronization
 
+use crate::worker::scope::JoinID;
 #[cfg(test)]
 use proptest::{
     prelude::*,
@@ -43,7 +44,7 @@ impl WorkerFutex {
         Self(AtomicU32::new(state.to_raw()))
     }
 
-    // --- Futex owner interface ---
+    // --- Interface for the worker that the futex belongs to ---
 
     /// Read out the current futex state
     ///
@@ -167,7 +168,7 @@ impl WorkerFutex {
         current
     }
 
-    // --- Other worker interface ---
+    // --- Interface usable by other entities interacting with the futex ---
 
     /// Notify the worker of a new recommended stealing location, returns truth
     /// that the recommendation was accepted (it's better than the previous one)
@@ -226,6 +227,33 @@ impl WorkerFutex {
                 }
             }
         }
+    }
+
+    /// Tell this worker thread that a certain join() has completed
+    pub fn notify_join(&self, join_id: JoinID, order: Ordering) {
+        // Inject our new join ID and cancel impeding attempts to sleep
+        //
+        // Need Acquire ordering so this is not reordered after wake_if_asleep
+        let old_raw = self
+            .0
+            .fetch_update(
+                Self::at_least_acquire(order),
+                Ordering::Relaxed,
+                |old_raw| {
+                    let old = WorkerFutexState::from_raw(old_raw);
+                    debug_assert_ne!(old.last_join_id, join_id);
+                    let new = WorkerFutexState {
+                        last_join_id: join_id,
+                        sleeping: false,
+                        ..old
+                    };
+                    Some(new.to_raw())
+                },
+            )
+            .expect("not allowed to fail");
+
+        // If we updated the futex of a sleeping thread, wake it up
+        self.wake_if_asleep(old_raw);
     }
 
     /// Wake up this worker thread if it's asleep
@@ -318,28 +346,27 @@ impl Debug for WorkerFutex {
 /// Current worker futex state
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct WorkerFutexState {
-    /// Location from which this worker is recommended to steal
-    steal_location: Option<StealLocation>,
+    /// Identifier of the last completed `join()` on this futex
+    last_join_id: JoinID,
 
     /// Truth that the thread pool is reachable and may receive more work
     work_incoming: bool,
 
     /// Truth that the worker is sleeping
     sleeping: bool,
+
+    /// Location from which this worker is recommended to steal
+    steal_location: Option<StealLocation>,
 }
 //
 impl WorkerFutexState {
     /// Initial worker futex state
     const INITIAL: WorkerFutexState = WorkerFutexState {
+        last_join_id: u16::MAX,
         steal_location: None,
         work_incoming: true,
         sleeping: false,
     };
-
-    /// Location that this thread is recommended stealing from
-    pub(crate) const fn steal_location(&self) -> Option<StealLocation> {
-        self.steal_location
-    }
 
     /// Truth that the thread pool is reachable and may receive more work
     ///
@@ -348,16 +375,23 @@ impl WorkerFutexState {
         self.work_incoming
     }
 
+    /// Location that this thread is recommended stealing from
+    pub(crate) const fn steal_location(&self) -> Option<StealLocation> {
+        self.steal_location
+    }
+
     /// Decode the raw state from the futex data
     const fn from_raw(raw: RawWorkerFutexState) -> Self {
-        let raw_location = raw & RAW_LOCATION_MASK;
-        let steal_location = StealLocation::from_raw(raw_location);
+        let last_join_id = (raw >> FUTEX_LAST_JOIN_ID_SHIFT) as JoinID;
         let work_incoming = raw & FUTEX_BIT_WORK_INCOMING != 0;
         let sleeping = raw & FUTEX_BIT_SLEEPING != 0;
+        let raw_location = raw & RAW_LOCATION_MASK;
+        let steal_location = StealLocation::from_raw(raw_location);
         let result = Self {
-            steal_location,
+            last_join_id,
             work_incoming,
             sleeping,
+            steal_location,
         };
         result.debug_check_state();
         result
@@ -367,6 +401,7 @@ impl WorkerFutexState {
     const fn to_raw(self) -> RawWorkerFutexState {
         self.debug_check_state();
         let mut raw = StealLocation::to_raw(self.steal_location);
+        raw |= (self.last_join_id as RawWorkerFutexState) << FUTEX_LAST_JOIN_ID_SHIFT;
         if self.work_incoming {
             raw |= FUTEX_BIT_WORK_INCOMING;
         }
@@ -505,12 +540,18 @@ impl Arbitrary for StealLocation {
 /// Inner futex data
 type RawWorkerFutexState = u32;
 
+/// Left shift to the start of the "last completed join" segment
+const FUTEX_LAST_JOIN_ID_SHIFT: u32 = RawWorkerFutexState::BITS / 2;
+
+/// Mask of the "last completed join" segment
+const FUTEX_LAST_JOIN_ID_MASK: RawWorkerFutexState = !(1 << FUTEX_LAST_JOIN_ID_SHIFT);
+
 /// Futex status bit signaling that the thread pool is still reachable from
 /// outside and thus more work might still be coming up
-const FUTEX_BIT_WORK_INCOMING: RawWorkerFutexState = 1 << (RawWorkerFutexState::BITS - 1);
+const FUTEX_BIT_WORK_INCOMING: RawWorkerFutexState = 1 << (FUTEX_LAST_JOIN_ID_SHIFT - 1);
 
 /// Futex status bit signaling that a thread is sleeping (or going to sleep)
-const FUTEX_BIT_SLEEPING: RawWorkerFutexState = 1 << (RawWorkerFutexState::BITS - 2);
+const FUTEX_BIT_SLEEPING: RawWorkerFutexState = 1 << (FUTEX_LAST_JOIN_ID_SHIFT - 2);
 
 /// Last futex status bit before start of location word
 const FUTEX_BIT_LAST: RawWorkerFutexState = FUTEX_BIT_SLEEPING;
