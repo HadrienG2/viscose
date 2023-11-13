@@ -256,24 +256,6 @@ impl WorkerFutex {
         self.wake_if_asleep(old_raw);
     }
 
-    /// Wake up this worker thread if it's asleep
-    ///
-    /// Use this in situations where no other futex state change fits, such as
-    /// when the remote end of a join() has been processed (we can't fit that in
-    /// the futex because we would need an unbounded number of futex bits to
-    /// encode the unbounded number of nested join() completion flags).
-    pub fn wake(&self, order: Ordering) {
-        // Cancel any impeding attempt to sleep
-        //
-        // Need Acquire ordering so this is not reordered after wake_if_asleep
-        let old_raw = self
-            .0
-            .fetch_and(!FUTEX_BIT_SLEEPING, Self::at_least_acquire(order));
-
-        // If we updated the futex of a sleeping thread, wake it up
-        self.wake_if_asleep(old_raw);
-    }
-
     // --- Thread pool interface ---
 
     /// Notify the worker that the thread pool is shutting down and won't be
@@ -542,9 +524,6 @@ type RawWorkerFutexState = u32;
 
 /// Left shift to the start of the "last completed join" segment
 const FUTEX_LAST_JOIN_ID_SHIFT: u32 = RawWorkerFutexState::BITS / 2;
-
-/// Mask of the "last completed join" segment
-const FUTEX_LAST_JOIN_ID_MASK: RawWorkerFutexState = !(1 << FUTEX_LAST_JOIN_ID_SHIFT);
 
 /// Futex status bit signaling that the thread pool is still reachable from
 /// outside and thus more work might still be coming up

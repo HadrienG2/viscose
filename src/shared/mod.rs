@@ -113,6 +113,19 @@ impl SharedState {
             update,
         )
     }
+
+    /// Enumerate workers that a thief could steal work from, at increasing
+    /// distance from said thief
+    pub fn find_steals<'self_, const CACHE_ITER_MASKS: bool>(
+        &'self_ self,
+        thief: &BitRef<'self_, CACHE_ITER_MASKS>,
+        load: Ordering,
+    ) -> Option<impl Iterator<Item = usize> + '_> {
+        let work_availability = &self.work_availability;
+        work_availability
+            .iter_set_around::<false, CACHE_ITER_MASKS>(thief, load)
+            .map(|iter| iter.map(|bit| bit.linear_idx(work_availability)))
+    }
 }
 
 /// External interface to a single worker in a thread pool

@@ -2,7 +2,7 @@
 
 pub mod scope;
 
-use self::scope::Scope;
+use self::scope::{JoinTracker, Scope};
 use crate::{
     shared::{
         flags::bitref::BitRef,
@@ -24,30 +24,29 @@ pub(crate) struct Worker<'pool> {
     /// Index of this thread in the shared state tables
     idx: usize,
 
-    /// Work queue
+    /// Work queue tracking work privately spawned by this worker
     work_queue: deque::Worker<DynJob>,
 
     /// Bit of this thread in `SharedState::work_availability`
-    work_available_bit: BitRef<'pool, true>,
-
-    /// Truth that `work_available_bit` is currently set
     ///
-    /// This ensures that in the happy path, we don't need to access any shared
-    /// variable subjected to concurrent access cache contention, besides the
-    /// state of our work queue.
-    work_available_set: Cell<bool>,
+    /// Tracks whether we think there is work available to steal in our work
+    /// queue (this information may become obsolete if the work gets stolen)
+    work_available: WorkAvailabilityBit<'pool>,
 
     /// Quick access to this thread's futex
+    ///
+    /// The futex directly or indirectly tracks all the information about the
+    /// outside world that the worker cares about, so whenever the world
+    /// changes, the futex value will change. This lets the worker fall asleep
+    /// while waiting for the world to change (new work available to steal,
+    /// `join()` finished...).
     futex: &'pool WorkerFutex,
 
-    /// Timestamp at which we entered the waiting state, assuming we're in it
-    waiting_start: Cell<Option<Instant>>,
+    /// State associated with this worker's `join()` statements
+    join_tracker: JoinTracker,
 
-    /// Number of spin-loop iterations since we last yielded to the OS
-    spin_iters_since_yield: Cell<usize>,
-
-    /// Number of spin-loop iterations between attempts to look for work
-    spin_iters_per_check: Cell<u8>,
+    /// State used when the worker thread is waiting for work
+    waiting_state: Cell<Option<WaitingState>>,
 
     /// Truth that we reached the end of observable work and expect no more work
     ///
@@ -59,18 +58,14 @@ pub(crate) struct Worker<'pool> {
 impl<'pool> Worker<'pool> {
     /// Set up and run the worker
     pub fn run(shared: &'pool SharedState, idx: usize, work_queue: deque::Worker<DynJob>) {
-        let futex = &shared.workers[idx].futex;
-        let work_available_bit = shared.work_availability.bit_with_cache(idx);
         let worker = Self {
             shared,
             idx,
             work_queue,
-            work_available_bit,
-            futex,
-            work_available_set: Cell::new(false),
-            waiting_start: Cell::new(None),
-            spin_iters_since_yield: Cell::new(0),
-            spin_iters_per_check: Cell::new(1),
+            work_available: WorkAvailabilityBit::new(shared, idx),
+            futex: &shared.workers[idx].futex,
+            join_tracker: JoinTracker::new(),
+            waiting_state: Cell::new(None),
             work_over: Cell::new(false),
         };
         worker.main();
@@ -87,7 +82,7 @@ impl<'pool> Worker<'pool> {
     #[inline(always)]
     fn step(&self) {
         // If we have recorded work in our private work queue...
-        if self.work_available_set.get() {
+        if self.work_available.is_set() {
             // Process work from our private work queue, if still there
             if let Some(task) = self.work_queue.pop() {
                 self.process_task(task);
@@ -97,9 +92,7 @@ impl<'pool> Worker<'pool> {
                 //
                 // Use Release ordering to make sure this is perceived to happen
                 // after emptying the work queue.
-                let was_set = self.work_available_bit.fetch_clear(Ordering::Release);
-                debug_assert!(was_set);
-                self.work_available_set.set(false);
+                self.work_available.clear(Ordering::Release);
             }
         }
 
@@ -126,20 +119,26 @@ impl<'pool> Worker<'pool> {
         let futex_state = self.futex.load_from_worker(Ordering::Acquire);
 
         // Try to steal work from other workers and the global injector, and
-        // update our waiting/non-waiting state accordingly.
+        // stop waiting on success.
         if self.steal_work(&futex_state) {
-            self.stop_waiting();
+            self.waiting_state.set(None);
             return;
-        } else if !self.is_waiting() {
-            self.start_waiting();
         }
 
         // At this point, we've failed to find more work. Figure out if more
         // work could still be coming up.
         if futex_state.work_incoming() {
-            // If there isn't any work to steal anywhere, but more work
-            // might still be coming up, wait for more work to come up
-            self.wait_for_work(&futex_state);
+            // If there isn't any work to steal anywhere, but more work might
+            // still be coming up, wait for more work to come up...
+            let mut waiting_state = self.waiting_state.get().unwrap_or_else(WaitingState::new);
+            waiting_state.wait(|| {
+                // ...and completely fall asleep after some grace period
+                //
+                // Make sure other threads manipulating the futex can faithfully
+                // observe our pre-sleep state.
+                self.futex
+                    .wait_for_change(futex_state, Ordering::Release, Ordering::Acquire);
+            });
         } else {
             // No work available for now and no more work expected, nothing
             // to do (this should only be a transient state when we are
@@ -273,14 +272,12 @@ impl<'pool> Worker<'pool> {
         // Are there other workers we could steal work from?
         if let Some(neighbors_with_work) = self
             .shared
-            .work_availability
-            .iter_set_around::<false, true>(&self.work_available_bit, Ordering::Acquire)
+            .find_steals(&self.work_available.bit, Ordering::Acquire)
         {
             // Try to steal from other workers at increasing distances
             //
             // Need Acquire so stealing happens after observing available work.
-            for bit in neighbors_with_work {
-                let idx = bit.linear_idx(&self.shared.work_availability);
+            for idx in neighbors_with_work {
                 if self.steal_from_worker(idx) {
                     return Some(StealLocation::Worker(idx));
                 }
@@ -308,55 +305,96 @@ impl<'pool> Worker<'pool> {
             }
         }
     }
+}
 
-    /// Start waiting for work
-    #[cold]
-    fn start_waiting(&self) {
-        self.waiting_start.set(Some(Instant::now()));
-        self.spin_iters_since_yield.set(0);
-        self.spin_iters_per_check.set(1);
+/// Flag telling the world that a worker might have work available to steal
+///
+/// Set when we the worker pushes new work into its work queue, cleared when the
+/// worker fails to pop work from its work queue. May be incorrectly set if
+/// other workers have stolen work, but will never be incorrectly unset.
+#[derive(Clone, Debug)]
+struct WorkAvailabilityBit<'pool> {
+    /// Bit of this worker in `SharedState::work_availability`
+    bit: BitRef<'pool, true>,
+
+    /// Truth that `bit` is currently set
+    ///
+    /// Caching this in a private variable ensures that in the happy path, we
+    /// don't need to access any shared variable subjected to concurrent access
+    /// cache contention, besides the state of our work queue.
+    bit_is_set: Cell<bool>,
+}
+//
+impl<'pool> WorkAvailabilityBit<'pool> {
+    /// Set up work availability notifications
+    fn new(shared: &'pool SharedState, worker_idx: usize) -> Self {
+        let bit = shared.work_availability.bit_with_cache(worker_idx);
+        let bit_is_set = Cell::new(bit.is_set(Ordering::Relaxed));
+        Self { bit, bit_is_set }
     }
 
-    /// Truth that we are presently waiting for work
-    fn is_waiting(&self) -> bool {
-        self.waiting_start.get().is_some()
+    /// Truth that our work availability bit is currently set
+    fn is_set(&self) -> bool {
+        self.bit_is_set.get()
     }
 
-    /// Stop waiting for work
-    #[cold]
-    fn stop_waiting(&self) {
-        self.waiting_start.set(None);
+    /// Set our work availability bit with the specific atomic ordering
+    fn set(&self, order: Ordering) {
+        if !self.bit_is_set.replace(true) {
+            let old = self.bit.fetch_set(order);
+            debug_assert!(!old);
+        }
     }
 
-    /// Keep waiting for more work to come up
-    #[cold]
-    fn wait_for_work(&self, futex_state: &WorkerFutexState) {
-        // Initialize or restore waiting state
-        debug_assert!(self.is_waiting());
-        let mut spin_iters_per_check = self.spin_iters_per_check.get();
-        let spin_iters_since_yield = self.spin_iters_since_yield.get();
+    /// Clear our work availability bit with the specific atomic ordering
+    fn clear(&self, order: Ordering) {
+        if self.bit_is_set.replace(false) {
+            let old = self.bit.fetch_clear(order);
+            debug_assert!(old);
+        }
+    }
+}
 
-        // Start with some busy waiting in user space...
-        if spin_iters_since_yield <= SPIN_ITERS_BEFORE_YIELD {
-            if spin_iters_per_check < MAX_SPIN_ITERS_PER_CHECK {
-                spin_iters_per_check = (2 * spin_iters_per_check).min(MAX_SPIN_ITERS_PER_CHECK);
-                self.spin_iters_per_check.set(spin_iters_per_check);
+/// State used when the worker is waiting for work
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+struct WaitingState {
+    /// Timestamp at which we entered the waiting state, assuming we're in it
+    waiting_start: Instant,
+
+    /// Number of spin-loop iterations since we last yielded to the OS
+    spin_iters_since_yield: usize,
+
+    /// Number of spin-loop iterations between attempts to look for work
+    spin_iters_per_check: u8,
+}
+//
+impl WaitingState {
+    /// Start waiting
+    fn new() -> Self {
+        Self {
+            waiting_start: Instant::now(),
+            spin_iters_since_yield: 0,
+            spin_iters_per_check: 1,
+        }
+    }
+
+    /// Do a spin loop iteration, periodically yielding to the kernel scheduler,
+    /// until the time comes to block the thread
+    fn wait(&mut self, blocking_wait: impl FnOnce()) {
+        if self.spin_iters_since_yield <= SPIN_ITERS_BEFORE_YIELD {
+            if self.spin_iters_per_check < MAX_SPIN_ITERS_PER_CHECK {
+                self.spin_iters_per_check =
+                    (2 * self.spin_iters_per_check).min(MAX_SPIN_ITERS_PER_CHECK);
             }
-            for _ in 0..spin_iters_per_check {
+            for _ in 0..self.spin_iters_per_check {
                 std::hint::spin_loop()
             }
-        } else if self.waiting_start.get().unwrap().elapsed() < OS_WAIT_DELAY {
+        } else if self.waiting_start.elapsed() < OS_WAIT_DELAY {
             // ...periodically yielding to the kernel scheduler...
             std::thread::sleep(YIELD_DURATION);
-            self.spin_iters_since_yield.set(0);
+            self.spin_iters_since_yield = 0;
         } else {
-            // ...then completely fall asleep after a while
-            //
-            // Make sure other threads manipulating the futex can faithfully
-            // observe our pre-sleep state.
-            let _new_futex_state =
-                self.futex
-                    .wait_for_change(*futex_state, Ordering::Release, Ordering::Relaxed);
+            blocking_wait()
         }
     }
 }
