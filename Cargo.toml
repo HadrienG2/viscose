@@ -6,14 +6,56 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+# Warn when the safe join() concurrency limit imposed by Linux is exceeded
+#
+# To ease support for old and low-end hardware without 64-bit atomics support,
+# the Linux kernel limits the size of the "futex" integer atomics used to block
+# and unblock tasks to 32 bits. This means the information used by a waiting
+# worker thread to determine if the state of the world is unchanged and it
+# should fall asleep must fit in that many bits.
+#
+# This futex size limit, in turn, indirectly limits the number of join()s whose
+# remote task can concurrently execute before there is a risk of lost worker
+# wakeup caused by the ABA problem. For most programs, this chance of this
+# happening is very small even in the unsafe concurrency range, but when it
+# happens it can lead to worker thread deadlock which is a serious problem.
+#
+# The join concurrency limit depends on details of the thread pool
+# implementation, but is guaranteed to be at least 2^16-1 (65535) concurrent
+# joins, which is far above the amount of concurrency needed for efficient
+# execution on common hardware. Therefore, when you reach this limit, the best
+# course of action is normally to simply use less join()s by tuning up the
+# sequential processing threshold of your program.
+#
+# To do so, however, you need to know when you're hitting the limit, and that's
+# what this feature is about. At the cost of slightly increasing the complexity
+# of the join() hot code path and adding a dependency on the log library, it
+# lets the thread pool implementation emit an error log when the limit is
+# reached, which lets you know about it and take corrective action.
+detect-excessive-joins = ["dep:log"]
+
+# Enable benchmarking code (must be enabled for benchmarks to compile)
+bench = ["dep:criterion", "dep:env_logger", "dep:iterator_ilp", "dep:pessimize", "dep:rayon"]
+
+# Enable unsafe join concurrency detection and benchmarking by default
+default = ["detect-excessive-joins", "bench"]
+
 [dependencies]
+# Core dependencies
 atomic-wait = { version = "1.1.0", default-features = false }
-criterion = { version = "0.5.1", default-features = false }
 crossbeam = { version = "0.8.2", features = ["crossbeam-deque"] }
 hwlocality = { git = "https://github.com/HadrienG2/hwlocality.git", features = ["hwloc-2_2_0"] }
-iterator_ilp = "2.0"
-pessimize = { git = "https://github.com/HadrienG2/pessimize.git" }
-rayon = { version = "1.8.0", default-features = false }
+
+# Used to optionally warn about dangerous or inefficient library usage
+log = { version = "0.4", optional = true }
+
+# Benchmark dependencies
+criterion = { version = "0.5.1", default-features = false, optional = true }
+env_logger = { version = "0.10", optional = true }
+iterator_ilp = { version = "2.0", optional = true }
+pessimize = { git = "https://github.com/HadrienG2/pessimize.git", optional = true }
+rayon = { version = "1.8.0", default-features = false, optional = true }
 
 [dev-dependencies]
 itertools = "0.11"

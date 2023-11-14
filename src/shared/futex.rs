@@ -1,13 +1,11 @@
 //! Futex used for blocking worker synchronization
 
-use crate::worker::scope::JoinID;
 #[cfg(test)]
 use proptest::{
     prelude::*,
     strategy::{Map, TupleUnion},
 };
 use std::{
-    debug_assert, debug_assert_eq, debug_assert_ne,
     fmt::{self, Debug},
     sync::atomic::{self, AtomicU32, Ordering},
 };
@@ -56,16 +54,41 @@ impl WorkerFutex {
         result
     }
 
-    /// Load without state validity checks
+    /// Notify futex that a `join()` operation has started
     ///
-    /// This operation accepts all valid atomic orderings, not just load
-    /// operation orderings, but store orderings will be less efficient.
-    fn load(&self, order: Ordering) -> WorkerFutexState {
-        if [Ordering::Relaxed, Ordering::Acquire, Ordering::SeqCst].contains(&order) {
-            WorkerFutexState::from_raw(self.0.load(order))
-        } else {
-            WorkerFutexState::from_raw(self.0.fetch_add(0, order))
-        }
+    /// This is only needed when attempting to detect situations where there are
+    /// too many `join()`s in flight to guarantee ABA-safety.
+    #[cfg(feature = "detect-excessive-joins")]
+    #[inline]
+    pub fn start_join(&self, order: Ordering) {
+        let _ = self.0.fetch_update(order, Ordering::Relaxed, |old_raw| {
+            let old = WorkerFutexState::from_raw(old_raw);
+            debug_assert!(!old.sleeping);
+            if old.last_join_id == JoinID::MAX {
+                // To clarify, the problem here is that once we let JoinID wrap
+                // above its maximum value, the same futex value can appear
+                // every JoinID::MAX + 1 joins. This means the worker thread
+                // cannot differentiate between "no join happened since we last
+                // looked up the futex" and "JoinID::MAX + 1 joins happened
+                // since we last looked up the futex". This can lead the worker
+                // thread to wrongly fall asleep while waiting for joins that
+                // actually happened, and if there are no more pending remote
+                // joins to wake it up at this point then you have a worker
+                // thread deadlock on your hands...
+                crate::unlikely(|| {
+                    log::error!("\
+                        A worker thread has more join()s in flight than the ABA-safe limit of {} concurrent joins. \
+                        This worker thread has a small chance of deadlocking under bad scheduling circumstances. \
+                        Consider tightening your program's sequential processing threshold, as it is highly \
+                        unlikely that having this many concurrent tasks benefits your performance...\
+                    ", JoinID::MAX);
+                });
+            }
+            Some(WorkerFutexState {
+                last_join_id: old.last_join_id.wrapping_add(1),
+                ..old
+            }.to_raw())
+        });
     }
 
     /// Clear steal location after it becomes outdated, fail if the steal
@@ -229,27 +252,26 @@ impl WorkerFutex {
         }
     }
 
-    /// Tell this worker thread that a certain join() has completed
-    pub fn notify_join(&self, join_id: JoinID, order: Ordering) {
-        // Inject our new join ID and cancel impeding attempts to sleep
+    /// Tell this worker thread that the remote end of a `join()` has completed
+    #[inline]
+    pub fn notify_join(&self, order: Ordering) {
+        // Switch to a new join ID and cancel impeding attempts to sleep
         //
         // Need Acquire ordering so this is not reordered after wake_if_asleep
+        let order = Self::at_least_acquire(order);
         let old_raw = self
             .0
-            .fetch_update(
-                Self::at_least_acquire(order),
-                Ordering::Relaxed,
-                |old_raw| {
-                    let old = WorkerFutexState::from_raw(old_raw);
-                    debug_assert_ne!(old.last_join_id, join_id);
-                    let new = WorkerFutexState {
-                        last_join_id: join_id,
+            .fetch_update(order, Ordering::Relaxed, |old_raw| {
+                let old = WorkerFutexState::from_raw(old_raw);
+                Some(
+                    WorkerFutexState {
+                        last_join_id: old.last_join_id.wrapping_sub(1),
                         sleeping: false,
                         ..old
-                    };
-                    Some(new.to_raw())
-                },
-            )
+                    }
+                    .to_raw(),
+                )
+            })
             .expect("not allowed to fail");
 
         // If we updated the futex of a sleeping thread, wake it up
@@ -279,6 +301,19 @@ impl WorkerFutex {
 
     // --- Internal utilities ---
 
+    /// Load without state validity checks
+    ///
+    /// This operation accepts all valid atomic orderings, not just load
+    /// operation orderings, but store orderings will be less efficient.
+    #[inline]
+    fn load(&self, order: Ordering) -> WorkerFutexState {
+        if [Ordering::Relaxed, Ordering::Acquire, Ordering::SeqCst].contains(&order) {
+            WorkerFutexState::from_raw(self.0.load(order))
+        } else {
+            WorkerFutexState::from_raw(self.0.fetch_add(0, order))
+        }
+    }
+
     /// If we updated the futex of a sleeping thread, wake it up
     ///
     /// This should be done after performing a RMW operation with Acquire or
@@ -286,13 +321,17 @@ impl WorkerFutex {
     /// futex state.
     fn wake_if_asleep(&self, old_raw: RawWorkerFutexState) {
         if old_raw & FUTEX_BIT_SLEEPING != 0 {
-            debug_assert_eq!(old_raw & RAW_LOCATION_MASK, RAW_LOCATION_NONE);
-            debug_assert_ne!(old_raw & FUTEX_BIT_WORK_INCOMING, 0);
+            if cfg!(debug_assertions) {
+                let old = WorkerFutexState::from_raw(old_raw);
+                assert!(old.steal_location().is_none());
+                assert!(old.work_incoming());
+            }
             atomic_wait::wake_all(&self.0)
         }
     }
 
     /// Add an Acquire barrier to a user-specified ordering
+    #[inline]
     fn at_least_acquire(order: Ordering) -> Ordering {
         match order {
             Ordering::Relaxed | Ordering::Acquire => Ordering::Acquire,
@@ -328,9 +367,6 @@ impl Debug for WorkerFutex {
 /// Current worker futex state
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct WorkerFutexState {
-    /// Identifier of the last completed `join()` on this futex
-    last_join_id: JoinID,
-
     /// Truth that the thread pool is reachable and may receive more work
     work_incoming: bool,
 
@@ -339,15 +375,30 @@ pub(crate) struct WorkerFutexState {
 
     /// Location from which this worker is recommended to steal
     steal_location: Option<StealLocation>,
+
+    /// Identifier of the last completed `join()` on this futex
+    ///
+    /// When the `detect-excessive-joins` feature is enabled, this tracks the
+    /// number of ongoing joins whose remote task has not completed yet: it's
+    /// incremented when a join() begins, and it's decremented when the remote
+    /// task of a join() ends.
+    ///
+    /// When that feature is not enabled, this is just a free-running counter
+    /// that changes every time the remote task of a join completes.
+    ///
+    /// In both cases, the counter can wrap around, but in the former case it's
+    /// considered to be an error whereas in the latter case it's a normal fact
+    /// of life that does not warrant any particular notification.
+    last_join_id: JoinID,
 }
 //
 impl WorkerFutexState {
     /// Initial worker futex state
     const INITIAL: WorkerFutexState = WorkerFutexState {
-        last_join_id: u16::MAX,
         steal_location: None,
         work_incoming: true,
         sleeping: false,
+        last_join_id: 0,
     };
 
     /// Truth that the thread pool is reachable and may receive more work
@@ -364,16 +415,17 @@ impl WorkerFutexState {
 
     /// Decode the raw state from the futex data
     const fn from_raw(raw: RawWorkerFutexState) -> Self {
-        let last_join_id = (raw >> FUTEX_LAST_JOIN_ID_SHIFT) as JoinID;
         let work_incoming = raw & FUTEX_BIT_WORK_INCOMING != 0;
         let sleeping = raw & FUTEX_BIT_SLEEPING != 0;
-        let raw_location = raw & RAW_LOCATION_MASK;
+        let raw_location = (raw & FUTEX_LOCATION_MASK) >> FUTEX_LOCATION_SHIFT;
         let steal_location = StealLocation::from_raw(raw_location);
+        let raw_last_join_id = (raw & FUTEX_JOIN_ID_MASK) >> FUTEX_JOIN_ID_SHIFT;
+        let last_join_id = raw_last_join_id as JoinID;
         let result = Self {
-            last_join_id,
             work_incoming,
             sleeping,
             steal_location,
+            last_join_id,
         };
         result.debug_check_state();
         result
@@ -382,8 +434,8 @@ impl WorkerFutexState {
     /// Convert back to raw futex data
     const fn to_raw(self) -> RawWorkerFutexState {
         self.debug_check_state();
-        let mut raw = StealLocation::to_raw(self.steal_location);
-        raw |= (self.last_join_id as RawWorkerFutexState) << FUTEX_LAST_JOIN_ID_SHIFT;
+        let mut raw = StealLocation::to_raw(self.steal_location) << FUTEX_LOCATION_SHIFT;
+        raw |= (self.last_join_id as RawWorkerFutexState) << FUTEX_JOIN_ID_SHIFT;
         if self.work_incoming {
             raw |= FUTEX_BIT_WORK_INCOMING;
         }
@@ -395,6 +447,8 @@ impl WorkerFutexState {
 
     /// Check that current futex state makes sense in debug builds
     const fn debug_check_state(&self) {
+        debug_assert!(self.last_join_id.ilog2() < FUTEX_JOIN_ID_BITS);
+        debug_assert!(StealLocation::to_raw(self.steal_location).ilog2() < FUTEX_LOCATION_BITS);
         if self.sleeping {
             debug_assert!(self.steal_location.is_none());
             debug_assert!(self.work_incoming);
@@ -412,15 +466,15 @@ impl Arbitrary for WorkerFutexState {
                 Map<
                     (
                         <Option<StealLocation> as Arbitrary>::Strategy,
-                        <bool as Arbitrary>::Strategy,
+                        <(bool, JoinID) as Arbitrary>::Strategy,
                     ),
-                    fn((Option<StealLocation>, bool)) -> Self,
+                    fn((Option<StealLocation>, (bool, JoinID))) -> Self,
                 >,
             >,
         ),
         (
             u32,
-            Arc<Map<<bool as Arbitrary>::Strategy, fn(bool) -> Self>>,
+            Arc<Map<<(bool, JoinID) as Arbitrary>::Strategy, fn((bool, JoinID)) -> Self>>,
         ),
     )>;
 
@@ -428,18 +482,21 @@ impl Arbitrary for WorkerFutexState {
         prop_oneof![
             // Non-waiting state may have arbitrary recommended stealing
             // location, no more work incoming
-            4 => (<Option<StealLocation> as Arbitrary>::arbitrary_with(args), any::<bool>())
-                .prop_map(|(steal_location, work_incoming)| Self {
-                    steal_location,
+            4 => (<Option<StealLocation> as Arbitrary>::arbitrary_with(args), any::<(bool, JoinID)>())
+                .prop_map(|(steal_location, (work_incoming, last_join_id))| Self {
+
                     work_incoming,
                     sleeping: false,
+                    steal_location,
+                    last_join_id,
                 }),
             // Worker may only sleep when there is no recommended stealing
             // location and work might still be incoming
-            1 => any::<bool>().prop_map(|sleeping| Self {
-                steal_location: None,
+            1 => any::<(bool, JoinID)>().prop_map(|(sleeping, last_join_id)| Self {
                 work_incoming: true,
                 sleeping,
+                steal_location: None,
+                last_join_id,
             })
         ]
     }
@@ -520,35 +577,74 @@ impl Arbitrary for StealLocation {
 }
 
 /// Inner futex data
+///
+/// This is actually a bitfield that is organized as follows:
+///
+/// ```
+/// WSLLLLLLLLLLLLLLJJJJJJJJJJJJJJJJ
+/// |||             |
+/// |||             Join identifier (if detect-excessive-joins feature is
+/// |||             enabled, tracks how many joins have a remote task that's
+/// |||             still running, otherwise simple free-running counter that's
+/// |||             changed every time the remote task of a join completes).
+/// |||
+/// ||Recommended steal location (MAX = No recommended location,
+/// ||                            MAX-1 = Global injector,
+/// ||                            other = Index of worker thread to steal from)
+/// ||
+/// |"Sleeping" bit (set by the worker when it falls asleep waiting for work. A
+/// |                non-worker thread that modifies the futex to submit work to
+/// |                the worker should clear this bit and wake up the worker if
+/// |                the bit was formerly set)
+/// |
+/// "Work incoming" bit (thread pool is live, more work might still come)
+/// ```
 type RawWorkerFutexState = u32;
-
-/// Left shift to the start of the "last completed join" segment
-const FUTEX_LAST_JOIN_ID_SHIFT: u32 = RawWorkerFutexState::BITS / 2;
 
 /// Futex status bit signaling that the thread pool is still reachable from
 /// outside and thus more work might still be coming up
-const FUTEX_BIT_WORK_INCOMING: RawWorkerFutexState = 1 << (FUTEX_LAST_JOIN_ID_SHIFT - 1);
+const FUTEX_BIT_WORK_INCOMING: RawWorkerFutexState = 1 << (RawWorkerFutexState::BITS - 1);
 
 /// Futex status bit signaling that a thread is sleeping (or going to sleep)
-const FUTEX_BIT_SLEEPING: RawWorkerFutexState = 1 << (FUTEX_LAST_JOIN_ID_SHIFT - 2);
+const FUTEX_BIT_SLEEPING: RawWorkerFutexState = 1 << (RawWorkerFutexState::BITS - 2);
 
-/// Last futex status bit before start of location word
+/// Last futex status bit before start of steal location data
 const FUTEX_BIT_LAST: RawWorkerFutexState = FUTEX_BIT_SLEEPING;
+
+/// Number of steal location bits
+const FUTEX_LOCATION_BITS: u32 = FUTEX_BIT_LAST.trailing_zeros() - FUTEX_JOIN_ID_BITS;
+
+/// Start of the location word
+const FUTEX_LOCATION_SHIFT: u32 = FUTEX_JOIN_ID_BITS;
+
+/// Number of low-order join identifier bits
+const FUTEX_JOIN_ID_BITS: u32 = JoinID::BITS;
+
+/// Start of the join identifier word
+const FUTEX_JOIN_ID_SHIFT: u32 = 0;
+
+/// Mask of the location word
+const FUTEX_LOCATION_MASK: RawWorkerFutexState =
+    ((1 << FUTEX_LOCATION_BITS) - 1) << FUTEX_LOCATION_SHIFT;
+
+/// Mask of the join identifier
+const FUTEX_JOIN_ID_MASK: RawWorkerFutexState =
+    ((1 << FUTEX_JOIN_ID_BITS) - 1) << FUTEX_JOIN_ID_SHIFT;
 
 /// Futex-internal encoding of [`StealLocation`]
 type RawStealLocation = RawWorkerFutexState;
 //
-/// Mask that extracts the location word from the futex state
-const RAW_LOCATION_MASK: RawWorkerFutexState = FUTEX_BIT_LAST - 1;
-//
 /// No recommended location at the moment
-const RAW_LOCATION_NONE: RawStealLocation = FUTEX_BIT_LAST - 1;
+const RAW_LOCATION_NONE: RawStealLocation = (1 << FUTEX_LOCATION_BITS) - 1;
 //
 /// Steal from the global injector
-const RAW_LOCATION_INJECTOR: RawStealLocation = FUTEX_BIT_LAST - 2;
+const RAW_LOCATION_INJECTOR: RawStealLocation = RAW_LOCATION_NONE - 1;
 //
 /// Number of normal locations
 const RAW_LOCATION_NUM_NORMAL: RawStealLocation = RAW_LOCATION_INJECTOR;
+
+/// Join identifier
+type JoinID = u16;
 
 #[cfg(test)]
 mod tests {

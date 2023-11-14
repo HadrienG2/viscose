@@ -7,7 +7,7 @@ use hwlocality::{cpu::binding::CpuBindingFlags, object::types::ObjectType, Topol
 use iterator_ilp::IteratorILP;
 use std::{
     collections::BTreeSet,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Once, OnceLock},
 };
 
 /// Re-export atomic flags for benchmarking
@@ -22,6 +22,7 @@ pub fn for_each_locality(
         Box<dyn FnMut() -> FlatPool>,
     ),
 ) {
+    setup_logger_once();
     let topology = topology();
     let mut seen_affinities = BTreeSet::new();
     for ty in [
@@ -412,6 +413,14 @@ pub fn norm_sqr_flat<const BLOCK_SIZE: usize, const REDUCE_ILP_STREAMS: usize>(
 fn topology() -> &'static Arc<Topology> {
     static INSTANCE: OnceLock<Arc<Topology>> = OnceLock::new();
     INSTANCE.get_or_init(|| Arc::new(Topology::new().unwrap()))
+}
+
+/// Ensure logging to stderr is set up during benchmarking
+fn setup_logger_once() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        env_logger::init();
+    })
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 
 pub mod scope;
 
-use self::scope::{JoinTracker, Scope};
+use self::scope::Scope;
 use crate::{
     shared::{
         flags::bitref::BitRef,
@@ -42,9 +42,6 @@ pub(crate) struct Worker<'pool> {
     /// `join()` finished...).
     futex: &'pool WorkerFutex,
 
-    /// State associated with this worker's `join()` statements
-    join_tracker: JoinTracker,
-
     /// State used when the worker thread is waiting for work
     waiting_state: Cell<Option<WaitingState>>,
 
@@ -64,7 +61,6 @@ impl<'pool> Worker<'pool> {
             work_queue,
             work_available: WorkAvailabilityBit::new(shared, idx),
             futex: &shared.workers[idx].futex,
-            join_tracker: JoinTracker::new(),
             waiting_state: Cell::new(None),
             work_over: Cell::new(false),
         };
