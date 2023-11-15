@@ -129,6 +129,8 @@ impl<'scope> Scope<'scope> {
         self.0.work_available.set(Ordering::Relaxed);
 
         // ...and personally notify the closest starving thread about it
+        // This doesn't need to be ordered after the setting of work_available
+        // because workers following a recommendation don't read work_available.
         self.0.shared.recommend_steal::<false, true>(
             &self.0.work_available.bit,
             StealLocation::Worker(self.0.idx),
@@ -164,13 +166,13 @@ unsafe impl Notify for NotifyJoin<'_> {
         // Announce join completion
         //
         // This may replace a previous join notifications that wasn't observed
-        // by the worker, but that's okay: since we're using AcqRel ordering, a
-        // worker that sees our futex update with Acquire ordering transitively
-        // sees all futex updates performed by previous joins.
+        // by the worker, but that's okay: a worker that sees our futex update
+        // with Acquire ordering still transitively sees all futex updates
+        // performed by previous joins.
         //
-        // This must also be Release because otherwise one could get the
-        // notification before remote_finished is true, which would lead to an
-        // incorrectly failed join() check and thus lost wakeup.
-        self.futex.notify_join(Ordering::AcqRel);
+        // This must be Release because otherwise one could get the notification
+        // before remote_finished is true, which would lead to an incorrectly
+        // failed join() check and thus lost wakeup.
+        self.futex.notify_join(Ordering::Release);
     }
 }

@@ -172,7 +172,7 @@ impl<'pool> Worker<'pool> {
             //
             // Can use Relaxed because we are talking to ourselves and not using
             // the updated futex state, if we observe it again it will be with
-            // proper Acquire ordering.
+            // proper Acquire ordering on the next load().
             let _new_futex_state =
                 self.futex
                     .suggest_steal(location, self.idx, Ordering::Relaxed, Ordering::Relaxed);
@@ -184,7 +184,7 @@ impl<'pool> Worker<'pool> {
         //
         // Can use Relaxed because we are talking to ourselves and not using
         // the updated futex state, if we observe it again it will be with
-        // proper Acquire ordering.
+        // proper Acquire ordering on the next load().
         if recommended_location.is_some() {
             let _new_futex_state = self.futex.clear_outdated_location(
                 *futex_state,
