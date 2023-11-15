@@ -46,10 +46,10 @@ impl<'scope> Scope<'scope> {
         //
         // The join start notification, if any, must be Acquire so it's not
         // reordered after the beginning (or the end!) of the join. Although it
-        // should not be reordered before the completion of the previous join,
-        // there is no need to add a Release barrier for this because the
-        // Acquire barrier at the end of the previous join will already ensure
-        // this desired ordering constraint.
+        // should not be reordered before the completion of the previous join to
+        // avoid spurious join counter overflow, there is no need to add a
+        // Release barrier for this because the Acquire barrier at the end of
+        // the previous join will already enforce the desired ordering.
         let futex = &self.0.futex;
         #[cfg(feature = "detect-excessive-joins")]
         self.0.futex.start_join(Ordering::Acquire);
@@ -124,8 +124,8 @@ impl<'scope> Scope<'scope> {
         // be Relaxed stores after a Release barrier.
         atomic::fence(Ordering::Release);
 
-        // ...tell the world that we now have work available to steal if they
-        // didn't know about it before...
+        // ...tell the entire world that we now have work available to steal if
+        // they didn't know about it before...
         self.0.work_available.set(Ordering::Relaxed);
 
         // ...and personally notify the closest starving thread about it
@@ -166,9 +166,10 @@ unsafe impl Notify for NotifyJoin<'_> {
         // Announce join completion
         //
         // This may replace a previous join notifications that wasn't observed
-        // by the worker, but that's okay: a worker that sees our futex update
-        // with Acquire ordering still transitively sees all futex updates
-        // performed by previous joins.
+        // by the worker, but that's okay: due to atomic variable coherence, a
+        // worker that sees our futex update with Acquire ordering still
+        // transitively sees the machine effects associated with all futex
+        // updates performed by previous joins.
         //
         // This must be Release because otherwise one could get the notification
         // before remote_finished is true, which would lead to an incorrectly

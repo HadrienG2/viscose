@@ -62,7 +62,7 @@ impl WorkerFutex {
     #[inline]
     pub fn start_join(&self, order: Ordering) {
         // Failure ordering can be `Relaxed` because the operation does not read
-        // any other state and will eventually succeed.
+        // any other application state and will eventually succeed.
         let _ = self.0.fetch_update(order, Ordering::Relaxed, |old_raw| {
             let old = WorkerFutexState::from_raw(old_raw);
             debug_assert!(!old.sleeping);

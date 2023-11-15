@@ -72,8 +72,8 @@ impl SharedState {
     ) {
         // Check if there are job-less neighbors to submit work to...
         //
-        // Need Acquire ordering so the futex is read after the status flag, no
-        // status flag caching/speculation allowed.
+        // Need Acquire ordering so the futex is read after the work
+        // availability flag, no work availability caching/speculation allowed.
         let Some(mut asleep_neighbors) = self
             .work_availability
             .iter_unset_around::<INCLUDE_CENTER, CACHE_ITER_MASKS>(local_worker, Ordering::Acquire)
