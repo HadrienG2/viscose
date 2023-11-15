@@ -61,6 +61,8 @@ impl WorkerFutex {
     #[cfg(feature = "detect-excessive-joins")]
     #[inline]
     pub fn start_join(&self, order: Ordering) {
+        // Failure ordering can be `Relaxed` because the operation does not read
+        // any other state and will eventually succeed.
         let _ = self.0.fetch_update(order, Ordering::Relaxed, |old_raw| {
             let old = WorkerFutexState::from_raw(old_raw);
             debug_assert!(!old.sleeping);
@@ -180,7 +182,7 @@ impl WorkerFutex {
             current = self.load(Ordering::AcqRel);
         }
 
-        // Apply user-requested readout ordering if stronger than Acquire
+        // Apply user-requested wakeup ordering if stronger than Acquire
         if ![Ordering::Relaxed, Ordering::Acquire].contains(&wake) {
             atomic::fence(wake);
         }
@@ -257,7 +259,9 @@ impl WorkerFutex {
     pub fn notify_join(&self, order: Ordering) {
         // Switch to a new join ID and cancel impeding attempts to sleep
         //
-        // Need Acquire ordering so this is not reordered after wake_if_asleep
+        // Need Acquire ordering so this is not reordered after wake_if_asleep.
+        // Failed load ordering can be Relaxed as we're not reading any other
+        // state and the operation will eventually succeed.
         let order = Self::at_least_acquire(order);
         let old_raw = self
             .0

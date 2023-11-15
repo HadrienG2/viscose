@@ -45,7 +45,11 @@ impl<'scope> Scope<'scope> {
         // Set up remote job and its completion notification mechanism
         //
         // The join start notification, if any, must be Acquire so it's not
-        // reordered after the beginning (or the end!) of the join.
+        // reordered after the beginning (or the end!) of the join. Although it
+        // should not be reordered before the completion of the previous join,
+        // there is no need to add a Release barrier for this because the
+        // Acquire barrier at the end of the previous join will already ensure
+        // this desired ordering constraint.
         let futex = &self.0.futex;
         #[cfg(feature = "detect-excessive-joins")]
         self.0.futex.start_join(Ordering::Acquire);
@@ -114,6 +118,10 @@ impl<'scope> Scope<'scope> {
         self.0.work_queue.push(job);
 
         // ...and once this push is visible...
+        //
+        // It doesn't matter which of the stores below completes first, as long
+        // as they execute after the work becomes visibly available, so they can
+        // be Relaxed stores after a Release barrier.
         atomic::fence(Ordering::Release);
 
         // ...tell the world that we now have work available to steal if they

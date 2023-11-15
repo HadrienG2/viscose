@@ -71,6 +71,9 @@ impl SharedState {
         update: Ordering,
     ) {
         // Check if there are job-less neighbors to submit work to...
+        //
+        // Need Acquire ordering so the futex is read after the status flag, no
+        // status flag caching/speculation allowed.
         let Some(mut asleep_neighbors) = self
             .work_availability
             .iter_unset_around::<INCLUDE_CENTER, CACHE_ITER_MASKS>(local_worker, Ordering::Acquire)
@@ -79,8 +82,6 @@ impl SharedState {
         };
 
         // ...and if so, tell the closest one about our newly submitted job
-        //
-        // Need Acquire ordering so the futex is read after the status flag
         #[cold]
         fn unlikely<'self_, const CACHE_ITER_MASKS: bool>(
             self_: &'self_ SharedState,
@@ -93,6 +94,11 @@ impl SharedState {
             let local_worker = local_worker.linear_idx(&self_.work_availability);
             for closest_asleep in asleep_neighbors {
                 // Update their futex recommendation as appropriate
+                //
+                // Can use Relaxed ordering on failure because failing to
+                // suggest work to a worker has no observable consequences and
+                // isn't used to inform any decision other than looking up the
+                // state of the next worker. Worker states are independent.
                 let closest_asleep = closest_asleep.linear_idx(&self_.work_availability);
                 let accepted = self_.workers[closest_asleep].futex.suggest_steal(
                     task_location,

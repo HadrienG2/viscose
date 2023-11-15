@@ -68,6 +68,8 @@ impl AtomicFlags {
     /// Set all the flags
     #[cold]
     pub fn set_all(&self, order: Ordering) {
+        // It doesn't matter in which order stores observably complete, so they
+        // can all share the same memory barrier.
         if order != Ordering::Relaxed {
             atomic::fence(order);
         }
@@ -79,6 +81,8 @@ impl AtomicFlags {
     /// Clear all the flags
     #[cold]
     pub fn clear_all(&self, order: Ordering) {
+        // It doesn't matter in which order stores observably complete, so they
+        // can all share the same memory barrier.
         if order != Ordering::Relaxed {
             atomic::fence(order);
         }
