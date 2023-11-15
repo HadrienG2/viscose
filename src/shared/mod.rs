@@ -1,12 +1,14 @@
-pub mod flags;
-/// Thread pool shared state
+//! State shared between the thread pool and all of its workers
+
+pub(crate) mod flags;
 pub(crate) mod futex;
+pub(crate) mod job;
 
 use self::{
     flags::{bitref::BitRef, AtomicFlags},
     futex::{StealLocation, WorkerFutex},
+    job::DynJob,
 };
-use crate::job::DynJob;
 use crossbeam::{
     deque::{self, Injector, Stealer},
     utils::CachePadded,
@@ -69,6 +71,9 @@ impl SharedState {
         update: Ordering,
     ) {
         // Check if there are job-less neighbors to submit work to...
+        //
+        // Need Acquire ordering so the futex is read after the work
+        // availability flag, no work availability caching/speculation allowed.
         let Some(mut asleep_neighbors) = self
             .work_availability
             .iter_unset_around::<INCLUDE_CENTER, CACHE_ITER_MASKS>(local_worker, Ordering::Acquire)
@@ -86,11 +91,14 @@ impl SharedState {
             update: Ordering,
         ) {
             // Iterate over increasingly remote job-less neighbors
-            //
-            // Need Acquire ordering so the futex is read after the status flag
             let local_worker = local_worker.linear_idx(&self_.work_availability);
             for closest_asleep in asleep_neighbors {
                 // Update their futex recommendation as appropriate
+                //
+                // Can use Relaxed ordering on failure because failing to
+                // suggest work to a worker has no observable consequences and
+                // isn't used to inform any decision other than looking up the
+                // state of the next worker. Worker states are independent.
                 let closest_asleep = closest_asleep.linear_idx(&self_.work_availability);
                 let accepted = self_.workers[closest_asleep].futex.suggest_steal(
                     task_location,
@@ -110,6 +118,19 @@ impl SharedState {
             task_location,
             update,
         )
+    }
+
+    /// Enumerate workers that a thief could steal work from, at increasing
+    /// distance from said thief
+    pub fn find_steals<'self_, const CACHE_ITER_MASKS: bool>(
+        &'self_ self,
+        thief: &BitRef<'self_, CACHE_ITER_MASKS>,
+        load: Ordering,
+    ) -> Option<impl Iterator<Item = usize> + '_> {
+        let work_availability = &self.work_availability;
+        work_availability
+            .iter_set_around::<false, CACHE_ITER_MASKS>(thief, load)
+            .map(|iter| iter.map(|bit| bit.linear_idx(work_availability)))
     }
 }
 

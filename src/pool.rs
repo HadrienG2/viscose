@@ -1,8 +1,11 @@
 //! Thread pool-wide interfaces
 
 use crate::{
-    job::{AbortOnUnwind, DynJob, Job, Notify},
-    shared::{futex::StealLocation, SharedState},
+    shared::{
+        futex::StealLocation,
+        job::{AbortOnUnwind, DynJob, Job, Notify},
+        SharedState,
+    },
     worker::Worker,
     Work,
 };

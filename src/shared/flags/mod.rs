@@ -1,8 +1,9 @@
 //! Set of flags that can be atomically set, checked or unset
 
-pub mod bitref;
+pub(crate) mod bitref;
 mod iter;
 
+use self::bitref::BitRef;
 #[cfg(test)]
 use proptest::prelude::*;
 use std::{
@@ -13,8 +14,6 @@ use std::{
     sync::atomic::{self, AtomicUsize, Ordering},
     write,
 };
-
-use self::bitref::BitRef;
 
 /// Word::BITS but it's a Word
 const WORD_BITS: usize = Word::BITS as usize;
@@ -69,6 +68,8 @@ impl AtomicFlags {
     /// Set all the flags
     #[cold]
     pub fn set_all(&self, order: Ordering) {
+        // It doesn't matter in which order stores observably complete, so they
+        // can all share the same memory barrier.
         if order != Ordering::Relaxed {
             atomic::fence(order);
         }
@@ -80,6 +81,8 @@ impl AtomicFlags {
     /// Clear all the flags
     #[cold]
     pub fn clear_all(&self, order: Ordering) {
+        // It doesn't matter in which order stores observably complete, so they
+        // can all share the same memory barrier.
         if order != Ordering::Relaxed {
             atomic::fence(order);
         }

@@ -1,13 +1,14 @@
 #![warn(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
+#[cfg(feature = "bench")]
 pub mod bench;
-mod job;
-pub mod pool;
-pub mod shared;
+mod pool;
+mod shared;
 mod worker;
 
-use crate::worker::Scope;
 use std::time::Duration;
+
+pub use crate::{pool::FlatPool, worker::scope::Scope};
 
 /// Minimal busy-waiting time between declaring sleepiness and falling asleep
 ///

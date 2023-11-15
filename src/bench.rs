@@ -1,16 +1,19 @@
 //! Benchmarking utilities
 
-use crate::{pool::FlatPool, worker::Scope};
+use crate::{pool::FlatPool, worker::scope::Scope};
 use criterion::{Bencher, Criterion};
 use crossbeam::utils::CachePadded;
 use hwlocality::{cpu::binding::CpuBindingFlags, object::types::ObjectType, Topology};
 use iterator_ilp::IteratorILP;
 use std::{
     collections::BTreeSet,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Once, OnceLock},
 };
 
-/// Run a benchmark for all interesting named CPU localities
+/// Re-export atomic flags for benchmarking
+pub use crate::shared::flags::{bitref::BitRef, AtomicFlags};
+
+/// Run a benchmark for all interesting  localities
 pub fn for_each_locality(
     mut bench: impl FnMut(
         &str,
@@ -19,6 +22,7 @@ pub fn for_each_locality(
         Box<dyn FnMut() -> FlatPool>,
     ),
 ) {
+    setup_logger_once();
     let topology = topology();
     let mut seen_affinities = BTreeSet::new();
     for ty in [
@@ -43,12 +47,13 @@ pub fn for_each_locality(
                 locality_name.push_str("/fullSMT");
             }
 
-            // Check if this is the same as the last affinity we processed
+            // Check if we have already processed an equivalent locality
             if !seen_affinities.insert(affinity.clone()) {
                 continue;
             }
 
-            // Help rayon at CPU affinity ;)
+            // Enforce CPU affinity constraint for every thread including
+            // rayon-spawned threads and the benchmark's main thread
             topology
                 .bind_cpu(
                     &affinity,
@@ -56,7 +61,7 @@ pub fn for_each_locality(
                 )
                 .unwrap();
 
-            // Build thread pools
+            // Prepare to build thread pools
             let affinity2 = affinity.clone();
             let make_flat_pool = move || FlatPool::with_affinity(topology.clone(), &affinity2);
             let make_rayon_pool = move || {
@@ -81,8 +86,8 @@ pub fn for_each_locality(
 /// Recursive parallel fibonacci based on rayon
 ///
 /// This is obviously not how you would efficiently compute the nth term of the
-/// Fibonacci sequence (see tests::fibonacci_ref), but it's an excellent
-/// microbenchmark for the overhead of join().
+/// Fibonacci sequence (see `tests::fibonacci_ref()` for that), but it's an
+/// excellent microbenchmark for the overhead of `join()`.
 #[inline]
 pub fn fibonacci_rayon(n: u64) -> u64 {
     if n > 1 {
@@ -261,6 +266,9 @@ fn max_data_size_pow2() -> u32 {
 }
 
 /// Square each number inside of a LocalFloatsSlice
+///
+/// This is our simplest memory-bound microbenchmark with a load-to-store memory
+/// access pattern and zero dependency chains between loop iterations.
 #[inline]
 pub fn square_rayon<const BLOCK_SIZE: usize>(slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>) {
     slice.process(
@@ -297,6 +305,10 @@ pub fn square_flat<const BLOCK_SIZE: usize>(
 }
 
 /// Sum the numbers inside of a LocalFloatSlice
+///
+/// This memory-bound microbenchmark does not perform stores, but it features
+/// dependencies between loop iterations and is thus more strongly affected by
+/// increasing memory access latencies.
 #[inline]
 pub fn sum_rayon<const BLOCK_SIZE: usize, const ILP_STREAMS: usize>(
     slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
@@ -338,18 +350,21 @@ pub fn sum_flat<const BLOCK_SIZE: usize, const ILP_STREAMS: usize>(
 /// This computation is not written for optimal efficiency (a single-pass
 /// algorithm would be more efficient), but to highlight the importance of NUMA
 /// and cache locality in multi-threaded work. It purposely writes down the
-/// squares of vector elements and then reads them back to assess how the
-/// performance of such memory-bound code is affected by allocation locality.
+/// squares of vector elements, then reads them back, to expose how the
+/// performance of such store-to-load memory access patterns is affected by task
+/// CPU migrations or lack thereof.
+///
+/// While artificial in this particular case, this store-to-load memory access
+/// pattern is commonly seen in real-world numpy-style unoptimized array
+/// computations, where the result of each computation step is written down to a
+/// temporary array and later re-read by a later computation step.
 #[inline]
 pub fn norm_sqr_rayon<const BLOCK_SIZE: usize, const REDUCE_ILP_STREAMS: usize>(
     slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
 ) -> f32 {
     slice.process(
         |[mut left, mut right]| {
-            rayon::join(
-                || square_rayon::<BLOCK_SIZE>(&mut left),
-                || square_rayon::<BLOCK_SIZE>(&mut right),
-            );
+            rayon::join(|| square_rayon(&mut left), || square_rayon(&mut right));
             let (left, right) = rayon::join(
                 || sum_rayon::<BLOCK_SIZE, REDUCE_ILP_STREAMS>(&mut left),
                 || sum_rayon::<BLOCK_SIZE, REDUCE_ILP_STREAMS>(&mut right),
@@ -398,6 +413,14 @@ pub fn norm_sqr_flat<const BLOCK_SIZE: usize, const REDUCE_ILP_STREAMS: usize>(
 fn topology() -> &'static Arc<Topology> {
     static INSTANCE: OnceLock<Arc<Topology>> = OnceLock::new();
     INSTANCE.get_or_init(|| Arc::new(Topology::new().unwrap()))
+}
+
+/// Ensure logging to stderr is set up during benchmarking
+fn setup_logger_once() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        env_logger::init();
+    })
 }
 
 #[cfg(test)]
