@@ -43,6 +43,9 @@ impl<'scope> Scope<'scope> {
         RemoteRes: Send,
     {
         // Set up remote job and its completion notification mechanism
+        //
+        // The join start notification, if any, must be Acquire so it's not
+        // reordered after the beginning (or the end!) of the join.
         let futex = &self.0.futex;
         #[cfg(feature = "detect-excessive-joins")]
         self.0.futex.start_join(Ordering::Acquire);
@@ -156,6 +159,10 @@ unsafe impl Notify for NotifyJoin<'_> {
         // by the worker, but that's okay: since we're using AcqRel ordering, a
         // worker that sees our futex update with Acquire ordering transitively
         // sees all futex updates performed by previous joins.
+        //
+        // This must also be Release because otherwise one could get the
+        // notification before remote_finished is true, which would lead to an
+        // incorrectly failed join() check and thus lost wakeup.
         self.futex.notify_join(Ordering::AcqRel);
     }
 }

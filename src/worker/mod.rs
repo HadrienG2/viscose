@@ -87,7 +87,7 @@ impl<'pool> Worker<'pool> {
                 // Otherwise notify others that our work queue is now empty
                 //
                 // Use Release ordering to make sure this is perceived to happen
-                // after emptying the work queue.
+                // after we actually empty the work queue.
                 self.work_available.clear(Ordering::Release);
             }
         }
@@ -130,8 +130,9 @@ impl<'pool> Worker<'pool> {
             waiting_state.wait(|| {
                 // ...and completely fall asleep after some grace period
                 //
-                // Make sure other threads manipulating the futex can faithfully
-                // observe our pre-sleep state.
+                // Make sure that other threads manipulating the futex can
+                // faithfully observe our pre-sleep state, and that we end up
+                // seeing the world like they did at the end.
                 self.futex
                     .wait_for_change(futex_state, Ordering::Release, Ordering::Acquire);
             });
@@ -169,7 +170,9 @@ impl<'pool> Worker<'pool> {
             // there again next time, unless a better recommendation has
             // concurrently come up from another thread.
             //
-            // Can use Relaxed because we are talking to ourselves.
+            // Can use Relaxed because we are talking to ourselves and not using
+            // the updated futex state, if we observe it again it will be with
+            // proper Acquire ordering.
             let _new_futex_state =
                 self.futex
                     .suggest_steal(location, self.idx, Ordering::Relaxed, Ordering::Relaxed);
@@ -179,7 +182,9 @@ impl<'pool> Worker<'pool> {
         // No work available anywhere at the moment, just clear our
         // recommended stealing location and enter the waiting state.
         //
-        // Can use Relaxed because we are talking to ourselves.
+        // Can use Relaxed because we are talking to ourselves and not using
+        // the updated futex state, if we observe it again it will be with
+        // proper Acquire ordering.
         if recommended_location.is_some() {
             let _new_futex_state = self.futex.clear_outdated_location(
                 *futex_state,
@@ -266,13 +271,13 @@ impl<'pool> Worker<'pool> {
     /// of `self.futex`, so that `self.futex` can be updated if appropriate.
     fn steal_from_anyone(&self) -> Option<StealLocation> {
         // Are there other workers we could steal work from?
+        //
+        // Need Acquire so stealing happens after observing the available work.
         if let Some(neighbors_with_work) = self
             .shared
             .find_steals(&self.work_available.bit, Ordering::Acquire)
         {
             // Try to steal from other workers at increasing distances
-            //
-            // Need Acquire so stealing happens after observing available work.
             for idx in neighbors_with_work {
                 if self.steal_from_worker(idx) {
                     return Some(StealLocation::Worker(idx));

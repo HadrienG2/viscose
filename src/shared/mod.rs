@@ -79,6 +79,8 @@ impl SharedState {
         };
 
         // ...and if so, tell the closest one about our newly submitted job
+        //
+        // Need Acquire ordering so the futex is read after the status flag
         #[cold]
         fn unlikely<'self_, const CACHE_ITER_MASKS: bool>(
             self_: &'self_ SharedState,
@@ -88,8 +90,6 @@ impl SharedState {
             update: Ordering,
         ) {
             // Iterate over increasingly remote job-less neighbors
-            //
-            // Need Acquire ordering so the futex is read after the status flag
             let local_worker = local_worker.linear_idx(&self_.work_availability);
             for closest_asleep in asleep_neighbors {
                 // Update their futex recommendation as appropriate
