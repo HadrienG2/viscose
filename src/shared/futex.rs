@@ -451,8 +451,9 @@ impl WorkerFutexState {
 
     /// Check that current futex state makes sense in debug builds
     const fn debug_check_state(&self) {
-        debug_assert!(self.last_join_id.ilog2() < FUTEX_JOIN_ID_BITS);
-        debug_assert!(StealLocation::to_raw(self.steal_location).ilog2() < FUTEX_LOCATION_BITS);
+        debug_assert!(self.last_join_id == 0 || self.last_join_id.ilog2() < FUTEX_JOIN_ID_BITS);
+        let raw_steal_location = StealLocation::to_raw(self.steal_location);
+        debug_assert!(raw_steal_location == 0 || raw_steal_location.ilog2() < FUTEX_LOCATION_BITS);
         if self.sleeping {
             debug_assert!(self.steal_location.is_none());
             debug_assert!(self.work_incoming);
@@ -484,8 +485,8 @@ impl Arbitrary for WorkerFutexState {
 
     fn arbitrary_with(args: Self::Parameters) -> Self::Strategy {
         prop_oneof![
-            // Non-waiting state may have arbitrary recommended stealing
-            // location, no more work incoming
+            // Non-sleeping state may have arbitrary recommended stealing
+            // location and no more work incoming
             4 => (<Option<StealLocation> as Arbitrary>::arbitrary_with(args), any::<(bool, JoinID)>())
                 .prop_map(|(steal_location, (work_incoming, last_join_id))| Self {
 
@@ -584,7 +585,7 @@ impl Arbitrary for StealLocation {
 ///
 /// This is actually a bitfield that is organized as follows:
 ///
-/// ```
+/// ```text
 /// WSLLLLLLLLLLLLLLJJJJJJJJJJJJJJJJ
 /// |||             |
 /// |||             Join identifier (if detect-excessive-joins feature is
@@ -664,6 +665,11 @@ mod tests {
         prop::sample::select(&[Ordering::Relaxed, Ordering::Acquire, Ordering::SeqCst][..])
     }
 
+    /// Atomic ordering suitable for read-modify-write operations
+    fn rmw_order() -> impl Strategy<Value = Ordering> {
+        any::<Ordering>()
+    }
+
     proptest! {
         #[test]
         fn new(load_order in rmw_order()) {
@@ -689,20 +695,41 @@ mod tests {
         state_strategy.prop_map(WorkerFutex::with_state)
     }
 
-    /// Atomic ordering suitable for read-modify-write operations
-    fn rmw_order() -> impl Strategy<Value = Ordering> {
-        any::<Ordering>()
+    /// Futex state from a worker that's not sleeping
+    fn awake_state() -> impl Strategy<Value = WorkerFutexState> {
+        any::<(Option<StealLocation>, bool, JoinID)>().prop_map(
+            |(steal_location, work_incoming, last_join_id)| WorkerFutexState {
+                work_incoming,
+                sleeping: false,
+                steal_location,
+                last_join_id,
+            },
+        )
+    }
+
+    proptest! {
+        #[cfg(feature = "detecte-excessive-joins")]
+        #[test]
+        fn start_join(state in awake_state(), order in rmw_order()) {
+            let futex = WorkerFutex::with_state(state);
+            futex.start_join(order);
+            assert_eq!(futex.load(Ordering::Relaxed), WorkerFutexState {
+                last_join_id: state.last_join_id.wrapping_add(1),
+                ..state
+            });
+        }
     }
 
     /// Futex state where steal_location is always set
     fn state_with_location() -> impl Strategy<Value = WorkerFutexState> {
-        any::<(StealLocation, bool)>().prop_map(|(steal_location, work_incoming)| {
-            WorkerFutexState {
-                steal_location: Some(steal_location),
+        any::<(StealLocation, bool, JoinID)>().prop_map(
+            |(steal_location, work_incoming, last_join_id)| WorkerFutexState {
                 work_incoming,
                 sleeping: false,
-            }
-        })
+                steal_location: Some(steal_location),
+                last_join_id,
+            },
+        )
     }
 
     /// Check that clear_outdated_location does clear the steal_location,
@@ -756,37 +783,15 @@ mod tests {
         }
     }
 
-    /// Only valid futex state from which a thread can go to sleep
-    const WAITING_STATE: WorkerFutexState = WorkerFutexState {
-        steal_location: None,
-        work_incoming: true,
-        sleeping: false,
-    };
-
-    /// Futex state where work_incoming is false
-    fn done_state() -> impl Strategy<Value = WorkerFutexState> {
-        any::<Option<StealLocation>>().prop_map(|steal_location| WorkerFutexState {
-            steal_location,
-            work_incoming: false,
+    /// State from which a thread can go to sleep
+    fn waiting_state() -> impl Strategy<Value = WorkerFutexState> {
+        any::<JoinID>().prop_map(|last_join_id| WorkerFutexState {
+            work_incoming: true,
             sleeping: false,
+            steal_location: None,
+            last_join_id,
         })
     }
-
-    /// Arbitrary non-sleeping state
-    fn wakeup_state() -> impl Strategy<Value = WorkerFutexState> {
-        prop_oneof![
-            2 => state_with_location(),
-            1 => done_state(),
-            1 => Just(WAITING_STATE),
-        ]
-    }
-
-    /// Only currently allowed sleeping futex state
-    const SLEEPING_STATE: WorkerFutexState = WorkerFutexState {
-        steal_location: None,
-        work_incoming: true,
-        sleeping: true,
-    };
 
     /// Reasonable delay to wait for threads to go to sleep
     const WAIT_FOR_SLEEP: Duration = Duration::from_millis(100);
@@ -797,16 +802,17 @@ mod tests {
         })]
         #[test]
         fn wait_for_change(
-            final_state in wakeup_state(),
+            waiting_state in waiting_state(),
+            final_state in awake_state(),
             sleep in rmw_order(),
             wake in load_order(),
         ) {
-            let futex = WorkerFutex::with_state(WAITING_STATE);
+            let futex = WorkerFutex::with_state(waiting_state);
             let done_waiting = AtomicBool::new(false);
             let barrier = Barrier::new(2);
             std::thread::scope(|scope| {
                 scope.spawn(|| {
-                    let new_state = futex.wait_for_change(WAITING_STATE, sleep, wake);
+                    let new_state = futex.wait_for_change(waiting_state, sleep, wake);
                     done_waiting.store(true, Ordering::Release);
                     barrier.wait();
                     assert_eq!(new_state, final_state);
@@ -815,7 +821,10 @@ mod tests {
 
                 std::thread::sleep(WAIT_FOR_SLEEP);
                 assert!(!done_waiting.load(Ordering::Relaxed));
-                assert_eq!(futex.load(Ordering::Relaxed), SLEEPING_STATE);
+                assert_eq!(futex.load(Ordering::Relaxed), WorkerFutexState {
+                    sleeping: true,
+                    ..waiting_state
+                });
 
                 futex.0.store(final_state.to_raw(), Ordering::Release);
                 atomic_wait::wake_all(&futex.0);
@@ -943,16 +952,17 @@ mod tests {
         }
 
         #[test]
-        fn wake(
+        fn notify_join(
             futex: WorkerFutex,
             order in rmw_order(),
         ) {
             test_waking_op(
                 futex,
-                |futex| futex.wake(order),
+                |futex| futex.notify_join(order),
                 (),
                 |initial| WorkerFutexState {
                     sleeping: false,
+                    last_join_id: initial.last_join_id.wrapping_sub(1),
                     ..initial
                 }
             )?;
@@ -962,16 +972,18 @@ mod tests {
     /// Futex state where work_incoming is always true
     fn live_pool_state() -> impl Strategy<Value = WorkerFutexState> {
         prop_oneof![
-            4 => any::<Option<StealLocation>>()
-                .prop_map(|steal_location| WorkerFutexState {
-                    steal_location,
+            4 => any::<(Option<StealLocation>, JoinID)>()
+                .prop_map(|(steal_location, last_join_id)| WorkerFutexState {
                     work_incoming: true,
                     sleeping: false,
+                    steal_location,
+                    last_join_id
                 }),
-            1 => any::<bool>().prop_map(|sleeping| WorkerFutexState {
-                steal_location: None,
+            1 => any::<(bool, JoinID)>().prop_map(|(sleeping, last_join_id)| WorkerFutexState {
                 work_incoming: true,
                 sleeping,
+                steal_location: None,
+                last_join_id,
             })
         ]
     }
