@@ -2,6 +2,7 @@
 
 pub(crate) mod flags;
 pub(crate) mod futex;
+pub(crate) mod hierarchical;
 pub(crate) mod job;
 
 use self::{

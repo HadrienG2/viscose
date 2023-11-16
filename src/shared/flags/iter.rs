@@ -372,7 +372,7 @@ impl<'flags> InitialState<'flags> {
         // If that's the only word in the flags and the bit value we're looking
         // for doesn't appear in it, we can skip iteration entirely
         if flags.words.len() == 1 {
-            let mask = start.iter_mask::<FIND_SET, INCLUDE_START>(flags);
+            let mask = start.search_mask::<FIND_SET, INCLUDE_START>(flags);
             let word_empty = if FIND_SET {
                 word & mask == Word::MIN
             } else {
@@ -403,27 +403,6 @@ impl<'flags> InitialState<'flags> {
         // SAFETY: word_idx does the bounds checking
         let word = unsafe { flags.words.get_unchecked(word_idx).load(order) };
         (SharedState { flags, order }, word_idx, bit_shift, word)
-    }
-}
-
-/// Mask to be used when evaluating whether single-word flags are empty
-pub(crate) fn init_mask<
-    'flags,
-    const FIND_SET: bool,
-    const INCLUDE_START: bool,
-    const CACHE_ITER_MASKS: bool,
->(
-    flags: &'flags AtomicFlags,
-    start: &BitRef<'flags, CACHE_ITER_MASKS>,
-) -> Word {
-    let word_idx = start.word_idx(flags);
-    let significant = Word::from(flags.significant_bits(word_idx));
-    let bit = start.bit_mask();
-    match [FIND_SET, INCLUDE_START] {
-        [false, false] => !significant | bit,
-        [false, true] => !significant,
-        [true, false] => significant & !bit,
-        [true, true] => significant,
     }
 }
 
