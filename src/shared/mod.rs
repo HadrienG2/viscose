@@ -54,6 +54,10 @@ impl SharedState {
         // implementation supports that
         let cpuset = topology.cpuset() & affinity;
         let num_workers = cpuset.weight().unwrap();
+        assert_ne!(
+            num_workers, 0,
+            "a thread pool without threads can't make progress and will deadlock on first request"
+        );
         assert!(
             num_workers < WorkerFutex::MAX_WORKERS,
             "unsupported number of worker threads"

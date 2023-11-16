@@ -12,10 +12,12 @@ use super::{
 };
 use crate::shared::{flags::bitref::FormerWordState, futex::WorkerFutex};
 use crossbeam::{deque::Injector, utils::CachePadded};
-use hwlocality::{cpu::cpuset::CpuSet, topology::editor::RestrictFlags, Topology};
+use hwlocality::{
+    cpu::cpuset::CpuSet, object::TopologyObject, topology::editor::RestrictFlags, Topology,
+};
 use std::{
     borrow::Borrow,
-    debug_assert_eq,
+    debug_assert, debug_assert_eq,
     sync::{
         atomic::{self, Ordering},
         Arc,
@@ -60,39 +62,78 @@ impl HierarchicalState {
             restricted
         };
         let num_workers = topology.cpuset().weight().unwrap();
+        assert_ne!(
+            num_workers, 0,
+            "a thread pool without threads can't make progress and will deadlock on first request"
+        );
         assert!(
             num_workers < WorkerFutex::MAX_WORKERS,
-            "unsupported number of worker threads"
+            "number of worker threads is above implementation limits"
         );
 
         // Traverse the topology tree to construct the state iteratively
         let mut worker_configs = Vec::with_capacity(num_workers);
         let mut worker_interfaces = Vec::with_capacity(num_workers);
         let mut work_availability_tree = Vec::new();
+        //
+        let mut workers = CpuSet::new();
+        let mut objects_vec_morgue = Vec::<Vec<&TopologyObject>>::new(); // Recycling
+                                                                         //
+        /// Children of a certain parent node that we need to process
+        struct Children<'topology> {
+            /// Parent node, if any
+            parent_idx: Option<usize>,
+
+            /// Hwloc objects below this parent
+            ///
+            /// May be workers (cpuset == 1), nodes (normal_children.count() >
+            /// 1), or uninteresting nodes to be traversed (cpuset != 1 &&
+            /// normal_children.count() == 1).
+            objects: Vec<&'topology TopologyObject>,
+        }
+        //
         // Double buffer of node with associated parent pointer in
         // work_availability_tree, for current depth + next depth
-        let mut curr_nodes = vec![(None, topology.root_object())];
-        let mut next_nodes = Vec::new();
-        while !curr_nodes.is_empty() {
-            for (parent_idx, node) in curr_nodes.drain(..) {
-                todo!("probe cpuset, short-circuit to worker creation on cpusets of weight 1, 0 shouldn't happen");
-                match node.normal_children().count() {
-                    0 => unreachable!("filtered out by cpuset above"),
-                    1 => unimplemented!("forward children to next_nodes"),
-                    // TODO: Handle corner case with a mixture of leaf and
-                    //       non-leaf children, which requires creating an
-                    //       artificial node for the leaf children
-                    // TODO: Figure out if children ptr should be set via
-                    //       lookahead or a posteriori when moving to next depth
-                    other => unimplemented!(
-                        "create a node, forward children to next_nodes with new node as parent_idx"
-                    ),
+        let mut curr_children = vec![Children {
+            parent_idx: None,
+            objects: vec![topology.root_object()],
+        }];
+        let mut next_children = Vec::new();
+        while !curr_children.is_empty() {
+            for mut children_set in curr_children.drain(..) {
+                // Prepare to track worker children and node children
+                //
+                // Do not add worker children to the parent right away, buffer
+                // worker children privately until we know if this node has both
+                // node and worker children, or only worker children. OTOH we
+                // can add node children right away.
+                workers.clear();
+                let mut nodes = objects_vec_morgue.pop().unwrap_or_default();
+                for object in children_set.objects.drain(..) {
+                    // TODO: Assert cpuset.weight != 0
+                    // Discriminate worker child (cpuset.weight == 1), node
+                    // child (normal_children().count() > 1) and uninteresting
+                    // topology detail to be skipped until we find a node
+                    // (normal_children.count() == 1). For the latter, replace
+                    // object with its only child until we find a node child.
+                    todo!();
                 }
+                objects_vec_morgue.push(children_set.objects);
+
+                // TODO: If there is >=1 node child, update parent to point to
+                //       first node child and create tree nodes for all node
+                //       children.
+                // TODO: If node has both worker and node children, create an
+                //       artificial node child to group all the worker children,
+                //       then push all the worker children.
+                // TODO: If node has only worker children, directly attach
+                //       workers to the parent. Create workers as in SharedState
+                //       constructor.
+                // TODO: Recycle resources for reuse on next loop iteration
+                // TODO: Put debug_assert!()s everywhere to check for correct tree
+                //       building as rigorously as I can
             }
-            // TODO: If children ptr is to be set via post-processing, then this
-            //       might be the right time to finalize it since we finally
-            //       know the index of the first child in work_availability_tree
-            std::mem::swap(&mut curr_nodes, &mut next_nodes);
+            std::mem::swap(&mut curr_children, &mut next_children);
         }
         debug_assert_eq!(worker_configs.len(), num_workers);
         debug_assert_eq!(worker_interfaces.len(), num_workers);
@@ -106,37 +147,7 @@ impl HierarchicalState {
         (result, worker_configs.into())
     }
 
-    // TODO: with_work_queues constructor that kinda does what SharedState
-    //       version did but builds the work_availability_tree by probing hwloc,
-    //       with the rules outlined above. Make SharedState::with_work_queues
-    //       take an hwloc &Topology as a parameter for consistency.
-    // TODO: injector() accessor + add one to SharedState too, then use it
-    //       everywhere and hide SharedState::injector member.
-    // TODO: worker(worker_idx) accessor + add one to SharedState too, then use
-    //       it everywhere and hide SharedState::workers member.
-    // TODO: work_availability(worker_idx) accessor that offloads to
-    //       WorkAvailabilityPath::new() + add one to SharedState that offloads
-    //       to AtomicFlags::bit_with_cache.
-    // TODO: Provide replacement for usage shared.work_availability.bit() in
-    //       ThreadPool, idea would be to lazily construct uncached BitRefs as
-    //       needed as we move up the hierarchy.
-    // TODO: recommend_steal and find_steal with an API that looks just like the
-    //       SharedState version except it takes a WorkAvailabilityPath instead
-    //       of a BitRef.
-    // TODO: If I didn't miss anything, at this point I should be able to...
-    //       - Hide SharedState::work_availability
-    //       - Turn the current SharedState into a flat::FlatState
-    //       - Create a SharedState trait that abstracts commonalities between
-    //         FlatState and HierarchicalState
-    //       - Rename FlatPool to ThreadPool, make that + Worker + anything else
-    //         that needs it generic over the implementation of SharedState
-    //       - Add a ThreadPoolBuilder that makes it easy to build either a flat
-    //         or hierarchical thread pool.
-    //       - Modify benchmark infrastructure to test over both flat and
-    //         hierarchical thread pools
-    //       - Run the updated benchmarks, profile them to understand results,
-    //         fine-tune inlining and other affected performance stuff.
-    //       - Report back findings to rayon issue
+    // TODO: Finish constructor, then rest
 }
 
 /// Node of `HierarchicalState::work_availability_tree`
