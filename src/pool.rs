@@ -4,7 +4,7 @@ use crate::{
     shared::{
         futex::StealLocation,
         job::{AbortOnUnwind, DynJob, Job, Notify},
-        SharedState,
+        SharedState, WorkerConfig,
     },
     worker::Worker,
     Work,
@@ -52,27 +52,26 @@ impl FlatPool {
     ///
     /// Only CPU cores that belong to this CpuSet will be used.
     pub fn with_affinity(topology: Arc<Topology>, affinity: impl Borrow<CpuSet>) -> Self {
-        // Determine which CPUs we can use
-        let cpuset = topology.cpuset() & affinity;
-
         // Set up the shared state and work queues
-        let (shared, work_queues) = SharedState::with_work_queues(cpuset.weight().unwrap());
+        let (shared, worker_configs) = SharedState::with_worker_config(&topology, affinity);
 
         // Start worker threads
-        let workers = cpuset
-            .iter_set()
-            .zip(work_queues.into_vec())
-            .enumerate()
-            .map(|(worker_idx, (cpu, work_queue))| {
-                let topology = topology.clone();
-                let shared = shared.clone();
+        let mut cpu_to_worker = HashMap::with_capacity(worker_configs.len());
+        let mut workers = Vec::with_capacity(worker_configs.len());
+        for (worker_idx, worker_config) in worker_configs.into_vec().into_iter().enumerate() {
+            let topology = topology.clone();
+            let shared = shared.clone();
+            workers.push(
                 std::thread::Builder::new()
-                    .name(format!("FlatPool worker #{worker_idx} (CPU {cpu})"))
+                    .name(format!(
+                        "FlatPool worker #{worker_idx} (CPU {})",
+                        worker_config.cpu
+                    ))
                     .spawn(move || {
                         // Pin the worker thread to its assigned CPU
                         topology
                             .bind_cpu(
-                                &CpuSet::from(cpu),
+                                &CpuSet::from(worker_config.cpu),
                                 CpuBindingFlags::THREAD | CpuBindingFlags::STRICT,
                             )
                             .unwrap();
@@ -81,18 +80,12 @@ impl FlatPool {
                         std::mem::drop(topology);
 
                         // Start processing work
-                        Worker::run(&shared, worker_idx, work_queue);
+                        Worker::run(&shared, worker_idx, worker_config.work_queue);
                     })
-                    .unwrap()
-            })
-            .collect();
-
-        // Record the mapping from OS CPU to worker thread index
-        let cpu_to_worker = cpuset
-            .iter_set()
-            .enumerate()
-            .map(|(idx, cpu)| (cpu, idx))
-            .collect();
+                    .expect("failed to spawn worker thread"),
+            );
+            cpu_to_worker.insert(worker_config.cpu, worker_idx);
+        }
 
         // Put it all together
         Self {

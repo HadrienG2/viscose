@@ -5,19 +5,25 @@
 //! to priorize giving or stealing work from the threads which are closest in
 //! the topology and share the most resources with them.
 
-use std::sync::atomic::{self, Ordering};
-
-use crate::shared::flags::bitref::FormerWordState;
-
 use super::{
     flags::{bitref::BitRef, AtomicFlags},
     job::DynJob,
-    WorkerInterface,
+    WorkerConfig, WorkerInterface,
 };
+use crate::shared::{flags::bitref::FormerWordState, futex::WorkerFutex};
 use crossbeam::{deque::Injector, utils::CachePadded};
+use hwlocality::{cpu::cpuset::CpuSet, topology::editor::RestrictFlags, Topology};
+use std::{
+    borrow::Borrow,
+    debug_assert_eq,
+    sync::{
+        atomic::{self, Ordering},
+        Arc,
+    },
+};
 
 /// State shared between all thread pool users and workers, with hierarchical
-/// work availability tracking
+/// work availability tracking.
 //
 // --- Implementation notes ---
 //
@@ -35,13 +41,71 @@ pub(crate) struct HierarchicalState {
 }
 //
 impl HierarchicalState {
-    // TODO: Make SharedState::with_work_queues receive an affinity cpuset and
-    //       topology as input and provide the worker index to CPU mapping as
-    //       output (in the form of an array of logical CPU indices), because
-    //       with HierarchicalState this mapping will become much less obvious
-    //       and shouldn't be managed by the thread pool. Could merge that with
-    //       the existing mechanism for returning work queues and call it
-    //       WorkerConfig or something.
+    /// Set up the shared and worker-local state
+    // FIXME: Figure out a way to modularize this
+    pub fn with_worker_config(
+        topology: &Topology,
+        affinity: impl Borrow<CpuSet>,
+    ) -> (Arc<Self>, Box<[WorkerConfig]>) {
+        // Restrict topology to desired affinity mask, and check if the residual
+        // cpuset fits within implementation limits.
+        let affinity = affinity.borrow();
+        let topology = {
+            let mut restricted = topology.clone();
+            restricted.edit(|editor| {
+                editor
+                    .restrict(affinity, RestrictFlags::REMOVE_EMPTIED)
+                    .expect("failed to restrict topology to affinity mask")
+            });
+            restricted
+        };
+        let num_workers = topology.cpuset().weight().unwrap();
+        assert!(
+            num_workers < WorkerFutex::MAX_WORKERS,
+            "unsupported number of worker threads"
+        );
+
+        // Traverse the topology tree to construct the state iteratively
+        let mut worker_configs = Vec::with_capacity(num_workers);
+        let mut worker_interfaces = Vec::with_capacity(num_workers);
+        let mut work_availability_tree = Vec::new();
+        // Double buffer of node with associated parent pointer in
+        // work_availability_tree, for current depth + next depth
+        let mut curr_nodes = vec![(None, topology.root_object())];
+        let mut next_nodes = Vec::new();
+        while !curr_nodes.is_empty() {
+            for (parent_idx, node) in curr_nodes.drain(..) {
+                todo!("probe cpuset, short-circuit to worker creation on cpusets of weight 1, 0 shouldn't happen");
+                match node.normal_children().count() {
+                    0 => unreachable!("filtered out by cpuset above"),
+                    1 => unimplemented!("forward children to next_nodes"),
+                    // TODO: Handle corner case with a mixture of leaf and
+                    //       non-leaf children, which requires creating an
+                    //       artificial node for the leaf children
+                    // TODO: Figure out if children ptr should be set via
+                    //       lookahead or a posteriori when moving to next depth
+                    other => unimplemented!(
+                        "create a node, forward children to next_nodes with new node as parent_idx"
+                    ),
+                }
+            }
+            // TODO: If children ptr is to be set via post-processing, then this
+            //       might be the right time to finalize it since we finally
+            //       know the index of the first child.
+            std::mem::swap(&mut curr_nodes, &mut next_nodes);
+        }
+        debug_assert_eq!(worker_configs.len(), num_workers);
+        debug_assert_eq!(worker_interfaces.len(), num_workers);
+
+        // Set up the global shared state
+        let result = Arc::new(Self {
+            injector: Injector::new(),
+            workers: worker_interfaces.into(),
+            work_availability_tree: work_availability_tree.into(),
+        });
+        (result, worker_configs.into())
+    }
+
     // TODO: with_work_queues constructor that kinda does what SharedState
     //       version did but builds the work_availability_tree by probing hwloc,
     //       with the rules outlined above. Make SharedState::with_work_queues

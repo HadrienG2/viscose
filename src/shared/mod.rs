@@ -14,10 +14,14 @@ use crossbeam::{
     deque::{self, Injector, Stealer},
     utils::CachePadded,
 };
-use std::sync::{atomic::Ordering, Arc};
+use hwlocality::{bitmap::BitmapIndex, cpu::cpuset::CpuSet, Topology};
+use std::{
+    borrow::Borrow,
+    sync::{atomic::Ordering, Arc},
+};
 
-/// State that is shared between users of the thread pool and all thread pool
-/// workers
+/// State shared between all thread pool users and workers, with
+/// non-hierarchical work availability tracking.
 #[derive(Debug, Default)]
 pub(crate) struct SharedState {
     /// Global work injector
@@ -41,26 +45,36 @@ pub(crate) struct SharedState {
 }
 //
 impl SharedState {
-    /// Set up the shared state
-    pub fn with_work_queues(num_workers: usize) -> (Arc<Self>, Box<[deque::Worker<DynJob>]>) {
+    /// Set up the shared and worker-local state
+    pub fn with_worker_config(
+        topology: &Topology,
+        affinity: impl Borrow<CpuSet>,
+    ) -> (Arc<Self>, Box<[WorkerConfig]>) {
+        // Determine which CPUs we can actually use, and cross-check that the
+        // implementation supports that
+        let cpuset = topology.cpuset() & affinity;
+        let num_workers = cpuset.weight().unwrap();
         assert!(
             num_workers < WorkerFutex::MAX_WORKERS,
             "unsupported number of worker threads"
         );
-        let injector = Injector::new();
-        let mut work_queues = Vec::with_capacity(num_workers);
-        let mut workers = Vec::with_capacity(num_workers);
-        for _ in 0..num_workers {
-            let (worker, work_queue) = WorkerInterface::with_work_queue();
-            workers.push(CachePadded::new(worker));
-            work_queues.push(work_queue);
+
+        // Set up worker-local state
+        let mut worker_configs = Vec::with_capacity(num_workers);
+        let mut worker_interfaces = Vec::with_capacity(num_workers);
+        for cpu in cpuset {
+            let (interface, work_queue) = WorkerInterface::with_work_queue();
+            worker_interfaces.push(CachePadded::new(interface));
+            worker_configs.push(WorkerConfig { work_queue, cpu });
         }
+
+        // Set up global shared state
         let result = Arc::new(Self {
-            injector,
-            workers: workers.into(),
+            injector: Injector::new(),
+            workers: worker_interfaces.into(),
             work_availability: AtomicFlags::new(num_workers),
         });
-        (result, work_queues.into())
+        (result, worker_configs.into())
     }
 
     /// Recommend that the work-less thread closest to a certain originating
@@ -133,6 +147,15 @@ impl SharedState {
             .iter_set_around::<false, CACHE_ITER_MASKS>(thief, load)
             .map(|iter| iter.map(|bit| bit.linear_idx(work_availability)))
     }
+}
+
+/// State needed to configure a new worker
+pub(crate) struct WorkerConfig {
+    /// Work queue
+    pub work_queue: deque::Worker<DynJob>,
+
+    /// CPU which this worker should be pinned to
+    pub cpu: BitmapIndex,
 }
 
 /// External interface to a single worker in a thread pool
