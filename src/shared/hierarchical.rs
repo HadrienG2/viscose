@@ -18,9 +18,11 @@ use crossbeam::{deque::Injector, utils::CachePadded};
 
 /// State shared between all thread pool users and workers, with hierarchical
 /// work availability tracking
-///
-/// All inner arrays are sorted in breadth-first order, first by source hwloc
-/// object depth and then by hwloc object cousin rank.
+//
+// --- Implementation notes ---
+//
+// All inner arrays are sorted in breadth-first order, first by source hwloc
+// object depth and then within each depth by hwloc object cousin rank.
 pub(crate) struct HierarchicalState {
     /// Global injector
     injector: Injector<DynJob>,
@@ -33,10 +35,17 @@ pub(crate) struct HierarchicalState {
 }
 //
 impl HierarchicalState {
+    // TODO: Make SharedState::with_work_queues receive an affinity cpuset and
+    //       topology as input and provide the worker index to CPU mapping as
+    //       output (in the form of an array of logical CPU indices), because
+    //       with HierarchicalState this mapping will become much less obvious
+    //       and shouldn't be managed by the thread pool. Could merge that with
+    //       the existing mechanism for returning work queues and call it
+    //       WorkerConfig or something.
     // TODO: with_work_queues constructor that kinda does what SharedState
-    //       version did + builds the work_availability_tree by probing hwloc.
-    //       Make SharedState::with_work_queues take an hwloc &Topology as a
-    //       parameter for consistency.
+    //       version did but builds the work_availability_tree by probing hwloc,
+    //       with the rules outlined above. Make SharedState::with_work_queues
+    //       take an hwloc &Topology as a parameter for consistency.
     // TODO: injector() accessor + add one to SharedState too, then use it
     //       everywhere and hide SharedState::injector member.
     // TODO: worker(worker_idx) accessor + add one to SharedState too, then use
