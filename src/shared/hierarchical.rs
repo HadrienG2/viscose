@@ -72,13 +72,17 @@ impl HierarchicalState {
         );
 
         // Traverse the topology tree to construct the state iteratively
+        //
+        // This will eventually become the tree state
         let mut worker_configs = Vec::with_capacity(num_workers);
         let mut worker_interfaces = Vec::with_capacity(num_workers);
         let mut work_availability_tree = Vec::new();
         //
-        let mut workers = CpuSet::new();
-        let mut objects_vec_morgue = Vec::<Vec<&TopologyObject>>::new(); // Recycling
-                                                                         //
+        // Used to track worker children of the active parent
+        let mut worker_children = CpuSet::new();
+        // Used for recycling used Vecs instead of reallocating
+        let mut objects_vec_morgue = Vec::<Vec<&TopologyObject>>::new();
+        //
         /// Children of a certain parent node that we need to process
         struct Children<'topology> {
             /// Parent node, if any
@@ -86,9 +90,9 @@ impl HierarchicalState {
 
             /// Hwloc objects below this parent
             ///
-            /// May be workers (cpuset == 1), nodes (normal_children.count() >
-            /// 1), or uninteresting nodes to be traversed (cpuset != 1 &&
-            /// normal_children.count() == 1).
+            /// May be workers (cpuset == 1), locality-significant nodes
+            /// (normal_children.count() > 1), or uninteresting nodes to be
+            /// traversed (cpuset != 1 && normal_children.count() == 1).
             objects: Vec<&'topology TopologyObject>,
         }
         //
@@ -101,14 +105,13 @@ impl HierarchicalState {
         let mut next_children = Vec::new();
         while !curr_children.is_empty() {
             for mut children_set in curr_children.drain(..) {
-                // Prepare to track worker children and node children
+                // Prepare to track worker children
                 //
                 // Do not add worker children to the parent right away, buffer
                 // worker children privately until we know if this node has both
                 // node and worker children, or only worker children. OTOH we
-                // can add node children right away.
-                workers.clear();
-                let mut nodes = objects_vec_morgue.pop().unwrap_or_default();
+                // can add node children to the tree right away.
+                worker_children.clear();
                 for object in children_set.objects.drain(..) {
                     // TODO: Assert cpuset.weight != 0
                     // Discriminate worker child (cpuset.weight == 1), node
