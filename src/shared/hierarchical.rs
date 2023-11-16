@@ -91,7 +91,7 @@ impl HierarchicalState {
             }
             // TODO: If children ptr is to be set via post-processing, then this
             //       might be the right time to finalize it since we finally
-            //       know the index of the first child.
+            //       know the index of the first child in work_availability_tree
             std::mem::swap(&mut curr_nodes, &mut next_nodes);
         }
         debug_assert_eq!(worker_configs.len(), num_workers);
