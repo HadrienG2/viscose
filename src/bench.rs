@@ -3,12 +3,9 @@
 use crate::{pool::FlatPool, worker::scope::Scope};
 use criterion::{Bencher, Criterion};
 use crossbeam::utils::CachePadded;
-use hwlocality::{cpu::binding::CpuBindingFlags, object::types::ObjectType, Topology};
+use hwlocality::{cpu::binding::CpuBindingFlags, object::types::ObjectType};
 use iterator_ilp::IteratorILP;
-use std::{
-    collections::BTreeSet,
-    sync::{Arc, Once, OnceLock},
-};
+use std::{collections::BTreeSet, sync::OnceLock};
 
 /// Re-export atomic flags for benchmarking
 pub use crate::shared::flags::{bitref::BitRef, AtomicFlags};
@@ -22,8 +19,8 @@ pub fn for_each_locality(
         Box<dyn FnMut() -> FlatPool>,
     ),
 ) {
-    setup_logger_once();
-    let topology = topology();
+    crate::setup_logger_once();
+    let topology = crate::topology();
     let mut seen_affinities = BTreeSet::new();
     for ty in [
         ObjectType::L1Cache,
@@ -255,7 +252,7 @@ pub fn bench_local_floats<const BLOCK_SIZE: usize>(
 fn max_data_size_pow2() -> u32 {
     static RESULT: OnceLock<u32> = OnceLock::new();
     *RESULT.get_or_init(|| {
-        let cache_stats = topology().cpu_cache_stats().unwrap();
+        let cache_stats = crate::topology().cpu_cache_stats().unwrap();
         let total_l3_capacity = cache_stats.total_data_cache_sizes().last().unwrap();
         let mut max_size = 2 * total_l3_capacity;
         if !max_size.is_power_of_two() {
@@ -407,20 +404,6 @@ pub fn norm_sqr_flat<const BLOCK_SIZE: usize, const REDUCE_ILP_STREAMS: usize>(
         },
         0.0,
     )
-}
-
-/// Topology instance shared by all above functions
-fn topology() -> &'static Arc<Topology> {
-    static INSTANCE: OnceLock<Arc<Topology>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Arc::new(Topology::new().unwrap()))
-}
-
-/// Ensure logging to stderr is set up during benchmarking
-fn setup_logger_once() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        env_logger::init();
-    })
 }
 
 #[cfg(test)]

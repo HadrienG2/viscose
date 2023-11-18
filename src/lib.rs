@@ -101,3 +101,32 @@ macro_rules! trace {
         $crate::log!(log::Level::Trace, $($args),*);
     };
 }
+//
+/// Ensure logging to stderr is set up during benchmarking
+#[cfg(any(test, feature = "bench"))]
+pub(crate) fn setup_logger_once() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        env_logger::init();
+    })
+}
+
+/// Topology instance shared by all tests and benchmarks
+#[cfg(any(test, feature = "bench"))]
+pub(crate) fn topology() -> &'static std::sync::Arc<hwlocality::Topology> {
+    use hwlocality::Topology;
+    use std::sync::{Arc, OnceLock};
+    static INSTANCE: OnceLock<Arc<Topology>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Arc::new(Topology::new().unwrap()))
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::panic::UnwindSafe;
+
+    pub(crate) fn assert_panics<R>(op: impl FnOnce() -> R + UnwindSafe) {
+        assert!(std::panic::catch_unwind(op).is_err());
+    }
+}

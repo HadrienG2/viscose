@@ -91,6 +91,11 @@ impl AtomicFlags {
             .for_each(|word| word.store(0, Ordering::Relaxed));
     }
 
+    /// Iterate over all bits in the flags
+    pub fn iter<'self_>(&'self_ self) -> impl Iterator<Item = BitRef<'self_, false>> + 'self_ {
+        (0..self.len()).map(|bit_idx| self.bit(bit_idx))
+    }
+
     /// Iterate over the global bit positions of set flags at increasing
     /// distance from a certain position
     ///

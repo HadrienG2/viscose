@@ -48,7 +48,7 @@ default = ["detect-excessive-joins", "bench"]
 # Core dependencies
 atomic-wait = { version = "1.1.0", default-features = false }
 crossbeam = { version = "0.8.2", features = ["crossbeam-deque"] }
-hwlocality = { git = "https://github.com/HadrienG2/hwlocality.git", features = ["hwloc-2_3_0"] }
+hwlocality = { git = "https://github.com/HadrienG2/hwlocality.git", features = ["hwloc-2_2_0", "proptest"] }
 
 # Used to optionally warn about dangerous or inefficient library usage
 log = { version = "0.4", optional = true }
