@@ -78,7 +78,7 @@ impl WorkerFutex {
                 // joins to wake it up at this point then you have a worker
                 // thread deadlock on your hands...
                 crate::unlikely(|| {
-                    log::error!("\
+                    crate::error!("\
                         A worker thread has more join()s in flight than the ABA-safe limit of {} concurrent joins. \
                         This worker thread has a small chance of deadlocking under bad scheduling circumstances. \
                         Consider tightening your program's sequential processing threshold, as it is highly \

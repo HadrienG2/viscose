@@ -154,6 +154,7 @@ impl SharedState {
 }
 
 /// State needed to configure a new worker
+#[derive(Debug)]
 pub(crate) struct WorkerConfig {
     /// Work queue
     pub work_queue: deque::Worker<DynJob>,

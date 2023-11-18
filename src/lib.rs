@@ -56,3 +56,48 @@ fn result_or_panic<R>(result: std::thread::Result<R>) -> R {
 fn unlikely<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
+
+// Set up optional logging
+#[doc(hidden)]
+#[macro_export]
+macro_rules! log {
+    ($level:expr, $($args:expr),*) => {
+        #[cfg(feature = "log")]
+        log::log!($level, $($args),*);
+    };
+}
+#[doc(hidden)]
+#[macro_export]
+macro_rules! error {
+    ($($args:expr),*) => {
+        $crate::log!(log::Level::Error, $($args),*);
+    };
+}
+#[doc(hidden)]
+#[macro_export]
+macro_rules! warn {
+    ($($args:expr),*) => {
+        $crate::log!(log::Level::Warn, $($args),*);
+    };
+}
+#[doc(hidden)]
+#[macro_export]
+macro_rules! info {
+    ($($args:expr),*) => {
+        $crate::log!(log::Level::Info, $($args),*);
+    };
+}
+#[doc(hidden)]
+#[macro_export]
+macro_rules! debug {
+    ($($args:expr),*) => {
+        $crate::log!(log::Level::Debug, $($args),*);
+    };
+}
+#[doc(hidden)]
+#[macro_export]
+macro_rules! trace {
+    ($($args:expr),*) => {
+        $crate::log!(log::Level::Trace, $($args),*);
+    };
+}
