@@ -323,7 +323,7 @@ impl HierarchicalState {
 }
 
 /// Node of `HierarchicalState::work_availability_tree`
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct Node {
     /// Index of parent tree node, if any
     ///
@@ -362,10 +362,13 @@ impl Node {
     fn worker_bit_idx(&self, global_node_idx: usize) -> Option<usize> {
         let worker_children = self.worker_children?;
         let worker_idx = worker_children.child_idx(global_node_idx)?;
-        let worker_offset = self
-            .node_children
-            .map_or(0, |node_children| usize::from(node_children.num_children));
-        Some(worker_idx + worker_offset)
+        Some(worker_idx + self.num_node_children())
+    }
+
+    /// Number of node children
+    fn num_node_children(&self) -> usize {
+        self.node_children
+            .map_or(0, |node_children| usize::from(node_children.num_children))
     }
 }
 
@@ -530,88 +533,200 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::VecDeque;
 
-    /// Check that the hierarchical state building works as expected, given a
-    /// certain affinity mask
-    fn check_state_building(affinity: CpuSet) {
-        crate::setup_logger_once();
+    proptest! {
+        #[test]
+        fn with_worker_config(affinity: CpuSet) {
+            crate::setup_logger_once();
 
-        let topology = crate::topology();
-        let make_state = || HierarchicalState::with_worker_config(topology, &affinity);
-        let (state, worker_configs) = if topology.cpuset().intersects(&affinity) {
-            make_state()
-        } else {
-            crate::tests::assert_panics(make_state);
-            return;
-        };
-
-        let expected_cpuset = topology.cpuset() & affinity;
-        let expected_num_workers = expected_cpuset.weight().unwrap();
-
-        assert_eq!(worker_configs.len(), expected_num_workers);
-        assert_eq!(
-            worker_configs
-                .iter()
-                .map(|config| config.cpu)
-                .collect::<CpuSet>(),
-            expected_cpuset
-        );
-
-        assert_eq!(state.workers.len(), expected_num_workers);
-
-        let mut expected_parents = VecDeque::new();
-        let mut expected_next_worker_idx = 0;
-        let mut expected_next_node_idx = 1;
-        for (idx, node) in state.work_availability_tree.iter().enumerate() {
-            // All work availability bits should initially be empty
-            assert!(node
-                .work_availability
-                .iter()
-                .all(|bit| !bit.is_set(Ordering::Relaxed)));
-
-            // Check parent index coherence
-            if idx == 0 {
-                assert_eq!(node.parent_idx, None);
+            let topology = crate::topology();
+            let make_state = || HierarchicalState::with_worker_config(topology, &affinity);
+            let (state, worker_configs) = if topology.cpuset().intersects(&affinity) {
+                make_state()
             } else {
-                assert_eq!(node.parent_idx, Some(expected_parents.pop_front().unwrap()));
-            }
-            if let Some(ChildrenLink { num_children, .. }) = node.node_children {
-                for _ in 0..num_children.into() {
-                    expected_parents.push_back(idx);
-                }
-            }
+                crate::tests::assert_panics(make_state);
+                return Ok(());
+            };
 
-            // Check child index coherence
-            if let Some(ChildrenLink {
-                first_child_idx,
-                num_children,
-            }) = node.node_children
-            {
-                assert_eq!(first_child_idx, expected_next_node_idx);
-                expected_next_node_idx += usize::from(num_children);
-            }
-            if let Some(ChildrenLink {
-                first_child_idx,
-                num_children,
-            }) = node.worker_children
-            {
-                assert_eq!(first_child_idx, expected_next_worker_idx);
-                expected_next_worker_idx += usize::from(num_children);
+            let expected_cpuset = topology.cpuset() & affinity;
+            let expected_num_workers = expected_cpuset.weight().unwrap();
+
+            assert_eq!(worker_configs.len(), expected_num_workers);
+            assert_eq!(
+                worker_configs
+                    .iter()
+                    .map(|config| config.cpu)
+                    .collect::<CpuSet>(),
+                expected_cpuset
+            );
+
+            assert_eq!(state.workers.len(), expected_num_workers);
+
+            'check_tree: {
+                // The tree will be empty if and only if there is only a single
+                // worker (uniprocessor system), in which case that worker doesn't
+                // need a tree to synchronize with other workers.
+                if expected_num_workers == 1 {
+                    assert_eq!(state.work_availability_tree.len(), 0);
+                    break 'check_tree;
+                }
+                assert!(state.work_availability_tree.len() >= 1);
+
+                // Otherwise, explore tree node in (breadth-first) order
+                let mut expected_parents = VecDeque::new();
+                let mut expected_next_worker_idx = 0;
+                let mut expected_next_node_idx = 1;
+                for (idx, node) in state.work_availability_tree.iter().enumerate() {
+                    // All work availability bits should initially be empty
+                    assert!(node
+                        .work_availability
+                        .iter()
+                        .all(|bit| !bit.is_set(Ordering::Relaxed)));
+
+                    // Check parent index coherence
+                    if idx == 0 {
+                        assert_eq!(node.parent_idx, None);
+                    } else {
+                        assert_eq!(node.parent_idx, Some(expected_parents.pop_front().unwrap()));
+                    }
+                    if let Some(ChildrenLink { num_children, .. }) = node.node_children {
+                        for _ in 0..num_children.into() {
+                            expected_parents.push_back(idx);
+                        }
+                    }
+
+                    // Check child index coherence
+                    if let Some(ChildrenLink {
+                        first_child_idx,
+                        num_children,
+                    }) = node.node_children
+                    {
+                        assert_eq!(first_child_idx, expected_next_node_idx);
+                        expected_next_node_idx += usize::from(num_children);
+                    }
+                    if let Some(ChildrenLink {
+                        first_child_idx,
+                        num_children,
+                    }) = node.worker_children
+                    {
+                        assert_eq!(first_child_idx, expected_next_worker_idx);
+                        expected_next_worker_idx += usize::from(num_children);
+                    }
+                }
+
+                // The root node should indirectly point to all other trees or node
+                assert_eq!(expected_next_worker_idx, state.workers.len());
+                assert_eq!(expected_next_node_idx, state.work_availability_tree.len());
             }
         }
-
-        check_work_availiability_path(&state);
     }
 
-    /// Check that work availability path building works as expected, for a
-    /// given pre-initialized hierarchical state
-    fn check_work_availiability_path(state: &HierarchicalState) {
-        todo!("Test WorkAvailabilityPath");
+    /// Arbitrary HierarchicalState
+    ///
+    /// Unlike the HierarchicalState constructor, this uses an affinity mask
+    /// which only contains CPUs from the topology, resulting in superior state
+    /// shrinking since the state search space is smaller.
+    fn hierarchical_state() -> impl Strategy<Value = Arc<HierarchicalState>> {
+        let topology = crate::topology();
+        let cpus = topology.cpuset().iter_set().collect::<Vec<_>>();
+        let num_cpus = cpus.len();
+        prop::sample::subsequence(cpus, 1..=num_cpus).prop_map(move |cpus| {
+            HierarchicalState::with_worker_config(topology, cpus.into_iter().collect::<CpuSet>()).0
+        })
     }
 
     proptest! {
         #[test]
-        fn with_worker_config(affinity: CpuSet) {
-            check_state_building(affinity);
+        fn new_work_availability_path(state in hierarchical_state()) {
+            // Test harness setup
+            crate::setup_logger_once();
+            crate::info!("Testing WorkAvailabilityPath construction over {state:#?}");
+            let initial_tree = state.work_availability_tree.clone();
+
+            // Uniprocessor edge case: no need for a synchronization tree
+            if state.work_availability_tree.len() == 0 {
+                assert_eq!(state.workers.len(), 1);
+                return Ok(());
+            }
+
+            // Otherwise, iterate over node-attached workers and their parents
+            let worker_parents = state
+                .work_availability_tree
+                .iter()
+                .enumerate()
+                .filter(|(_idx, node)| node.worker_children.is_some());
+            for (parent_idx, parent) in worker_parents {
+                crate::debug!("Checking WorkAvailabilityPath construction for workers below node #{parent_idx} ({parent:#?})");
+                let workers = parent.worker_children.unwrap();
+                for rel_worker_idx in 0..usize::from(workers.num_children) {
+                    let global_worker_idx = rel_worker_idx + workers.first_child_idx;
+                    let worker_bit_idx = parent.num_node_children() + rel_worker_idx;
+                    crate::debug!("Checking child worker #{rel_worker_idx} (global #{global_worker_idx}, bit #{worker_bit_idx})");
+
+                    // Check that Node::worker_bit_idx works
+                    assert_eq!(
+                        parent.worker_bit_idx(global_worker_idx),
+                        Some(worker_bit_idx)
+                    );
+
+                    // Build a path and check that tree is unaffected
+                    let path = WorkAvailabilityPath::new(&state, global_worker_idx);
+                    crate::debug!("Got work availability path {path:#?}");
+                    assert_eq!(state.work_availability_tree, initial_tree);
+
+                    // Check that first path element points to the worker's parent
+                    crate::debug!("Checking parent node #{parent_idx}...");
+                    let mut path_elems = path.0.iter();
+                    let worker_elem = path_elems.next().unwrap();
+                    assert_eq!(worker_elem, &parent.work_availability.bit(worker_bit_idx));
+
+                    // Check that num_node_children works for worker-only parents
+                    if parent.node_children.is_none() {
+                        assert_eq!(parent.num_node_children(), 0);
+                    }
+
+                    // Regursively check parent nodes
+                    let mut curr_node_idx = parent_idx;
+                    let mut curr_node = parent;
+                    for curr_parent_elem in path_elems {
+                        // If path says there's a parent, there should be one...
+                        let curr_parent_idx = curr_node.parent_idx.unwrap();
+                        let curr_parent = &state.work_availability_tree[curr_parent_idx];
+                        crate::debug!("Checking ancestor node #{curr_parent_idx} ({curr_parent:#?})");
+
+                        // ...and it should know about us
+                        let our_child_list = curr_parent.node_children.unwrap();
+                        assert!(our_child_list.first_child_idx <= curr_node_idx);
+                        let rel_node_idx = curr_node_idx - our_child_list.first_child_idx;
+                        assert!(rel_node_idx < usize::from(our_child_list.num_children));
+                        assert_eq!(
+                            curr_parent.node_bit_idx(curr_node_idx).unwrap(),
+                            rel_node_idx
+                        );
+                        let node_bit_idx = rel_node_idx;
+
+                        // Check that path element is located correctly
+                        assert_eq!(
+                            curr_parent_elem,
+                            &curr_parent.work_availability.bit(node_bit_idx)
+                        );
+
+                        // Check that num_node_children works for node parents
+                        assert_eq!(
+                            curr_parent.num_node_children(),
+                            usize::from(our_child_list.num_children)
+                        );
+
+                        // Update state for next recursion step
+                        curr_node_idx = curr_parent_idx;
+                        curr_node = curr_parent;
+                    }
+                    assert_eq!(curr_node.parent_idx, None);
+                }
+            }
         }
     }
+
+    // TODO: Test that takes a HierarchicalState and a list of worker indices as
+    //       input, and for each worker index try fetch_noop and fetch_flip +
+    //       validate effect on HierarchicalState.
 }

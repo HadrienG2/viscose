@@ -276,7 +276,7 @@ pub enum FormerWordState {
 }
 
 /// Cached masks for bit value searches
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Copy, Clone, Eq, Hash, PartialEq)]
 struct SearchMasksCache {
     /// Mask to be used when searching for set bits, including self
     ///
@@ -311,6 +311,17 @@ struct SearchMasksCache {
     /// Cannot be all-zeroes because at least one bit associated with self witll
     /// be set to 1.
     unset_wo_self: NonZeroWord,
+}
+//
+impl Debug for SearchMasksCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SearchMasksCache")
+            .field("set_with_self", &format!("{:064b}", self.set_with_self))
+            .field("set_wo_self", &format!("{:064b}", self.set_wo_self))
+            .field("unset_with_self", &format!("{:064b}", self.unset_with_self))
+            .field("unset_wo_self", &format!("{:064b}", self.unset_wo_self))
+            .finish()
+    }
 }
 
 // TODO: Add tests
