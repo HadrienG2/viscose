@@ -269,16 +269,6 @@ impl<'flags, const LEFT_CACHED: bool, const RIGHT_CACHED: bool>
     }
 }
 
-/// State of a word before a check_xyz_and_abc operation
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-pub enum FormerWordState {
-    /// Word was in the state of interest, empty or full
-    EmptyOrFull,
-
-    /// Word was in any other state with the bit of interest in this state
-    OtherWithBit(bool),
-}
-
 /// Cached masks for bit value searches
 #[derive(Copy, Clone, Eq, Hash, PartialEq)]
 struct SearchMasksCache {
