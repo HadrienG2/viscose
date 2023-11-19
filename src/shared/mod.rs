@@ -28,7 +28,7 @@ pub(crate) struct SharedState {
     injector: Injector<DynJob>,
 
     /// Worker interfaces
-    pub workers: Box<[CachePadded<WorkerInterface>]>,
+    workers: Box<[CachePadded<WorkerInterface>]>,
 
     /// Per-worker truth that each worker _might_ have work ready to be stolen
     /// inside of its work queue
@@ -84,6 +84,11 @@ impl SharedState {
     /// Access the global work injector
     pub fn injector(&self) -> &Injector<DynJob> {
         &self.injector
+    }
+
+    /// Access the worker interfaces
+    pub fn workers(&self) -> &[CachePadded<WorkerInterface>] {
+        &self.workers[..]
     }
 
     /// Recommend that the work-less thread closest to a certain originating

@@ -60,7 +60,7 @@ impl<'pool> Worker<'pool> {
             idx,
             work_queue,
             work_available: WorkAvailabilityBit::new(shared, idx),
-            futex: &shared.workers[idx].futex,
+            futex: &shared.workers()[idx].futex,
             waiting_state: Cell::new(None),
             work_over: Cell::new(false),
         };
@@ -254,7 +254,7 @@ impl<'pool> Worker<'pool> {
         // while the worker finishes processing its current task, but it seems
         // like a fair price to pay in exchange for a clean synchronization
         // protocol and a cheap happy path when every worker stays fed.
-        self.steal_with(|| self.shared.workers[idx].stealer.steal())
+        self.steal_with(|| self.shared.workers()[idx].stealer.steal())
     }
 
     /// Try to steal work from the global task injector

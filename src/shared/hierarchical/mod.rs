@@ -156,6 +156,11 @@ impl HierarchicalState {
         &self.injector
     }
 
+    /// Access the worker interfaces
+    pub fn workers(&self) -> &[CachePadded<WorkerInterface>] {
+        &self.workers[..]
+    }
+
     // TODO: Add more methods, reach feature parity with current SharedState
 }
 
