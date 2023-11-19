@@ -60,26 +60,30 @@ impl<'flags> BitRef<'flags, false> {
 impl<'flags> BitRef<'flags, true> {
     /// Set this bit and check if the surrounding word was all-zeros before
     ///
-    /// This can be used to tell whether the surrounding AtomicFlags could have
-    /// been all-zeroes before setting this flag.
-    pub fn check_empty_and_set(&self, order: Ordering) -> FormerWordState {
-        let bit = self.bit_mask();
-        match self.word.fetch_or(bit, order) & self.cached_search_mask::<true, true>() {
-            Word::MIN => FormerWordState::EmptyOrFull,
-            other => FormerWordState::OtherWithBit(other & bit != 0),
-        }
-    }
-
-    /// Clear this bit and check if the surrounding word was all-ones before
+    /// Returns the former bit value and the truth that the surrounding word was
+    /// all-zeros before setting the bit, in this order.
     ///
     /// This can be used to tell whether the surrounding AtomicFlags could have
-    /// been all-ones before clearing this flag.
-    pub fn check_full_and_clear(&self, order: Ordering) -> FormerWordState {
+    /// been all-zeroes before setting this flag.
+    pub fn check_empty_and_set(&self, order: Ordering) -> (bool, bool) {
         let bit = self.bit_mask();
-        match self.word.fetch_and(!bit, order) | self.cached_search_mask::<false, true>() {
-            Word::MAX => FormerWordState::EmptyOrFull,
-            other => FormerWordState::OtherWithBit(other & bit != 0),
-        }
+        let old_word = self.word.fetch_or(bit, order);
+        let was_set = old_word & bit != 0;
+        let was_empty = (old_word & self.cached_search_mask::<true, true>()) == Word::MIN;
+        (was_set, was_empty)
+    }
+
+    /// Clear this bit and check if that made the surrounding word all-zeroes
+    ///
+    /// This can be used to tell whether the surrounding AtomicFlags could have
+    /// become all-zeroes as a result of clearing this flag.
+    pub fn clear_and_check_emptied(&self, order: Ordering) -> (bool, bool) {
+        let bit = self.bit_mask();
+        let old_word = self.word.fetch_and(!bit, order);
+        let was_set = old_word & bit != 0;
+        let new_word = old_word & !bit;
+        let now_empty = (new_word & self.cached_search_mask::<true, true>()) == Word::MIN;
+        (was_set, was_set && now_empty)
     }
 
     /// Cached version of `Self::search_mask()`

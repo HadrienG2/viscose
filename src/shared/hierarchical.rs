@@ -391,7 +391,7 @@ impl ChildrenLink {
 }
 
 /// Trail of `work_availability` bits from a worker to the root node
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkAvailabilityPath<'shared>(Box<[BitRef<'shared, true>]>);
 //
 impl<'shared> WorkAvailabilityPath<'shared> {
@@ -458,7 +458,7 @@ impl<'shared> WorkAvailabilityPath<'shared> {
     ///
     /// Return the former worker-private work availability bit value, if any
     pub fn fetch_clear(&self, order: Ordering) -> Option<bool> {
-        self.fetch_op(BitRef::check_full_and_clear, order, false)
+        self.fetch_op(BitRef::clear_and_check_emptied, order, false)
     }
 
     /// Shared commonalities between `fetch_set` and `fetch_clear`
@@ -470,7 +470,7 @@ impl<'shared> WorkAvailabilityPath<'shared> {
     /// should always be `!final_bit`.
     fn fetch_op(
         &self,
-        mut op: impl FnMut(&BitRef<'shared, true>, Ordering) -> FormerWordState,
+        mut op: impl FnMut(&BitRef<'shared, true>, Ordering) -> (bool, bool),
         order: Ordering,
         final_bit: bool,
     ) -> Option<bool> {
@@ -486,7 +486,8 @@ impl<'shared> WorkAvailabilityPath<'shared> {
         let mut old_worker_bit = None;
         for (idx, bit) in self.0.iter().enumerate() {
             // Adjust the work availability bit at this layer of the
-            // hierarchical state, and check former word state
+            // hierarchical state, and check if the next word in path must be
+            // updated as well
             //
             // This must be Release so that someone observing the work
             // availability bit at depth N with an Acquire load gets a
@@ -496,14 +497,11 @@ impl<'shared> WorkAvailabilityPath<'shared> {
             // any other state that's dependent on the former value of the work
             // availability bit. If the user requests an Acquire barrier for
             // their own purposes, it will be enforced by the fence below.
-            let old_word = op(bit, Ordering::Release);
+            let (old_bit, must_update_parent) = op(bit, Ordering::Release);
 
             // Collect the former worker-private work availability bit
             if idx == 0 {
-                old_worker_bit = Some(match old_word {
-                    FormerWordState::EmptyOrFull => !final_bit,
-                    FormerWordState::OtherWithBit(bit) => bit,
-                });
+                old_worker_bit = Some(old_bit);
             }
 
             // If the word was previously all-cleared when setting the work
@@ -511,9 +509,10 @@ impl<'shared> WorkAvailabilityPath<'shared> {
             // availability information up the hierarchy.
             //
             // Otherwise, another worker has already done it for us.
-            match old_word {
-                FormerWordState::EmptyOrFull => continue,
-                FormerWordState::OtherWithBit(_) => break,
+            if must_update_parent {
+                continue;
+            } else {
+                break;
             }
         }
 
@@ -530,12 +529,13 @@ impl<'shared> WorkAvailabilityPath<'shared> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::prelude::*;
+    use proptest::{collection::SizeRange, prelude::*};
     use std::collections::VecDeque;
 
     proptest! {
+        /// Test HierarchicalState construction
         #[test]
-        fn with_worker_config(affinity: CpuSet) {
+        fn new_hierarchical_state(affinity: CpuSet) {
             crate::setup_logger_once();
 
             let topology = crate::topology();
@@ -635,6 +635,7 @@ mod tests {
     }
 
     proptest! {
+        /// Test WorkAvailiabilityPath construction
         #[test]
         fn new_work_availability_path(state in hierarchical_state()) {
             // Test harness setup
@@ -726,7 +727,112 @@ mod tests {
         }
     }
 
-    // TODO: Test that takes a HierarchicalState and a list of worker indices as
-    //       input, and for each worker index try fetch_noop and fetch_flip +
-    //       validate effect on HierarchicalState.
+    /// Arbitrary HierarchicalState + ordered list of worker indices
+    ///
+    /// This is used to test WorkAvailliabilityPath operation correctness
+    fn state_and_worker_indices() -> impl Strategy<Value = (Arc<HierarchicalState>, Vec<usize>)> {
+        hierarchical_state().prop_flat_map(|state| {
+            let worker_indices =
+                prop::collection::vec(0..state.workers.len(), SizeRange::default());
+            worker_indices.prop_map(move |worker_indices| {
+                for node in state.work_availability_tree.iter() {
+                    node.work_availability.clear_all(Ordering::Relaxed);
+                }
+                (state.clone(), worker_indices)
+            })
+        })
+    }
+
+    proptest! {
+        /// Test WorkAvailabilityPath usage
+        #[test]
+        fn use_work_availability_path(
+            (state, worker_indices) in state_and_worker_indices()
+        ) {
+            // Test harness setup
+            crate::setup_logger_once();
+            crate::info!("Testing WorkAvailabilityPath usage pattern {worker_indices:?} over {state:#?}");
+
+            // Handle uniprocessor edge case
+            if state.workers.len() == 1 {
+                crate::debug!("Handling uniprocessor edge case");
+                assert_eq!(state.work_availability_tree.len(), 0);
+                let path = WorkAvailabilityPath::new(&state, 0);
+                assert_eq!(path.0.len(), 0);
+                for worker_idx in worker_indices {
+                    assert_eq!(worker_idx, 0);
+                    assert_eq!(path.fetch_set(Ordering::Relaxed), None);
+                    assert_eq!(path.fetch_clear(Ordering::Relaxed), None);
+                }
+                return Ok(());
+            }
+
+            // Precompute the work availability path of every worker, both in
+            // its optimized WorkAvailabilityPath form and in its unoptimized
+            // (node idx, child idx) form.
+            let worker_paths = (0..state.workers.len()).map(|worker_idx| {
+                crate::debug!("Building work availability path for worker {worker_idx}");
+
+                // Compute optimized WorkAvailabilityPath
+                let old_tree = state.work_availability_tree.clone();
+                let path = WorkAvailabilityPath::new(&state, worker_idx);
+                assert_eq!(state.work_availability_tree, old_tree);
+
+                // Compute unoptimized (node idx, child idx) version of the path
+                let mut raw_path = Vec::with_capacity(path.0.len());
+                let direct_parent = state.work_availability_tree.iter().enumerate().rev().find_map(|(node_idx, node)| {
+                    node.worker_bit_idx(worker_idx).map(|worker_bit_idx| {
+                        ((node_idx, node), worker_bit_idx)
+                    })
+                }).unwrap();
+                let ((mut node_idx, mut node), mut child_idx) = direct_parent;
+                raw_path.push((node_idx, child_idx));
+                //
+                while let Some(parent_idx) = node.parent_idx {
+                    node = &state.work_availability_tree[parent_idx];
+                    child_idx = node.node_bit_idx(node_idx).unwrap();
+                    node_idx = parent_idx;
+                    raw_path.push((node_idx, child_idx));
+                };
+                crate::debug!("Worker {worker_idx} has raw (node, child) path {raw_path:?}");
+
+                (path, raw_path)
+            }).collect::<Vec<_>>();
+
+            // Toggle worker availability and check effect on state
+            for worker_idx in worker_indices {
+                crate::debug!("Toggling work availability of worker {worker_idx}");
+                let (path, raw_path) = &worker_paths[worker_idx];
+                let was_set = path.0[0].is_set(Ordering::Relaxed);
+                let expected_tree = state.work_availability_tree.clone();
+                if was_set {
+                    assert_eq!(path.fetch_set(Ordering::Relaxed), Some(true));
+                    assert_eq!(state.work_availability_tree, expected_tree);
+                    assert_eq!(path.fetch_clear(Ordering::Relaxed), Some(true));
+                    for &(node_idx, child_idx) in raw_path {
+                        let bit = expected_tree[node_idx].work_availability.bit_with_cache(child_idx);
+                        let (was_set, now_empty) = bit.clear_and_check_emptied(Ordering::Relaxed);
+                        assert!(was_set);
+                        if !now_empty {
+                            break;
+                        }
+                    }
+                } else {
+                    assert_eq!(path.fetch_clear(Ordering::Relaxed), Some(false));
+                    assert_eq!(state.work_availability_tree, expected_tree);
+                    assert_eq!(path.fetch_set(Ordering::Relaxed), Some(false));
+                    for &(node_idx, child_idx) in raw_path {
+                        let bit = expected_tree[node_idx].work_availability.bit_with_cache(child_idx);
+                        let (was_set, was_empty) = bit.check_empty_and_set(Ordering::Relaxed);
+                        assert!(!was_set);
+                        if !was_empty {
+                            break;
+                        }
+                    }
+                }
+                crate::trace!("Tree is now in state {:#?}", state.work_availability_tree);
+                assert_eq!(state.work_availability_tree, expected_tree);
+            }
+        }
+    }
 }
