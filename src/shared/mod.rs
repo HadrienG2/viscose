@@ -25,7 +25,7 @@ use std::{
 #[derive(Debug, Default)]
 pub(crate) struct SharedState {
     /// Global work injector
-    pub injector: Injector<DynJob>,
+    injector: Injector<DynJob>,
 
     /// Worker interfaces
     pub workers: Box<[CachePadded<WorkerInterface>]>,
@@ -79,6 +79,11 @@ impl SharedState {
             work_availability: AtomicFlags::new(num_workers),
         });
         (result, worker_configs.into())
+    }
+
+    /// Access the global work injector
+    pub fn injector(&self) -> &Injector<DynJob> {
+        &self.injector
     }
 
     /// Recommend that the work-less thread closest to a certain originating

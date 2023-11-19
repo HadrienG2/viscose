@@ -151,7 +151,12 @@ impl HierarchicalState {
         builder.build()
     }
 
-    // TODO: Finish constructor, then rest
+    /// Access the global work injector
+    pub fn injector(&self) -> &Injector<DynJob> {
+        &self.injector
+    }
+
+    // TODO: Add more methods, reach feature parity with current SharedState
 }
 
 /// Node of `HierarchicalState::work_availability_tree`

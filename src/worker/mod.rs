@@ -262,7 +262,7 @@ impl<'pool> Worker<'pool> {
     /// Return truth that a task was successfully stolen and run.
     #[inline(always)]
     fn steal_from_injector(&self) -> bool {
-        self.steal_with(|| self.shared.injector.steal())
+        self.steal_with(|| self.shared.injector().steal())
     }
 
     /// Try to steal work from all possible sources
