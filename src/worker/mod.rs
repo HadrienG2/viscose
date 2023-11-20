@@ -275,7 +275,7 @@ impl<'pool> Worker<'pool> {
         // Need Acquire so stealing happens after observing available work.
         if let Some(neighbors_with_work) = self
             .shared
-            .find_steals(&self.work_available.bit, Ordering::Acquire)
+            .find_work_to_steal(&self.work_available.bit, Ordering::Acquire)
         {
             // Try to steal from other workers at increasing distances
             for idx in neighbors_with_work {
@@ -329,7 +329,7 @@ struct WorkAvailabilityBit<'pool> {
 impl<'pool> WorkAvailabilityBit<'pool> {
     /// Set up work availability notifications
     fn new(shared: &'pool SharedState, worker_idx: usize) -> Self {
-        let bit = shared.work_availability.bit_with_cache(worker_idx);
+        let bit = shared.worker_availability(worker_idx);
         // Can be a relaxed load since no one else should be modifying this bit
         let bit_is_set = Cell::new(bit.is_set(Ordering::Relaxed));
         Self { bit, bit_is_set }

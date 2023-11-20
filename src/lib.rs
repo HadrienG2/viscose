@@ -6,7 +6,7 @@ mod pool;
 mod shared;
 mod worker;
 
-use std::time::Duration;
+use std::{sync::atomic::Ordering, time::Duration};
 
 pub use crate::{pool::FlatPool, worker::scope::Scope};
 
@@ -55,6 +55,17 @@ fn result_or_panic<R>(result: std::thread::Result<R>) -> R {
 #[inline(never)]
 fn unlikely<T>(f: impl FnOnce() -> T) -> T {
     f()
+}
+
+/// Add an Acquire barrier to a user-specified atomic operation ordering
+#[inline]
+fn at_least_acquire(order: Ordering) -> Ordering {
+    match order {
+        Ordering::Relaxed | Ordering::Acquire => Ordering::Acquire,
+        Ordering::Release | Ordering::AcqRel => Ordering::AcqRel,
+        Ordering::SeqCst => Ordering::SeqCst,
+        _ => unimplemented!(),
+    }
 }
 
 // Set up optional logging

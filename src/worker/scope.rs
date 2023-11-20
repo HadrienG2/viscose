@@ -131,7 +131,7 @@ impl<'scope> Scope<'scope> {
         // ...and personally notify the closest starving thread about it
         // This doesn't need to be ordered after the setting of work_available
         // because workers following a recommendation don't read work_available.
-        self.0.shared.recommend_steal::<false, true>(
+        self.0.shared.suggest_stealing::<false, true>(
             &self.0.work_available.bit,
             StealLocation::Worker(self.0.idx),
             Ordering::Relaxed,

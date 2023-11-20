@@ -7,11 +7,18 @@
 
 pub mod path;
 
+use self::path::WorkAvailabilityPath;
+
 use super::{flags::AtomicFlags, job::DynJob, WorkerConfig, WorkerInterface};
 use crate::shared::futex::WorkerFutex;
 use crossbeam::{deque::Injector, utils::CachePadded};
 use hwlocality::{bitmap::BitmapIndex, cpu::cpuset::CpuSet, object::TopologyObject, Topology};
-use std::{assert_ne, borrow::Borrow, num::NonZeroUsize, sync::Arc};
+use std::{
+    assert_ne,
+    borrow::Borrow,
+    num::NonZeroUsize,
+    sync::{atomic::Ordering, Arc},
+};
 
 /// State shared between all thread pool users and workers, with hierarchical
 /// work availability tracking.
@@ -160,6 +167,39 @@ impl HierarchicalState {
     pub fn workers(&self) -> &[CachePadded<WorkerInterface>] {
         &self.workers[..]
     }
+
+    /// Generate a worker-private work availability path
+    ///
+    /// Workers can use this to signal when they have work available to steal
+    /// and when they stop having work available to steal. It is also used as a
+    /// worker identifier in other methods of this class.
+    ///
+    /// This accessor is meant to constructed by workers at thread pool
+    /// initialization time and then retained for the entire lifetime of the
+    /// thread pool. As a result, it is optimized for efficiency of repeated
+    /// usage, but initial construction may be expensive.
+    pub fn worker_availability(&self, worker_idx: usize) -> WorkAvailabilityPath<'_> {
+        WorkAvailabilityPath::new(self, worker_idx)
+    }
+
+    /* /// Enumerate workers with work available to steal at increasing distances
+    /// from a certain "thief" worker
+    pub fn find_work_to_steal<'result>(
+        &'result self,
+        worker_availability: &'result WorkAvailabilityPath<'result>,
+        load: Ordering,
+    ) -> Option<impl Iterator<Item = usize> + 'result> {
+        let mut ancestors = worker_availability.ancestors();
+        let parent = ancestors.next()?;
+        let mut searchers = Vec::with_capacity(worker_availability.num_ancestors());
+        // FIXME: Start iterating for work to steal in parent, then grandparent,
+        //        until we reach the point where either we have covered all
+        //        ancestors without finding work (in which case we return None),
+        //        or we have found a specific ancestor with work. Then dive down
+        //        that ancestor's children until we successfully build a worker
+        //        iterator. Repeat as many times as necessary.
+        Some(std::iter::from_fn(move || {}))
+    } */
 
     // TODO: Add more methods, reach feature parity with current SharedState
 }

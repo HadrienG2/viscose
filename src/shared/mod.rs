@@ -91,9 +91,39 @@ impl SharedState {
         &self.workers[..]
     }
 
-    /// Recommend that the work-less thread closest to a certain originating
-    /// locality steal a task from the specified location
-    pub fn recommend_steal<'self_, const INCLUDE_CENTER: bool, const CACHE_ITER_MASKS: bool>(
+    /// Generate a worker-private work availability bit accessor
+    ///
+    /// Workers can use this to signal when they have work available to steal
+    /// and when they stop having work available to steal.
+    ///
+    /// This accessor is meant to constructed by workers at thread pool
+    /// initialization time and then retained for the entire lifetime of the
+    /// thread pool. As a result, it is optimized for efficiency of repeated
+    /// usage, but initial construction may be expensive.
+    pub fn worker_availability(&self, worker_idx: usize) -> BitRef<'_, true> {
+        self.work_availability.bit_with_cache(worker_idx)
+    }
+
+    /// Enumerate workers with work available to steal at increasing distances
+    /// from a certain "thief" worker
+    pub fn find_work_to_steal<'result>(
+        &'result self,
+        worker_availability: &BitRef<'result, true>,
+        load: Ordering,
+    ) -> Option<impl Iterator<Item = usize> + 'result> {
+        let work_availability = &self.work_availability;
+        work_availability
+            .iter_set_around::<false, true>(
+                worker_availability,
+                // Need at least Acquire ordering to ensure work is visible
+                crate::at_least_acquire(load),
+            )
+            .map(|iter| iter.map(|bit| bit.linear_idx(work_availability)))
+    }
+
+    /// Recommend that the worker closest to a certain originating locality
+    /// steal a task from the specified location
+    pub fn suggest_stealing<'self_, const INCLUDE_CENTER: bool, const CACHE_ITER_MASKS: bool>(
         &'self_ self,
         local_worker: &BitRef<'self_, CACHE_ITER_MASKS>,
         task_location: StealLocation,
@@ -101,7 +131,7 @@ impl SharedState {
     ) {
         // Check if there are job-less neighbors to submit work to...
         //
-        // Need Acquire ordering so the futex is read after the work
+        // Need Acquire ordering so the futex is read/modified after the work
         // availability flag, no work availability caching/speculation allowed.
         let Some(mut asleep_neighbors) = self
             .work_availability
@@ -147,19 +177,6 @@ impl SharedState {
             task_location,
             update,
         )
-    }
-
-    /// Enumerate workers that a thief could steal work from, at increasing
-    /// distance from said thief
-    pub fn find_steals<'self_, const CACHE_ITER_MASKS: bool>(
-        &'self_ self,
-        thief: &BitRef<'self_, CACHE_ITER_MASKS>,
-        load: Ordering,
-    ) -> Option<impl Iterator<Item = usize> + '_> {
-        let work_availability = &self.work_availability;
-        work_availability
-            .iter_set_around::<false, CACHE_ITER_MASKS>(thief, load)
-            .map(|iter| iter.map(|bit| bit.linear_idx(work_availability)))
     }
 }
 

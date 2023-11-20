@@ -2,7 +2,10 @@
 
 use super::HierarchicalState;
 use crate::shared::flags::bitref::BitRef;
-use std::sync::atomic::{self, Ordering};
+use std::{
+    iter::FusedIterator,
+    sync::atomic::{self, Ordering},
+};
 
 /// Trail of `work_availability` bits from a worker to the root node
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -13,7 +16,7 @@ impl<'shared> WorkAvailabilityPath<'shared> {
     ///
     /// This is a fairly expensive computation, and workers are very strongly
     /// advised to cache the result instead or repeating the query.
-    fn new(shared: &'shared HierarchicalState, worker_idx: usize) -> Self {
+    pub fn new(shared: &'shared HierarchicalState, worker_idx: usize) -> Self {
         // Handle uniprocessor system special case (single worker w/o a parent)
         if shared.work_availability_tree.is_empty() {
             assert_eq!(worker_idx, 0);
@@ -57,6 +60,18 @@ impl<'shared> WorkAvailabilityPath<'shared> {
             parent = grandparent;
         }
         Self(path.into())
+    }
+
+    /// Number of ancestor nodes above this worker in the tree
+    pub(super) fn num_ancestors(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Ancestor nodes above this worker
+    pub(super) fn ancestors<'self_>(
+        &'self_ self,
+    ) -> impl ExactSizeIterator<Item = &'self_ BitRef<'shared, true>> + FusedIterator {
+        self.0.iter()
     }
 
     /// Set this worker's work availability bit, propagating information that
@@ -284,7 +299,7 @@ mod tests {
                 crate::debug!("Handling uniprocessor edge case");
                 assert_eq!(state.work_availability_tree.len(), 0);
                 let path = WorkAvailabilityPath::new(&state, 0);
-                assert_eq!(path.0.len(), 0);
+                assert_eq!(path.num_ancestors(), 0);
                 for worker_idx in worker_indices {
                     assert_eq!(worker_idx, 0);
                     assert_eq!(path.fetch_set(Ordering::Relaxed), None);
@@ -305,7 +320,7 @@ mod tests {
                 assert_eq!(state.work_availability_tree, old_tree);
 
                 // Compute unoptimized (node idx, child idx) version of the path
-                let mut raw_path = Vec::with_capacity(path.0.len());
+                let mut raw_path = Vec::with_capacity(path.num_ancestors());
                 let direct_parent = state.work_availability_tree.iter().enumerate().rev().find_map(|(node_idx, node)| {
                     node.worker_bit_idx(worker_idx).map(|worker_bit_idx| {
                         ((node_idx, node), worker_bit_idx)
