@@ -250,21 +250,9 @@ impl ChildrenLink {
         }
     }
 
-    /// Index of the first child of this kind in the relevant global table.
-    pub fn first_child_idx(&self) -> usize {
-        self.first_child_idx
-    }
-
     /// Number of children of this kind
     pub fn num_children(&self) -> usize {
         self.work_availability.len()
-    }
-
-    /// Translate a global child object index into a local work availability bit
-    /// index if this object is truly our child
-    pub fn child_bit_idx(&self, global_child_idx: usize) -> Option<usize> {
-        let bit_idx = global_child_idx.checked_sub(self.first_child_idx)?;
-        (bit_idx < self.num_children()).then_some(bit_idx)
     }
 
     /// Build a fast accessor to a child's work availability bit, if it is
@@ -319,7 +307,7 @@ impl ChildrenLink {
             work_availability.iter_set_around::<false, true>(thief_bit, load)
         } else {
             // Otherwise, start search from a random point of the child list to
-            // balance the work-stealing workload
+            // balance the work-stealing workload across children
             let mut rng = rand::thread_rng();
             let start_bit_idx = rng.gen_range(0..work_availability.len());
             let start_bit = work_availability.bit(start_bit_idx);
@@ -327,6 +315,18 @@ impl ChildrenLink {
         }?;
         // Translate local bits into global child indices
         Some(bit_iter.map(|bit| self.first_child_idx + bit.linear_idx(work_availability)))
+    }
+
+    /// Index of the first child of this kind in the relevant global table.
+    fn first_child_idx(&self) -> usize {
+        self.first_child_idx
+    }
+
+    /// Translate a global child object index into a local work availability bit
+    /// index if this object is truly our child
+    fn child_bit_idx(&self, global_child_idx: usize) -> Option<usize> {
+        let bit_idx = global_child_idx.checked_sub(self.first_child_idx)?;
+        (bit_idx < self.num_children()).then_some(bit_idx)
     }
 }
 
