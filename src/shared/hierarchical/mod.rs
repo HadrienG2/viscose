@@ -8,15 +8,14 @@
 pub mod path;
 
 use self::path::WorkAvailabilityPath;
-
 use super::{flags::AtomicFlags, job::DynJob, WorkerConfig, WorkerInterface};
-use crate::shared::futex::WorkerFutex;
+use crate::{bench::BitRef, shared::futex::WorkerFutex};
 use crossbeam::{deque::Injector, utils::CachePadded};
 use hwlocality::{bitmap::BitmapIndex, cpu::cpuset::CpuSet, object::TopologyObject, Topology};
+use rand::Rng;
 use std::{
     assert_ne,
     borrow::Borrow,
-    num::NonZeroUsize,
     sync::{atomic::Ordering, Arc},
 };
 
@@ -138,16 +137,10 @@ impl HierarchicalState {
                     parent_idx >= first_node_at_prev_depth && parent_idx < first_node_at_this_depth,
                     "parent should be within last tree layer"
                 );
-                let children = |first_child_idx, num_children| {
-                    NonZeroUsize::new(num_children).map(|num_children| ChildrenLink {
-                        first_child_idx,
-                        num_children,
-                    })
-                };
                 builder.setup_children(
                     parent_idx,
-                    children(first_child_worker_idx, num_worker_children),
-                    children(first_child_node_idx, num_node_children),
+                    ChildrenLink::new(first_child_worker_idx, num_worker_children),
+                    ChildrenLink::new(first_child_node_idx, num_node_children),
                 );
             }
 
@@ -214,61 +207,126 @@ struct Node {
     /// parent's first child index
     parent_idx: Option<usize>,
 
-    /// Work availability flags for this depth level
-    ///
-    /// Node children come first, then worker children.
-    ///
-    /// Provide flag set methods that automatically propagate the setting of the
-    /// first flag and the unsetting of the last flag to the parent node,
-    /// recursively all the way up to the root. The BitRef cached by worker
-    /// threads must honor this logic.
-    work_availability: AtomicFlags,
+    /// Location and availability of node children
+    node_children: ChildrenLink,
 
-    /// Index and number of node children
-    node_children: Option<ChildrenLink>,
-
-    /// Index and number of worker children
-    worker_children: Option<ChildrenLink>,
+    /// Location and availability of worker children
+    worker_children: ChildrenLink,
 }
 //
 impl Node {
-    /// Index of the bit associated with a certain node child within
-    /// self.work_availability, or None if this is not a child of this node
-    fn node_bit_idx(&self, global_node_idx: usize) -> Option<usize> {
-        let node_children = self.node_children?;
-        node_children.child_idx(global_node_idx)
-    }
-
-    /// Index of the bit associated with a certain worker child within
-    /// self.work_availability, or None if this is not a child of this node
-    fn worker_bit_idx(&self, global_node_idx: usize) -> Option<usize> {
-        let worker_children = self.worker_children?;
-        let worker_idx = worker_children.child_idx(global_node_idx)?;
-        Some(worker_idx + self.num_node_children())
-    }
-
-    /// Number of node children
-    fn num_node_children(&self) -> usize {
+    /// Clear all work availability flags
+    ///
+    /// This method is solely intended for use by unit tests as a quick "reset
+    /// to initial state" knob.
+    #[cfg(test)]
+    pub(crate) fn clear_work_availability(&self) {
         self.node_children
-            .map_or(0, |node_children| usize::from(node_children.num_children))
+            .work_availability
+            .clear_all(Ordering::Relaxed);
+        self.worker_children
+            .work_availability
+            .clear_all(Ordering::Relaxed);
     }
 }
 
-/// Number of children and index of the first child within the relevant list
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+/// Number and availability of [`Node`] children of a certain kind
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ChildrenLink {
-    /// First child index
-    first_child_idx: usize,
+    /// Availability flags
+    work_availability: AtomicFlags,
 
-    /// Number of children of this type
-    num_children: NonZeroUsize,
+    /// First child index in the relevant global table
+    first_child_idx: usize,
 }
 //
 impl ChildrenLink {
-    /// Index of a certain globally numbered entity within this local child list
-    fn child_idx(&self, global_idx: usize) -> Option<usize> {
-        let child_idx = global_idx.checked_sub(self.first_child_idx)?;
-        (child_idx < usize::from(self.num_children)).then_some(child_idx)
+    /// Set up a children link for a set of N children, contiguously stored in
+    /// the relevant global object list starting at a certain index
+    pub fn new(first_child_idx: usize, num_children: usize) -> Self {
+        Self {
+            work_availability: AtomicFlags::new(num_children),
+            first_child_idx,
+        }
+    }
+
+    /// Index of the first child of this kind in the relevant global table.
+    pub fn first_child_idx(&self) -> usize {
+        self.first_child_idx
+    }
+
+    /// Number of children of this kind
+    pub fn num_children(&self) -> usize {
+        self.work_availability.len()
+    }
+
+    /// Translate a global child object index into a local work availability bit
+    /// index if this object is truly our child
+    pub fn child_bit_idx(&self, global_child_idx: usize) -> Option<usize> {
+        let bit_idx = global_child_idx.checked_sub(self.first_child_idx)?;
+        (bit_idx < self.num_children()).then_some(bit_idx)
+    }
+
+    /// Build a fast accessor to a child's work availability bit, if it is
+    /// indeed a child of this node
+    ///
+    /// Children are identified by their index in the relevant global object
+    /// list, i.e. `HierarchicalState::workers` for workers and
+    /// `HierarchicalState::work_availability_tree` for nodes.
+    ///
+    /// Workers are encouraged to cache the output of this function for all of
+    /// their ancestor nodes in the work availability tree. It is a bit
+    /// expensive to compute initially, but ensures faster operations on work
+    /// availability bits in the long run.
+    pub fn child_availability(&self, global_child_idx: usize) -> Option<BitRef<'_, true>> {
+        self.child_bit_idx(global_child_idx)
+            .map(|bit_idx| self.work_availability.bit_with_cache(bit_idx))
+    }
+
+    /// Find children that might have work to steal
+    ///
+    /// For worker children, "might have work to steal" means the worker has
+    /// pushed work to its work queue and not seen it empty since (though it
+    /// might well become empty as a result of other workers stealing work from
+    /// it ). Result indices refer to [`WorkerInterface`] indices in the global
+    /// `HierarchicalState::workers` table.
+    ///
+    /// For node children, "might have work to steal" means that the associated
+    /// node has some worker(s) beneath it which announced having work available
+    /// for stealing as described above. Result indices refer to [`Node`]
+    /// indices in the global `HierarchicalState::work_availability_tree` table.
+    ///
+    /// If the thief is another child from the same children list, then it
+    /// should set `thief_bit` to its own bit in `work_availability`. This will
+    /// bias the work-stealing algorithm towards stealing from other children
+    /// closest in the hwloc-provided child list, which may enjoy slightly
+    /// faster communication depending on CPU microarchitecture.
+    ///
+    /// Otherwise, `thief_bit` should be set to `None`, which will lead to a
+    /// fair load balancing of the work-stealing workload through victim search
+    /// order randomization.
+    pub fn find_children_to_rob<'self_>(
+        &'self_ self,
+        thief_bit: Option<&BitRef<'self_, true>>,
+        load: Ordering,
+    ) -> Option<impl Iterator<Item = usize> + 'self_> {
+        let work_availability = &self.work_availability;
+        // Need at least Acquire ordering to ensure work is visible
+        let load = crate::at_least_acquire(load);
+        let bit_iter = if let Some(thief_bit) = thief_bit {
+            // If the thief is a child of ours, look for work at increasing
+            // distances from this child
+            work_availability.iter_set_around::<false, true>(thief_bit, load)
+        } else {
+            // Otherwise, start search from a random point of the child list to
+            // balance the work-stealing workload
+            let mut rng = rand::thread_rng();
+            let start_bit_idx = rng.gen_range(0..work_availability.len());
+            let start_bit = work_availability.bit(start_bit_idx);
+            work_availability.iter_set_around::<false, false>(&start_bit, load)
+        }?;
+        // Translate local bits into global child indices
+        Some(bit_iter.map(|bit| self.first_child_idx + bit.linear_idx(work_availability)))
     }
 }
 
@@ -492,12 +550,10 @@ impl HierarchicalStateBuilder {
         let result = self.next_node_idx();
         self.work_availability_tree.push(Node {
             parent_idx,
-            // Cannot fill in the details of the node until we've
-            // processed the children, but thankfully we have a "no
-            // children yet" placeholder state.
-            work_availability: AtomicFlags::new(0),
-            node_children: None,
-            worker_children: None,
+            // Cannot fill in the details of the node until we've processed the
+            // children, but we have a "no children yet" placeholder state.
+            node_children: ChildrenLink::default(),
+            worker_children: ChildrenLink::default(),
         });
         result
     }
@@ -509,23 +565,19 @@ impl HierarchicalStateBuilder {
     fn setup_children(
         &mut self,
         node_idx: usize,
-        worker_children: Option<ChildrenLink>,
-        node_children: Option<ChildrenLink>,
+        worker_children: ChildrenLink,
+        node_children: ChildrenLink,
     ) {
         // Basic input validation
         assert!(node_idx < self.num_nodes());
-        let check_children = |link: Option<ChildrenLink>, current_len: usize| {
-            if let Some(link) = link {
-                assert!(link.first_child_idx + usize::from(link.num_children) <= current_len);
-            }
+        let check_children = |link: &ChildrenLink, current_len: usize| {
+            assert!(link.first_child_idx + link.num_children() <= current_len);
         };
-        check_children(worker_children, self.num_workers());
-        check_children(node_children, self.num_nodes());
+        check_children(&worker_children, self.num_workers());
+        check_children(&node_children, self.num_nodes());
 
         // Make children-less nodes illegal
-        let num_children =
-            |link: Option<ChildrenLink>| link.map_or(0, |link| usize::from(link.num_children));
-        let num_children = num_children(node_children) + num_children(worker_children);
+        let num_children = node_children.num_children() + worker_children.num_children();
         assert_ne!(
             num_children, 0,
             "nodes without children should be filtered out"
@@ -533,7 +585,6 @@ impl HierarchicalStateBuilder {
 
         // Set the node's children descriptors
         let node = &mut self.work_availability_tree[node_idx];
-        node.work_availability = AtomicFlags::new(num_children);
         node.worker_children = worker_children;
         node.node_children = node_children;
     }
@@ -639,10 +690,14 @@ pub(crate) mod tests {
                 let mut expected_next_node_idx = 1;
                 for (idx, node) in state.work_availability_tree.iter().enumerate() {
                     // All work availability bits should initially be empty
-                    assert!(node
-                        .work_availability
-                        .iter()
-                        .all(|bit| !bit.is_set(Ordering::Relaxed)));
+                    let check_work_unavailable = |children: &ChildrenLink| {
+                        assert!(children
+                            .work_availability
+                            .iter()
+                            .all(|bit| !bit.is_set(Ordering::Relaxed)));
+                    };
+                    check_work_unavailable(&node.node_children);
+                    check_work_unavailable(&node.worker_children);
 
                     // Check parent index coherence
                     if idx == 0 {
@@ -650,29 +705,15 @@ pub(crate) mod tests {
                     } else {
                         assert_eq!(node.parent_idx, Some(expected_parents.pop_front().unwrap()));
                     }
-                    if let Some(ChildrenLink { num_children, .. }) = node.node_children {
-                        for _ in 0..num_children.into() {
-                            expected_parents.push_back(idx);
-                        }
+                    for _ in 0..node.node_children.num_children() {
+                        expected_parents.push_back(idx);
                     }
 
                     // Check child index coherence
-                    if let Some(ChildrenLink {
-                        first_child_idx,
-                        num_children,
-                    }) = node.node_children
-                    {
-                        assert_eq!(first_child_idx, expected_next_node_idx);
-                        expected_next_node_idx += usize::from(num_children);
-                    }
-                    if let Some(ChildrenLink {
-                        first_child_idx,
-                        num_children,
-                    }) = node.worker_children
-                    {
-                        assert_eq!(first_child_idx, expected_next_worker_idx);
-                        expected_next_worker_idx += usize::from(num_children);
-                    }
+                    assert_eq!(node.node_children.first_child_idx, expected_next_node_idx);
+                    expected_next_node_idx += node.node_children.num_children();
+                    assert_eq!(node.worker_children.first_child_idx, expected_next_worker_idx);
+                    expected_next_worker_idx += node.worker_children.num_children();
                 }
 
                 // The root node should indirectly point to all other trees or node

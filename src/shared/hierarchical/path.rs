@@ -8,6 +8,10 @@ use std::{
 };
 
 /// Trail of `work_availability` bits from a worker to the root node
+///
+/// Note that the first `BitRef`, if any, targets the `work_availability` of the
+/// parent node's `worker_children`. Subsequent `BitRef`s target the
+/// `work_availability` of ancestor nodes' `node_children`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkAvailabilityPath<'shared>(Box<[BitRef<'shared, true>]>);
 //
@@ -31,12 +35,9 @@ impl<'shared> WorkAvailabilityPath<'shared> {
             .enumerate()
             .rev()
             .find_map(|(node_idx, node)| {
-                node.worker_bit_idx(worker_idx).map(|worker_bit_idx| {
-                    (
-                        (node_idx, node),
-                        node.work_availability.bit_with_cache(worker_bit_idx),
-                    )
-                })
+                node.worker_children
+                    .child_availability(worker_idx)
+                    .map(|worker_bit| ((node_idx, node), worker_bit))
             })
             .expect("worker index is out of bounds");
 
@@ -50,10 +51,11 @@ impl<'shared> WorkAvailabilityPath<'shared> {
             let grandparent = &shared.work_availability_tree[grandparent_idx];
 
             // Push work availability bit for this node with parent node
-            let parent_bit_idx = grandparent
-                .node_bit_idx(parent_idx)
+            let parent_bit = grandparent
+                .node_children
+                .child_availability(parent_idx)
                 .expect("tree parent <-> grandparent links are inconsistent");
-            path.push(grandparent.work_availability.bit_with_cache(parent_bit_idx));
+            path.push(parent_bit);
 
             // Adjust iteration state to use grandparent as new parent
             parent_idx = grandparent_idx;
@@ -157,6 +159,7 @@ impl<'shared> WorkAvailabilityPath<'shared> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::hierarchical::Node;
     use hwlocality::cpu::cpuset::CpuSet;
     use proptest::{collection::SizeRange, prelude::*};
     use std::sync::Arc;
@@ -195,20 +198,13 @@ mod tests {
                 .work_availability_tree
                 .iter()
                 .enumerate()
-                .filter(|(_idx, node)| node.worker_children.is_some());
+                .filter(|(_idx, node)| node.worker_children.num_children() != 0);
             for (parent_idx, parent) in worker_parents {
                 crate::debug!("Checking WorkAvailabilityPath construction for workers below node #{parent_idx} ({parent:#?})");
-                let workers = parent.worker_children.unwrap();
-                for rel_worker_idx in 0..usize::from(workers.num_children) {
-                    let global_worker_idx = rel_worker_idx + workers.first_child_idx;
-                    let worker_bit_idx = parent.num_node_children() + rel_worker_idx;
-                    crate::debug!("Checking child worker #{rel_worker_idx} (global #{global_worker_idx}, bit #{worker_bit_idx})");
-
-                    // Check that Node::worker_bit_idx works
-                    assert_eq!(
-                        parent.worker_bit_idx(global_worker_idx),
-                        Some(worker_bit_idx)
-                    );
+                let workers = &parent.worker_children;
+                for worker_bit_idx in 0..workers.num_children() {
+                    let global_worker_idx = worker_bit_idx + workers.first_child_idx;
+                    crate::debug!("Checking child worker #{worker_bit_idx} (global worker #{global_worker_idx})");
 
                     // Build a path and check that tree is unaffected
                     let path = WorkAvailabilityPath::new(&state, global_worker_idx);
@@ -219,12 +215,7 @@ mod tests {
                     crate::debug!("Checking parent node #{parent_idx}...");
                     let mut path_elems = path.0.iter();
                     let worker_elem = path_elems.next().unwrap();
-                    assert_eq!(worker_elem, &parent.work_availability.bit(worker_bit_idx));
-
-                    // Check that num_node_children works for worker-only parents
-                    if parent.node_children.is_none() {
-                        assert_eq!(parent.num_node_children(), 0);
-                    }
+                    assert_eq!(worker_elem, &workers.work_availability.bit(worker_bit_idx));
 
                     // Regursively check parent nodes
                     let mut curr_node_idx = parent_idx;
@@ -236,26 +227,16 @@ mod tests {
                         crate::debug!("Checking ancestor node #{curr_parent_idx} ({curr_parent:#?})");
 
                         // ...and it should know about us
-                        let our_child_list = curr_parent.node_children.unwrap();
+                        let our_child_list = &curr_parent.node_children;
                         assert!(our_child_list.first_child_idx <= curr_node_idx);
                         let rel_node_idx = curr_node_idx - our_child_list.first_child_idx;
-                        assert!(rel_node_idx < usize::from(our_child_list.num_children));
-                        assert_eq!(
-                            curr_parent.node_bit_idx(curr_node_idx).unwrap(),
-                            rel_node_idx
-                        );
+                        assert!(rel_node_idx < our_child_list.num_children());
                         let node_bit_idx = rel_node_idx;
 
                         // Check that path element is located correctly
                         assert_eq!(
                             curr_parent_elem,
-                            &curr_parent.work_availability.bit(node_bit_idx)
-                        );
-
-                        // Check that num_node_children works for node parents
-                        assert_eq!(
-                            curr_parent.num_node_children(),
-                            usize::from(our_child_list.num_children)
+                            &our_child_list.work_availability.bit(node_bit_idx)
                         );
 
                         // Update state for next recursion step
@@ -277,7 +258,7 @@ mod tests {
                 prop::collection::vec(0..state.workers.len(), SizeRange::default());
             worker_indices.prop_map(move |worker_indices| {
                 for node in state.work_availability_tree.iter() {
-                    node.work_availability.clear_all(Ordering::Relaxed);
+                    node.clear_work_availability();
                 }
                 (state.clone(), worker_indices)
             })
@@ -319,26 +300,54 @@ mod tests {
                 let path = WorkAvailabilityPath::new(&state, worker_idx);
                 assert_eq!(state.work_availability_tree, old_tree);
 
-                // Compute unoptimized (node idx, child idx) version of the path
-                let mut raw_path = Vec::with_capacity(path.num_ancestors());
-                let direct_parent = state.work_availability_tree.iter().enumerate().rev().find_map(|(node_idx, node)| {
-                    node.worker_bit_idx(worker_idx).map(|worker_bit_idx| {
-                        ((node_idx, node), worker_bit_idx)
+                // Reference work availability path construction method
+                let mut ancestor_nodes = Vec::with_capacity(path.num_ancestors() - 1);
+                let worker_parent = state.work_availability_tree.iter().enumerate().rev().find_map(|(node_idx, node)| {
+                    node.worker_children.child_bit_idx(worker_idx).map(|_| {
+                        ((node_idx, node), worker_idx)
                     })
                 }).unwrap();
-                let ((mut node_idx, mut node), mut child_idx) = direct_parent;
-                raw_path.push((node_idx, child_idx));
+                let ((worker_parent_idx, mut node), worker_idx) = worker_parent;
+                let mut node_idx = worker_parent_idx;
                 //
                 while let Some(parent_idx) = node.parent_idx {
                     node = &state.work_availability_tree[parent_idx];
-                    child_idx = node.node_bit_idx(node_idx).unwrap();
+                    node.node_children.child_bit_idx(node_idx).unwrap();
+                    ancestor_nodes.push((parent_idx, node_idx));
                     node_idx = parent_idx;
-                    raw_path.push((node_idx, child_idx));
                 };
-                crate::debug!("Worker {worker_idx} has raw (node, child) path {raw_path:?}");
+                crate::debug!("Worker {worker_idx} has a raw (node, child) path \
+                    composed of worker child ({worker_parent_idx}, {worker_idx}) \
+                    followed by node children {ancestor_nodes:?}");
 
-                (path, raw_path)
+                (path, ((worker_parent_idx, worker_idx), ancestor_nodes))
             }).collect::<Vec<_>>();
+
+            fn checked_path_op(
+                inout_tree: &[Node],
+                raw_path: &((usize, usize), Vec<(usize, usize)>),
+                node_op: fn(&BitRef<'_, true>, Ordering) -> (bool, bool),
+                expected_set: bool
+            ) {
+                let ((worker_parent_idx, worker_idx), ancestor_nodes) = raw_path;
+
+                let worker_bit = inout_tree[*worker_parent_idx].worker_children.child_availability(*worker_idx).unwrap();
+                let (was_set, empty_changed) = node_op(&worker_bit, Ordering::Relaxed);
+                assert_eq!(was_set, expected_set);
+                if !empty_changed {
+                    return;
+                }
+
+                for (node_parent_idx, node_idx) in ancestor_nodes {
+                    let node_bit = inout_tree[*node_parent_idx].node_children.child_availability(*node_idx).unwrap();
+                    let (was_set, empty_changed) = node_op(&node_bit, Ordering::Relaxed);
+                    assert_eq!(was_set, expected_set);
+                    if !empty_changed {
+                        return;
+                    }
+                }
+            }
+
 
             // Toggle worker availability and check effect on state
             for worker_idx in worker_indices {
@@ -350,26 +359,12 @@ mod tests {
                     assert_eq!(path.fetch_set(Ordering::Relaxed), Some(true));
                     assert_eq!(state.work_availability_tree, expected_tree);
                     assert_eq!(path.fetch_clear(Ordering::Relaxed), Some(true));
-                    for &(node_idx, child_idx) in raw_path {
-                        let bit = expected_tree[node_idx].work_availability.bit_with_cache(child_idx);
-                        let (was_set, now_empty) = bit.clear_and_check_emptied(Ordering::Relaxed);
-                        assert!(was_set);
-                        if !now_empty {
-                            break;
-                        }
-                    }
+                    checked_path_op(&expected_tree, raw_path, |bit, ordering| bit.clear_and_check_emptied(ordering), true);
                 } else {
                     assert_eq!(path.fetch_clear(Ordering::Relaxed), Some(false));
                     assert_eq!(state.work_availability_tree, expected_tree);
                     assert_eq!(path.fetch_set(Ordering::Relaxed), Some(false));
-                    for &(node_idx, child_idx) in raw_path {
-                        let bit = expected_tree[node_idx].work_availability.bit_with_cache(child_idx);
-                        let (was_set, was_empty) = bit.check_empty_and_set(Ordering::Relaxed);
-                        assert!(!was_set);
-                        if !was_empty {
-                            break;
-                        }
-                    }
+                    checked_path_op(&expected_tree, raw_path, |bit, ordering| bit.check_empty_and_set(ordering), false);
                 }
                 crate::trace!("Tree is now in state {:#?}", state.work_availability_tree);
                 assert_eq!(state.work_availability_tree, expected_tree);

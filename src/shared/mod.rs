@@ -123,9 +123,9 @@ impl SharedState {
 
     /// Recommend that the worker closest to a certain originating locality
     /// steal a task from the specified location
-    pub fn suggest_stealing<'self_, const INCLUDE_CENTER: bool, const CACHE_ITER_MASKS: bool>(
+    pub fn suggest_stealing<'self_, const INCLUDE_CENTER: bool, const CACHE_SEARCH_MASKS: bool>(
         &'self_ self,
-        local_worker: &BitRef<'self_, CACHE_ITER_MASKS>,
+        local_worker: &BitRef<'self_, CACHE_SEARCH_MASKS>,
         task_location: StealLocation,
         update: Ordering,
     ) {
@@ -135,17 +135,20 @@ impl SharedState {
         // availability flag, no work availability caching/speculation allowed.
         let Some(mut asleep_neighbors) = self
             .work_availability
-            .iter_unset_around::<INCLUDE_CENTER, CACHE_ITER_MASKS>(local_worker, Ordering::Acquire)
+            .iter_unset_around::<INCLUDE_CENTER, CACHE_SEARCH_MASKS>(
+                local_worker,
+                Ordering::Acquire,
+            )
         else {
             return;
         };
 
         // ...and if so, tell the closest one about our newly submitted job
         #[cold]
-        fn unlikely<'self_, const CACHE_ITER_MASKS: bool>(
+        fn unlikely<'self_, const CACHE_SEARCH_MASKS: bool>(
             self_: &'self_ SharedState,
             asleep_neighbors: impl Iterator<Item = BitRef<'self_, false>>,
-            local_worker: &BitRef<'self_, CACHE_ITER_MASKS>,
+            local_worker: &BitRef<'self_, CACHE_SEARCH_MASKS>,
             task_location: StealLocation,
             update: Ordering,
         ) {

@@ -10,7 +10,7 @@ use std::{
 
 /// Iterator over set/unset bits at increasing distances from a central point
 #[derive(Debug, Clone)]
-pub(crate) struct NearestBitIterator<'flags, const FIND_SET: bool, const INCLUDE_CENTER: bool> {
+pub struct NearestBitIterator<'flags, const FIND_SET: bool, const INCLUDE_CENTER: bool> {
     /// Flags that we're iterating over
     flags: &'flags AtomicFlags,
 
@@ -32,13 +32,14 @@ impl<'flags, const FIND_SET: bool, const INCLUDE_CENTER: bool>
 {
     /// Start iterating over set/uset bits around a central position
     #[inline(always)]
-    pub(crate) fn new<const CACHE_ITER_MASKS: bool>(
+    pub(crate) fn new<const CACHE_SEARCH_MASKS: bool>(
         flags: &'flags AtomicFlags,
-        center: &BitRef<'flags, CACHE_ITER_MASKS>,
+        center: &BitRef<'flags, CACHE_SEARCH_MASKS>,
         order: Ordering,
     ) -> Option<Self> {
-        let initial_state =
-            InitialState::new::<FIND_SET, INCLUDE_CENTER, CACHE_ITER_MASKS>(flags, center, order)?;
+        let initial_state = InitialState::new::<FIND_SET, INCLUDE_CENTER, CACHE_SEARCH_MASKS>(
+            flags, center, order,
+        )?;
         let left_bits = BitIterator::<'flags, FIND_SET, true>::from_initial_state(initial_state);
         let right_bits = BitIterator::<'flags, FIND_SET, false>::from_initial_state(initial_state);
         let yield_center = INCLUDE_CENTER && (center.is_set(order) == FIND_SET);
@@ -123,12 +124,13 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
     ///
     /// The bit at initial position `after` will not be emitted.
     #[cfg(test)]
-    pub fn new<const CACHE_ITER_MASKS: bool>(
+    pub fn new<const CACHE_SEARCH_MASKS: bool>(
         flags: &'flags AtomicFlags,
-        after: &BitRef<'flags, CACHE_ITER_MASKS>,
+        after: &BitRef<'flags, CACHE_SEARCH_MASKS>,
         order: Ordering,
     ) -> Option<Self> {
-        let initial = InitialState::new::<FIND_SET, false, CACHE_ITER_MASKS>(flags, after, order)?;
+        let initial =
+            InitialState::new::<FIND_SET, false, CACHE_SEARCH_MASKS>(flags, after, order)?;
         Some(Self::from_initial_state(initial))
     }
 
@@ -361,9 +363,9 @@ impl<'flags> InitialState<'flags> {
     ///
     /// This will return None if it can be cheaply proven at this stage that no
     /// iteration is possible.
-    pub fn new<const FIND_SET: bool, const INCLUDE_START: bool, const CACHE_ITER_MASKS: bool>(
+    pub fn new<const FIND_SET: bool, const INCLUDE_START: bool, const CACHE_SEARCH_MASKS: bool>(
         flags: &'flags AtomicFlags,
-        start: &BitRef<'flags, CACHE_ITER_MASKS>,
+        start: &BitRef<'flags, CACHE_SEARCH_MASKS>,
         order: Ordering,
     ) -> Option<Self> {
         // Part that's independent of FIND_SET
@@ -393,9 +395,9 @@ impl<'flags> InitialState<'flags> {
     }
 
     /// Subset of the iteration work that's independent of FIND_SET
-    fn set_independent_init<const CACHE_ITER_MASKS: bool>(
+    fn set_independent_init<const CACHE_SEARCH_MASKS: bool>(
         flags: &'flags AtomicFlags,
-        start: &BitRef<'flags, CACHE_ITER_MASKS>,
+        start: &BitRef<'flags, CACHE_SEARCH_MASKS>,
         order: Ordering,
     ) -> (SharedState<'flags>, usize, u32, Word) {
         let word_idx = start.word_idx(flags);
