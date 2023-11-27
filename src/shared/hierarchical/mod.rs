@@ -5,16 +5,19 @@
 //! to priorize giving or stealing work from the threads which are closest in
 //! the topology and share the most resources with them.
 
-pub mod path;
+mod builder;
+pub(crate) mod path;
 
-use self::path::WorkAvailabilityPath;
-use super::{flags::AtomicFlags, job::DynJob, WorkerConfig, WorkerInterface};
-use crate::{bench::BitRef, shared::futex::WorkerFutex};
+use self::{
+    builder::{ChildObjects, HierarchicalStateBuilder},
+    path::WorkAvailabilityPath,
+};
+use super::{flags::AtomicFlags, futex::WorkerFutex, job::DynJob, WorkerConfig, WorkerInterface};
+use crate::bench::BitRef;
 use crossbeam::{deque::Injector, utils::CachePadded};
-use hwlocality::{bitmap::BitmapIndex, cpu::cpuset::CpuSet, object::TopologyObject, Topology};
+use hwlocality::{cpu::cpuset::CpuSet, Topology};
 use rand::Rng;
 use std::{
-    assert_ne,
     borrow::Borrow,
     sync::{atomic::Ordering, Arc},
 };
@@ -30,14 +33,14 @@ pub(crate) struct HierarchicalState {
     ///
     /// All workers associated with a given tree node reside at consecutive
     /// indices, but the ordering of workers is otherwise unspecified.
-    workers: Box<[CachePadded<WorkerInterface>]>,
+    workers: Box<[CachePadded<Child<WorkerInterface>>]>,
 
     /// One node per hwloc TopologyObject with multiple children.
     ///
     /// Sorted in breadth-first order, first by source hwloc object depth and
     /// then within each depth by hwloc object cousin rank. This ensures that
     /// all the node children of a given parent reside at consecutive indices.
-    work_availability_tree: Box<[Node]>,
+    work_availability_tree: Box<[Child<Node>]>,
 }
 //
 impl HierarchicalState {
@@ -108,7 +111,7 @@ impl HierarchicalState {
                     child_object_set.parent_idx
                 );
 
-                // Handle edge cases parent node
+                // Handle edge cases without a parent node
                 let Some(parent_idx) = child_object_set.parent_idx else {
                     match builder.num_nodes() {
                         0 => {
@@ -156,9 +159,9 @@ impl HierarchicalState {
         &self.injector
     }
 
-    /// Access the worker interfaces
-    pub fn workers(&self) -> &[CachePadded<WorkerInterface>] {
-        &self.workers[..]
+    /// Access the worker futexes
+    pub fn worker_futexes(&self) -> impl Iterator<Item = &'_ WorkerFutex> {
+        self.workers.iter().map(|child| &child.object.futex)
     }
 
     /// Generate a worker-private work availability path
@@ -197,16 +200,38 @@ impl HierarchicalState {
     // TODO: Add more methods, reach feature parity with current SharedState
 }
 
+/// Object tagged with a [`ParentLink`]
+///
+/// In the [`HierarchicalState`], it is common to look up a worker or node's
+/// parent node in order to perform work stealing or advertise work
+/// availability. Therefore, these objects are tagged with a pointer to their
+/// parent node, if any.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+struct Child<T> {
+    /// Index of the parent node
+    pub parent: ParentLink,
+
+    /// Worker or node
+    pub object: T,
+}
+
+/// Index of a worker or node's parent in
+/// [`HierarchicalState::work_availability_tree`]
+///
+/// There are only two cases in which a worker or node may not have a parent:
+///
+/// 1. In uniprocessor systems, there is no need for work availability tracking
+///    (the only purpose of this tracking is for workers to communicate with
+///    other workers for work stealing coordination purposes). Therefore, there
+///    is only a single worker with no parent.
+/// 2. In multiprocessor systems, there is at least one node in the work
+///    availability tree, but by definition the root node of the tree does not
+///    have parents.
+type ParentLink = Option<usize>;
+
 /// Node of `HierarchicalState::work_availability_tree`
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct Node {
-    /// Index of parent tree node, if any
-    ///
-    /// Child index within the parent can be deduced from the child index in the
-    /// relevant global table by subtracting this global child index from the
-    /// parent's first child index
-    parent_idx: Option<usize>,
-
     /// Location and availability of node children
     node_children: ChildrenLink,
 
@@ -255,8 +280,7 @@ impl ChildrenLink {
         self.work_availability.len()
     }
 
-    /// Build a fast accessor to a child's work availability bit, if it is
-    /// indeed a child of this node
+    /// Build a fast accessor to a child's work availability bit
     ///
     /// Children are identified by their index in the relevant global object
     /// list, i.e. `HierarchicalState::workers` for workers and
@@ -266,9 +290,9 @@ impl ChildrenLink {
     /// their ancestor nodes in the work availability tree. It is a bit
     /// expensive to compute initially, but ensures faster operations on work
     /// availability bits in the long run.
-    pub fn child_availability(&self, global_child_idx: usize) -> Option<BitRef<'_, true>> {
-        self.child_bit_idx(global_child_idx)
-            .map(|bit_idx| self.work_availability.bit_with_cache(bit_idx))
+    pub fn child_availability(&self, global_child_idx: usize) -> BitRef<'_, true> {
+        let bit_idx = self.child_bit_idx(global_child_idx);
+        self.work_availability.bit_with_cache(bit_idx)
     }
 
     /// Find children that might have work to steal
@@ -317,312 +341,18 @@ impl ChildrenLink {
         Some(bit_iter.map(|bit| self.first_child_idx + bit.linear_idx(work_availability)))
     }
 
-    /// Index of the first child of this kind in the relevant global table.
-    fn first_child_idx(&self) -> usize {
-        self.first_child_idx
-    }
-
     /// Translate a global child object index into a local work availability bit
     /// index if this object is truly our child
-    fn child_bit_idx(&self, global_child_idx: usize) -> Option<usize> {
-        let bit_idx = global_child_idx.checked_sub(self.first_child_idx)?;
-        (bit_idx < self.num_children()).then_some(bit_idx)
-    }
-}
-
-/// [`HierarchicalState`] that's in the process of being built
-struct HierarchicalStateBuilder {
-    /// Affinity of the thread pool being built
-    cpuset: CpuSet,
-
-    /// Configurations for future workers attached to the tree
-    worker_configs: Vec<WorkerConfig>,
-
-    /// Public interfaces of workers attached to the tree
-    worker_interfaces: Vec<CachePadded<WorkerInterface>>,
-
-    /// Tree for local work availability signaling
-    work_availability_tree: Vec<Node>,
-}
-//
-impl HierarchicalStateBuilder {
-    /// Start building a [`HierarchicalState`] for a certain number of workers
-    fn new(topology: &Topology, affinity: &CpuSet) -> Self {
-        // Check if the affinity-restricted topology cpuset fits within
-        // implementation limits and results in a valid pool
-        crate::debug!("Setting up a thread pool with affinity {affinity}");
-        let cpuset = topology.cpuset() & affinity;
-        let num_workers = cpuset.weight().expect("topology cpuset should be finite");
-        crate::debug!(
-            "Affinity-constrainted topology has cpuset {cpuset} containing {num_workers} CPU(s)"
-        );
-        assert_ne!(
-            num_workers, 0,
-            "a thread pool without threads can't make progress and will deadlock on first request"
-        );
+    fn child_bit_idx(&self, global_child_idx: usize) -> usize {
+        let bit_idx = global_child_idx
+            .checked_sub(self.first_child_idx)
+            .expect("global index too low to be a child");
         assert!(
-            num_workers < WorkerFutex::MAX_WORKERS,
-            "number of worker threads is above implementation limits"
+            bit_idx < self.num_children(),
+            "global index too high to be a child"
         );
-
-        // Initialize inner data stores
-        Self {
-            cpuset,
-            worker_configs: Vec::with_capacity(num_workers),
-            worker_interfaces: Vec::with_capacity(num_workers),
-            work_availability_tree: Vec::new(),
-        }
+        bit_idx
     }
-
-    /// Affinity mask
-    fn cpuset(&self) -> &CpuSet {
-        &self.cpuset
-    }
-
-    /// Number of workers expected at the end of tree building
-    fn expected_workers(&self) -> usize {
-        assert_eq!(
-            self.worker_configs.capacity(),
-            self.worker_interfaces.capacity()
-        );
-        self.worker_configs.capacity()
-    }
-
-    /// Number of workers currently present in the tree
-    fn num_workers(&self) -> usize {
-        assert_eq!(self.worker_configs.len(), self.worker_interfaces.len());
-        self.worker_configs.len()
-    }
-
-    /// Index that the next inserted worker will get
-    fn next_worker_idx(&self) -> usize {
-        self.num_workers()
-    }
-
-    /// Number of nodes currently present in the tree
-    fn num_nodes(&self) -> usize {
-        self.work_availability_tree.len()
-    }
-
-    /// Index that the next inserted tree node will get
-    fn next_node_idx(&self) -> usize {
-        self.num_nodes()
-    }
-
-    /// Dump the current builder state as a trace log
-    fn trace_state(&self) {
-        crate::trace!(
-            "Tree at current depth:\n  \
-            worker_configs: {:?},\n  \
-            work_availability_tree: {:#?}",
-            self.worker_configs,
-            self.work_availability_tree
-        );
-    }
-
-    /// Add a [`TopologyObject`] to the tree
-    ///
-    /// Only normal objects (i.e. the root object + all of its transitive normal
-    /// children) should be passed into this method.
-    ///
-    /// If the [`TopologyObject`] is translated into a tree node, then provide a
-    /// list of children to be subsequently attached to that tree node, once we
-    /// start processing the next tree depth. Once all children are attached,
-    /// call `setup_children()` to finalize the tree node.
-    fn add_object<'object>(
-        &mut self,
-        parent_idx: Option<usize>,
-        mut object: &'object TopologyObject,
-    ) -> Option<ChildObjects<'object>> {
-        // Parameter validation
-        assert!(object.object_type().is_normal());
-
-        // Only the very first object of the tree will not have a parent, all
-        // subsequent objects should have a parent.
-        assert!(parent_idx.is_some() || (self.num_workers() == 0 && self.num_nodes() == 0));
-
-        // Discriminate between different kinds of children
-        let builder_cpuset = self.cpuset.clone();
-        let restricted_children = 'single_child: loop {
-            // Log current tree-building status, if enabled
-            crate::trace!("Evaluating child {object} for insertion in the tree");
-
-            // Count object CPUs
-            let object_cpuset = self.restrict_cpuset(object);
-            let num_cpus = object_cpuset
-                .weight()
-                .expect("topology objects should have finite cpusets");
-            crate::trace!(
-                "Child has affinity-constrained cpuset {object_cpuset} containing {num_cpus} CPU(s)"
-            );
-
-            // Classify object accordingly
-            match num_cpus {
-                // Children without CPUs should be ignored earlier
-                0 => unreachable!(
-                    "children without CPUs should have been weeded out in previous steps"
-                ),
-
-                // Single-CPU children are attached as workers
-                1 => {
-                    let cpu = object_cpuset
-                        .first_set()
-                        .expect("cpusets with weight == 1 should have one entry");
-                    self.add_worker(cpu);
-                    return None;
-                }
-
-                // Multi-CPU children contain multiple branches down
-                // their children subtree. We'll recurse down to
-                // that branch and add it as a node child.
-                _multiple => {
-                    // Filter out child objects by affinity
-                    let mut restricted_children = object.normal_children().filter(|child| {
-                        let child_cpuset =
-                            child.cpuset().expect("normal children should have cpusets");
-                        child_cpuset.intersects(&builder_cpuset)
-                    });
-
-                    // Exit child recursion loop once a child with
-                    // multiple significant children is detected
-                    if restricted_children.clone().count() > 1 {
-                        break 'single_child restricted_children;
-                    }
-
-                    // Single-child nodes are not significant for
-                    // tree building, ignore them and recurse into
-                    // their single child until a multi-child object
-                    // comes out.
-                    crate::trace!("Should not become a tree node as it only has one child, recursing to grandchild...");
-                    object = restricted_children
-                        .next()
-                        .expect("child count can't be zero if object has non-empty cpuset");
-                    let child_cpuset = self.restrict_cpuset(object);
-                    assert_eq!(
-                        child_cpuset,
-                        object_cpuset,
-                        "if an object has a single child, the child should have the same cpuset as the parent"
-                    );
-                    continue 'single_child;
-                }
-            }
-        };
-
-        // If control reached this point, then we have a hwloc
-        // topology tree node with multiple normal children on our
-        // hands. Translate this node into a tree node.
-        let num_children = restricted_children.clone().count();
-        crate::debug!(
-            "Will turn child {object} into a new tree node with {num_children} children \
-            + schedule granchildren for processing on next 'depth iteration"
-        );
-        assert!(
-            num_children > 1,
-            "only objects with multiple children should become nodes"
-        );
-        let new_node_idx = self.add_node(parent_idx);
-
-        // Collect children to be processed once we move to the next
-        // tree depth (next iteration of the 'depth loop).
-        Some(ChildObjects {
-            parent_idx: Some(new_node_idx),
-            objects: restricted_children.collect(),
-        })
-    }
-
-    /// Add a worker to the tree, without attaching it to a node yet
-    ///
-    /// Returns index of the freshly inserted worker.
-    fn add_worker(&mut self, cpu: BitmapIndex) -> usize {
-        assert!(self.num_workers() < self.expected_workers());
-        assert!(self.cpuset.is_set(cpu));
-        let (interface, work_queue) = WorkerInterface::with_work_queue();
-        let result = self.next_worker_idx();
-        self.worker_interfaces.push(CachePadded::new(interface));
-        self.worker_configs.push(WorkerConfig { work_queue, cpu });
-        result
-    }
-
-    /// Add a node to the tree, without any child attached yet
-    ///
-    /// Returns index of the freshly inserted node.
-    fn add_node(&mut self, parent_idx: Option<usize>) -> usize {
-        let result = self.next_node_idx();
-        self.work_availability_tree.push(Node {
-            parent_idx,
-            // Cannot fill in the details of the node until we've processed the
-            // children, but we have a "no children yet" placeholder state.
-            node_children: ChildrenLink::default(),
-            worker_children: ChildrenLink::default(),
-        });
-        result
-    }
-
-    /// Set up a node's children
-    ///
-    /// This should only be done once per node, at the point where all the
-    /// children of the node have been inserted.
-    fn setup_children(
-        &mut self,
-        node_idx: usize,
-        worker_children: ChildrenLink,
-        node_children: ChildrenLink,
-    ) {
-        // Basic input validation
-        assert!(node_idx < self.num_nodes());
-        let check_children = |link: &ChildrenLink, current_len: usize| {
-            assert!(link.first_child_idx + link.num_children() <= current_len);
-        };
-        check_children(&worker_children, self.num_workers());
-        check_children(&node_children, self.num_nodes());
-
-        // Make children-less nodes illegal
-        let num_children = node_children.num_children() + worker_children.num_children();
-        assert_ne!(
-            num_children, 0,
-            "nodes without children should be filtered out"
-        );
-
-        // Set the node's children descriptors
-        let node = &mut self.work_availability_tree[node_idx];
-        node.worker_children = worker_children;
-        node.node_children = node_children;
-    }
-
-    /// Finish building the tree
-    fn build(self) -> (Arc<HierarchicalState>, Box<[WorkerConfig]>) {
-        // Make sure the final state meets expectations
-        assert_eq!(self.worker_configs.len(), self.expected_workers());
-        assert_eq!(self.worker_interfaces.len(), self.expected_workers());
-
-        // Set up the global shared state
-        let result = Arc::new(HierarchicalState {
-            injector: Injector::new(),
-            workers: self.worker_interfaces.into(),
-            work_availability_tree: self.work_availability_tree.into(),
-        });
-        crate::debug!("Final worker configs: {:?}", self.worker_configs);
-        crate::debug!("Final tree: {result:#?}");
-        (result, self.worker_configs.into())
-    }
-
-    /// Apply our affinity mask to the cpuset of a [`TopologyObject`] proposed
-    /// for insertion into the tree
-    fn restrict_cpuset(&self, object: &TopologyObject) -> CpuSet {
-        assert!(object.object_type().is_normal());
-        let cpuset = object.cpuset().expect("normal objects should have cpusets");
-        cpuset & (&self.cpuset)
-    }
-}
-
-/// Topology objects that we need to eventually add to the tree
-#[derive(Debug)]
-struct ChildObjects<'topology> {
-    /// Parent node, if any
-    parent_idx: Option<usize>,
-
-    /// Hwloc objects attached to this parent node
-    objects: Vec<&'topology TopologyObject>,
 }
 
 #[cfg(test)]
@@ -680,6 +410,7 @@ pub(crate) mod tests {
                 // need a tree to synchronize with other workers.
                 if expected_num_workers == 1 {
                     assert_eq!(state.work_availability_tree.len(), 0);
+                    assert_eq!(state.workers[0].parent, None);
                     break 'check_tree;
                 }
                 assert!(state.work_availability_tree.len() >= 1);
@@ -690,30 +421,38 @@ pub(crate) mod tests {
                 let mut expected_next_node_idx = 1;
                 for (idx, node) in state.work_availability_tree.iter().enumerate() {
                     // All work availability bits should initially be empty
+                    let node_children = &node.object.node_children;
+                    let worker_children = &node.object.worker_children;
                     let check_work_unavailable = |children: &ChildrenLink| {
                         assert!(children
                             .work_availability
                             .iter()
                             .all(|bit| !bit.is_set(Ordering::Relaxed)));
                     };
-                    check_work_unavailable(&node.node_children);
-                    check_work_unavailable(&node.worker_children);
+                    check_work_unavailable(node_children);
+                    check_work_unavailable(worker_children);
 
-                    // Check parent index coherence
+                    // Check node parent index coherence
                     if idx == 0 {
-                        assert_eq!(node.parent_idx, None);
+                        assert_eq!(node.parent, None);
                     } else {
-                        assert_eq!(node.parent_idx, Some(expected_parents.pop_front().unwrap()));
+                        assert_eq!(node.parent, Some(expected_parents.pop_front().unwrap()));
                     }
-                    for _ in 0..node.node_children.num_children() {
+                    for _ in 0..node_children.num_children() {
                         expected_parents.push_back(idx);
                     }
 
+                    // Check worker parent index coherence
+                    for worker_child_idx in 0..worker_children.num_children() {
+                        let worker_idx = worker_children.first_child_idx + worker_child_idx;
+                        assert_eq!(state.workers[worker_idx].parent, Some(idx));
+                    }
+
                     // Check child index coherence
-                    assert_eq!(node.node_children.first_child_idx, expected_next_node_idx);
-                    expected_next_node_idx += node.node_children.num_children();
-                    assert_eq!(node.worker_children.first_child_idx, expected_next_worker_idx);
-                    expected_next_worker_idx += node.worker_children.num_children();
+                    assert_eq!(node_children.first_child_idx, expected_next_node_idx);
+                    expected_next_node_idx += node_children.num_children();
+                    assert_eq!(worker_children.first_child_idx, expected_next_worker_idx);
+                    expected_next_worker_idx += worker_children.num_children();
                 }
 
                 // The root node should indirectly point to all other trees or node

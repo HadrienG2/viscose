@@ -17,6 +17,7 @@ use crossbeam::{
 use hwlocality::{bitmap::BitmapIndex, cpu::cpuset::CpuSet, Topology};
 use std::{
     borrow::Borrow,
+    ops::Deref,
     sync::{atomic::Ordering, Arc},
 };
 
@@ -67,9 +68,9 @@ impl SharedState {
         let mut worker_configs = Vec::with_capacity(num_workers);
         let mut worker_interfaces = Vec::with_capacity(num_workers);
         for cpu in cpuset {
-            let (interface, work_queue) = WorkerInterface::with_work_queue();
+            let (config, interface) = new_worker(cpu);
+            worker_configs.push(config);
             worker_interfaces.push(CachePadded::new(interface));
-            worker_configs.push(WorkerConfig { work_queue, cpu });
         }
 
         // Set up global shared state
@@ -87,8 +88,8 @@ impl SharedState {
     }
 
     /// Access the worker interfaces
-    pub fn workers(&self) -> &[CachePadded<WorkerInterface>] {
-        &self.workers[..]
+    pub fn worker_interfaces(&self) -> impl Iterator<Item = &'_ WorkerInterface> {
+        self.workers.iter().map(Deref::deref)
     }
 
     /// Generate a worker-private work availability bit accessor
@@ -183,7 +184,7 @@ impl SharedState {
     }
 }
 
-/// State needed to configure a new worker
+/// Internal state needed to configure a new worker
 #[derive(Debug)]
 pub(crate) struct WorkerConfig {
     /// Work queue
@@ -203,15 +204,20 @@ pub(crate) struct WorkerInterface {
     /// instruct it what to do when it is awakened.
     pub futex: WorkerFutex,
 }
-//
-impl WorkerInterface {
-    /// Set up a worker's work queue and external interface
-    pub fn with_work_queue() -> (Self, deque::Worker<DynJob>) {
-        let worker = deque::Worker::new_lifo();
-        let interface = Self {
-            stealer: worker.stealer(),
-            futex: WorkerFutex::new(),
-        };
-        (interface, worker)
-    }
+
+/// Prepare to add a new worker to the thread pool
+///
+/// This builds both the internal state that will be used to configure the
+/// worker on startup and the external interface that will be used by the rest
+/// of the world to communicate with the worker.
+pub(crate) fn new_worker(cpu: BitmapIndex) -> (WorkerConfig, WorkerInterface) {
+    let config = WorkerConfig {
+        work_queue: deque::Worker::new_lifo(),
+        cpu,
+    };
+    let interface = WorkerInterface {
+        stealer: config.work_queue.stealer(),
+        futex: WorkerFutex::new(),
+    };
+    (config, interface)
 }

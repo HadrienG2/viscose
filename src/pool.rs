@@ -189,7 +189,7 @@ impl Drop for FlatPool {
         // Tell workers that no further work will be coming and wake them all up
         //
         // Need Release ordering to make sure they see all previous pushed work
-        for worker in self.shared.workers().iter() {
+        for worker in self.shared.worker_interfaces() {
             worker.futex.notify_shutdown(Ordering::Release);
         }
 
