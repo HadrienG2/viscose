@@ -50,6 +50,114 @@ impl HierarchicalStateBuilder {
         }
     }
 
+    /// Create a builder and fill its inner vecs following a certain topology
+    /// woth an associated affinity mask
+    pub fn from_topology_affinity(topology: &Topology, affinity: &CpuSet) -> Self {
+        // Start building the tree
+        let mut result = Self::new(topology, affinity);
+
+        // Double buffer of node with associated parent pointer in
+        // work_availability_tree, for current tree depth + next tree depth
+        let mut curr_child_objects = vec![ChildObjects {
+            parent_idx: None,
+            objects: vec![topology.root_object()],
+        }];
+        let mut next_child_objects = Vec::new();
+
+        // Start of tree nodes for parent depth
+        let mut first_node_at_prev_depth = 0;
+        'depths: while !curr_child_objects.is_empty() {
+            // Log current tree-building status, if enabled
+            crate::debug!("Starting a new tree layer...");
+            result.trace_state();
+
+            // End of tree nodes for parent depth
+            let first_node_at_this_depth = result.next_node_idx();
+
+            // At each depth, topology objects are grouped into child sets that
+            // represent group of children associated with the same parent node.
+            let mut saw_root_child_set = false;
+            'child_sets: for child_object_set in curr_child_objects.drain(..) {
+                // Check that what looks like a lone root node is truly alone
+                assert!(!saw_root_child_set, "root child set should be alone");
+
+                // Log current tree-building status, if enabled
+                crate::debug!(
+                    "Will now process children of tree node {:?}",
+                    child_object_set.parent_idx
+                );
+
+                // Track worker and node children
+                let first_child_node_idx = result.next_node_idx();
+                let first_child_worker_idx = result.next_worker_idx();
+
+                // Iterate over topology objects from the current child set
+                for object in child_object_set.objects {
+                    if let Some(child_objects) =
+                        result.add_object(child_object_set.parent_idx, object)
+                    {
+                        next_child_objects.push(child_objects);
+                    }
+                }
+
+                // At this point, we have collected all children of the active
+                // work availability tree node
+                let num_worker_children = result
+                    .num_workers()
+                    .checked_sub(first_child_worker_idx)
+                    .expect("number of workers can only increase");
+                let num_node_children = result
+                    .num_nodes()
+                    .checked_sub(first_child_node_idx)
+                    .expect("number of tree nodes can only increase");
+                crate::debug!(
+                    "Done processing children of node {:?}, with a total of {num_worker_children} worker(s) and {num_node_children} node(s)",
+                    child_object_set.parent_idx
+                );
+
+                // Handle edge cases without a parent node
+                let Some(parent_idx) = child_object_set.parent_idx else {
+                    match result.num_nodes() {
+                        0 => {
+                            assert!(
+                                result.expected_workers() == 1
+                                    && num_worker_children == 1
+                                    && num_node_children == 0,
+                                "parent-less node in a worker-only tree is \
+                                only expected in a uniprocessor environment"
+                            );
+                            crate::debug!("No parent node due to uniprocessor edge case");
+                            break 'depths;
+                        }
+                        1 => {
+                            saw_root_child_set = true;
+                            crate::debug!("This is the root node, there is no parent to set up");
+                            continue 'child_sets;
+                        }
+                        _more => unreachable!("unexpected parent-less node"),
+                    }
+                };
+
+                // Attach children to parent node
+                crate::debug!("Will now attach children to parent node");
+                assert!(
+                    parent_idx >= first_node_at_prev_depth && parent_idx < first_node_at_this_depth,
+                    "parent should be within last tree layer"
+                );
+                result.setup_children(
+                    parent_idx,
+                    ChildrenLink::new(first_child_worker_idx, num_worker_children),
+                    ChildrenLink::new(first_child_node_idx, num_node_children),
+                );
+            }
+
+            // Done with this tree layer, go to next depth
+            std::mem::swap(&mut curr_child_objects, &mut next_child_objects);
+            first_node_at_prev_depth = first_node_at_this_depth;
+        }
+        result
+    }
+
     /// Number of workers expected at the end of tree building
     pub fn expected_workers(&self) -> usize {
         assert_eq!(
