@@ -1,7 +1,7 @@
 //! Set of flags that can be atomically set, checked or unset
 
 pub(crate) mod bitref;
-mod iter;
+pub(crate) mod iter;
 
 use self::{bitref::BitRef, iter::NearestBitIterator};
 #[cfg(test)]

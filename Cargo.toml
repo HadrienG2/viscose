@@ -48,6 +48,7 @@ default = ["detect-excessive-joins", "bench"]
 # Core dependencies
 atomic-wait = { version = "1.1.0", default-features = false }
 crossbeam = { version = "0.8.2", features = ["crossbeam-deque"] }
+genawaiter = { version = "0.99", default-features = false }
 hwlocality = { git = "https://github.com/HadrienG2/hwlocality.git", features = ["hwloc-2_2_0", "proptest"] }
 rand = "0.8"
 
