@@ -111,7 +111,7 @@ impl HierarchicalState {
 
         // Nodes that we are going to process next in the subtree of the current
         // ancestor. The thief is not a descendent of any of these nodes.
-        let mut next_foreign_nodes = VecDeque::new();
+        let mut next_subtree_nodes = VecDeque::new();
 
         // Yield iterator over increasingly remote workers
         // NOTE: genawaiter is just used as a convenience here as the iterator
@@ -140,12 +140,12 @@ impl HierarchicalState {
                 if let Some(node_bit) = thief_bit.take_node() {
                     if let Some(nodes) = node.node_children.find_relatives_to_rob(node_bit, load) {
                         for node_idx in nodes {
-                            next_foreign_nodes.push_back(node_idx);
+                            next_subtree_nodes.push_back(node_idx);
                         }
                     }
                 } else if let Some(nodes) = node.node_children.find_strangers_to_rob(load) {
                     for node_idx in nodes {
-                        next_foreign_nodes.push_back(node_idx);
+                        next_subtree_nodes.push_back(node_idx);
                     }
                 }
 
@@ -153,7 +153,7 @@ impl HierarchicalState {
                 // next. First check if there are more nodes to process in the
                 // subtree of the current ancestor. Process subtree nodes
                 // breadth-first for an optimal memory access pattern.
-                if let Some(next_node_idx) = next_foreign_nodes.pop_front() {
+                if let Some(next_node_idx) = next_subtree_nodes.pop_front() {
                     node_idx = next_node_idx;
                     continue 'process_node;
                 }
@@ -320,11 +320,9 @@ impl ChildrenLink {
         let start_bit_idx = rng.gen_range(0..work_availability.len());
         let start_bit = work_availability.bit(start_bit_idx);
 
-        // FIXME: Don't use NearestBitIterator here, just iterate linearly
-        //        over set flags starting from a random starting point, i.e.
-        //        consider flags x..N then flags 0..x. Add a new AtomicFlags
-        //        iterator type for this, call it maybe LinearBitIterator.
-        let bit_iter = work_availability.iter_set_around::<true, false>(&start_bit, load)?;
+        // Iterate over all set work availability bits, starting from that point
+        // of the work availability flags and wrapping around
+        let bit_iter = work_availability.iter_set(&start_bit, load)?;
         Some(bit_iter.map(|bit| self.first_child_idx + bit.linear_idx(work_availability)))
     }
 

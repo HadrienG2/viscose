@@ -113,7 +113,11 @@ impl<'flags, const CACHE_SEARCH_MASKS: bool> BitRef<'flags, CACHE_SEARCH_MASKS> 
     }
 
     /// Number of left bit shifts from `origin` to `self`
-    pub fn offset_from(&self, origin: &Self, flags: &'flags AtomicFlags) -> usize {
+    pub fn offset_from<const OTHER_CACHE: bool>(
+        &self,
+        origin: &BitRef<'flags, OTHER_CACHE>,
+        flags: &'flags AtomicFlags,
+    ) -> usize {
         self.linear_idx(flags) - origin.linear_idx(flags)
     }
 

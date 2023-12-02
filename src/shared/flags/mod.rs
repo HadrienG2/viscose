@@ -3,7 +3,10 @@
 pub(crate) mod bitref;
 pub(crate) mod iter;
 
-use self::{bitref::BitRef, iter::NearestBitIterator};
+use self::{
+    bitref::BitRef,
+    iter::{BitIterator, NearestBitIterator},
+};
 #[cfg(test)]
 use proptest::prelude::*;
 use std::{
@@ -91,9 +94,43 @@ impl AtomicFlags {
             .for_each(|word| word.store(0, Ordering::Relaxed));
     }
 
-    /// Iterate over all bits in the flags
-    pub fn iter<'self_>(&'self_ self) -> impl Iterator<Item = BitRef<'self_, false>> + 'self_ {
-        (0..self.len()).map(|bit_idx| self.bit(bit_idx))
+    /// Iterate over the global bit positions of set flags, starting and ending
+    /// at a certain position with circular wraparound
+    ///
+    /// This is basically an optimized version of
+    ///
+    /// ```rust,ignore
+    /// self.iter().skip(start_idx + 1)
+    ///     .chain(self.iter().take(start_idx + 1))
+    ///     .filter(|bit| bit.is_set())
+    /// ```
+    pub fn iter_set<'self_, const CACHE_SEARCH_MASKS: bool>(
+        &'self_ self,
+        start: &BitRef<'self_, CACHE_SEARCH_MASKS>,
+        order: Ordering,
+    ) -> Option<impl Iterator<Item = BitRef<'self_, false>> + Clone + FusedIterator + 'self_> {
+        let first = self.bit(0);
+        let start_idx = start.linear_idx(self);
+        Some(
+            // Start iterating at specified position, ignore absence of output.
+            BitIterator::<true, true>::new(self, start, order)
+                .into_iter()
+                .flatten()
+                .chain(
+                    // Once first iterator is done, resume from the beginning.
+                    // First emit first bit if appropriate...
+                    std::iter::once(first.clone()).filter(move |first| first.is_set(order)),
+                )
+                .chain(
+                    // ...then emit remaining bits, ignoring absence of output.
+                    BitIterator::<true, true>::new(self, &first, order)
+                        .into_iter()
+                        .flatten()
+                        // ...and end iteration at initial starting point,
+                        // inclusive because BitIterator is exclusive.
+                        .take_while(move |bit| bit.linear_idx(self) <= start_idx),
+                ),
+        )
     }
 
     /// Iterate over the global bit positions of set flags at increasing
@@ -118,6 +155,21 @@ impl AtomicFlags {
         order: Ordering,
     ) -> Option<NearestBitIterator<'self_, false, INCLUDE_CENTER>> {
         NearestBitIterator::<false, INCLUDE_CENTER>::new(self, center, order)
+    }
+
+    /// Iterate over all bits in the flags
+    ///
+    /// This iterator is not particularly optimized for performance and only
+    /// meant to be used for validation purposes.
+    #[cfg(test)]
+    pub(crate) fn iter(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = BitRef<'_, false>>
+           + Clone
+           + ExactSizeIterator
+           + FusedIterator
+           + '_ {
+        (0..self.len()).map(|bit_idx| self.bit(bit_idx))
     }
 
     /// Iterate over the value of inner words
@@ -306,9 +358,7 @@ pub(crate) mod tests {
             prop_assert_eq!(hasher.hash_one(&clone), hasher.hash_one(&flags));
             prop_assert!(flags.words(Ordering::Relaxed).eq(flags.words.iter().map(|word| word.load(Ordering::Relaxed))));
         }
-    }
 
-    proptest! {
         #[test]
         fn op_idx((flags, bit_idx) in flags_and_bit_idx()) {
             let initial_flags = flags.clone();
@@ -318,6 +368,18 @@ pub(crate) mod tests {
             let bit = bit_ref.bit_mask();
             prop_assert_eq!(word_idx, bit_idx / WORD_BITS);
             prop_assert_eq!(bit, 1 << (bit_idx % WORD_BITS));
+            prop_assert_eq!(&flags, &initial_flags);
+
+            let iter_set_out =
+                flags.iter_set(&bit_ref, Ordering::Relaxed)
+                    .into_iter().flatten()
+                    .collect::<Vec<_>>();
+            let expected_iter_set_out =
+                flags.iter().skip(bit_idx + 1)
+                    .chain(flags.iter().take(bit_idx + 1))
+                    .filter(|bit| bit.is_set(Ordering::Relaxed))
+                    .collect::<Vec<_>>();
+            prop_assert_eq!(iter_set_out, expected_iter_set_out);
             prop_assert_eq!(&flags, &initial_flags);
 
             let is_set = bit_ref.is_set(Ordering::Relaxed);

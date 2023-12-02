@@ -95,7 +95,7 @@ impl<const FIND_SET: bool, const INCLUDE_CENTER: bool> FusedIterator
 /// - `GOING_LEFT` tells whether we're going towards high-order bits (left side)
 ///   or towards low-order bits (right side)
 #[derive(Clone)]
-struct BitIterator<'flags, const FIND_SET: bool, const GOING_LEFT: bool> {
+pub(crate) struct BitIterator<'flags, const FIND_SET: bool, const GOING_LEFT: bool> {
     /// Shared iteration state
     shared: SharedState<'flags>,
 
@@ -123,8 +123,8 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
     /// Start iteration
     ///
     /// The bit at initial position `after` will not be emitted.
-    #[cfg(test)]
-    pub fn new<const CACHE_SEARCH_MASKS: bool>(
+    #[inline]
+    pub(crate) fn new<const CACHE_SEARCH_MASKS: bool>(
         flags: &'flags AtomicFlags,
         after: &BitRef<'flags, CACHE_SEARCH_MASKS>,
         order: Ordering,
@@ -136,7 +136,7 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
 
     /// Start iteration from a prepared initial state
     #[inline]
-    pub(crate) fn from_initial_state(initial: InitialState<'flags>) -> Self {
+    fn from_initial_state(initial: InitialState<'flags>) -> Self {
         let InitialState {
             shared,
             word_idx,
@@ -414,7 +414,7 @@ mod tests {
     use crate::shared::flags::tests::flags_and_bit_idx;
     use proptest::prelude::*;
 
-    /// Check outcome of iterating over FlagIdxIterator
+    /// Check output of BitIterator
     fn check_iterate<const FIND_SET: bool, const GOING_LEFT: bool>(
         flags: &AtomicFlags,
         start_idx: usize,
@@ -447,7 +447,7 @@ mod tests {
         Ok(())
     }
 
-    /// Check outcome of iterating over NearestFlagIterator
+    /// Check output of NearestBitIterator
     fn check_nearest<const FIND_SET: bool, const INCLUDE_CENTER: bool>(
         flags: &AtomicFlags,
         center_idx: usize,
@@ -504,6 +504,4 @@ mod tests {
             check_nearest::<true, true>(&flags, start_idx)?;
         }
     }
-
-    // TODO: Moar tests
 }
