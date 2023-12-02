@@ -119,7 +119,7 @@ impl HierarchicalState {
         //       hand. But if genawaiter shows up too much in perf profiles,
         //       just bite the bullet and implement the iterator manually...
         Some(genawaiter::rc::Gen::new(|co| async move {
-            'process_node: loop {
+            'process_nodes: loop {
                 // Access the current node
                 let node = &self.work_availability_tree[node_idx].object;
 
@@ -155,7 +155,7 @@ impl HierarchicalState {
                 // breadth-first for an optimal memory access pattern.
                 if let Some(next_node_idx) = next_subtree_nodes.pop_front() {
                     node_idx = next_node_idx;
-                    continue 'process_node;
+                    continue 'process_nodes;
                 }
 
                 // If we ran out of nodes, then it means we're done exploring
@@ -163,7 +163,7 @@ impl HierarchicalState {
                 // time to go to the next ancestor.
                 let Some(node_bit) = ancestor_bits.next() else {
                     // ...or end the search if we've run out of ancestors.
-                    break 'process_node;
+                    break 'process_nodes;
                 };
                 let ancestor = &self.work_availability_tree[ancestor_idx];
                 ancestor_idx = ancestor.parent.expect(
@@ -317,6 +317,9 @@ impl ChildrenLink {
         // not end up always hammering the same targets.
         let mut rng = rand::thread_rng();
         let work_availability = &self.work_availability;
+        if work_availability.is_empty() {
+            return None;
+        }
         let start_bit_idx = rng.gen_range(0..work_availability.len());
         let start_bit = work_availability.bit(start_bit_idx);
 
@@ -381,7 +384,7 @@ impl<'a> ThiefBit<'a> {
 pub(crate) mod tests {
     use super::*;
     use proptest::prelude::*;
-    use std::{collections::VecDeque, sync::atomic::Ordering};
+    use std::{collections::{VecDeque, HashSet}, sync::atomic::Ordering};
 
     /// Arbitrary HierarchicalState
     ///
@@ -481,6 +484,159 @@ pub(crate) mod tests {
                 assert_eq!(expected_next_worker_idx, state.workers.len());
                 assert_eq!(expected_next_node_idx, state.work_availability_tree.len());
             }
+        }
+    }
+
+    /// Generate a HierarchicalState and a valid worker index in that state
+    fn state_and_worker_idx() -> impl Strategy<Value = (Arc<HierarchicalState>, usize)> {
+        hierarchical_state().prop_flat_map(|state| {
+            let num_workers = state.workers.len();
+            (Just(state), 0..num_workers)
+        })
+    }
+
+    proptest! {
+        /// Test search for work to steal
+        #[test]
+        fn find_work_to_steal((state, thief_idx) in state_and_worker_idx()) {
+            // Determine set of possible work-stealing victims
+            let mut remaining_victims = state.work_availability_tree.iter().flat_map(|node| {
+                let workers = &node.object.worker_children;
+                workers.find_strangers_to_rob(Ordering::Relaxed).into_iter().flatten()
+            }).collect::<HashSet<_>>();
+
+            // Compute all useful flavors of worker ancestor path
+            let ancestor_nodes = |worker_idx: usize| std::iter::successors(
+                state.workers[worker_idx].parent,
+                |&parent_idx| state.work_availability_tree[parent_idx].parent
+            );
+            let thief_ancestor_nodes = ancestor_nodes(thief_idx).collect::<Vec<_>>();
+            let thief_availability = state.worker_availability(thief_idx);
+
+            // Track how far away the last observed victim was
+            let mut last_common_ancestor_height = 0;
+            let mut last_common_ancestor_child_distance = 0;
+            let mut last_victim_depth = 0;
+
+            // Check find_work_to_steal enumerates victims in the expected order
+            let victims =
+                state
+                    .find_work_to_steal(thief_idx, &thief_availability, Ordering::Relaxed)
+                    .into_iter().flatten();
+            for victim_idx in victims {
+                // Make sure this was an expected work-stealing victim and that
+                // this victim has only been yielded once
+                assert!(remaining_victims.remove(&victim_idx));
+
+                // Find common ancestor of thief and victim, and its direct node 
+                // child pointing towards the victim
+                let mut common_ancestor_node_child = None;
+                let (height_above_victim, height_above_thief) =
+                    // First enumerate ancestors of the victim + their height
+                    ancestor_nodes(victim_idx).enumerate()
+                        .find_map(|(height_above_victim, victim_ancestor)| {
+                            // Then find height of matching thief ancestor
+                            let result = thief_ancestor_nodes.iter()
+                                .position(|&thief_ancestor| thief_ancestor == victim_ancestor)
+                                // If search succeeds, we only care about the
+                                // height of the common ancestor above the
+                                // victim and the thief.
+                                .map(|height_above_thief| (height_above_victim, height_above_thief));
+                            // Track the last victim ancestor for which search
+                            // fails, this will be the direct common ancestor
+                            // node child pointing towards the victim.
+                            if result.is_none() {
+                                common_ancestor_node_child = Some(victim_ancestor);
+                            }
+                            result
+                        })
+                        .expect("thief and victim should share a common ancestor");
+
+                    // Check that victims are ordered by increasing common
+                    // ancestor height: the highest the common ancestor is, the
+                    // more expensive it will be to synchronize with the victim.
+                    use std::cmp::Ordering as CmpOrdering;
+                    match height_above_thief.cmp(&last_common_ancestor_height) {
+                        CmpOrdering::Less => panic!("victims are not ordered by ancestor height"),
+                        CmpOrdering::Equal => {}
+                        CmpOrdering::Greater => {
+                            // Going to a higher common ancestor resets all
+                            // other victim ordering tracking variables
+                            last_common_ancestor_height = height_above_thief;
+                            last_common_ancestor_child_distance = 0;
+                            last_victim_depth = height_above_victim;
+                        }
+                    }
+
+                    // Check that victims below a given common ancestor are
+                    // ordered by increasing victim depth. Deeper victims are
+                    // more expensive to enumerate as more of the tree must be
+                    // traversed to query their state, so they should come last.
+                    match height_above_victim.cmp(&last_victim_depth) {
+                        CmpOrdering::Less => panic!("victims are not ordered by depth below common ancestor"),
+                        CmpOrdering::Equal => {}
+                        CmpOrdering::Greater => {
+                            last_victim_depth = height_above_victim;
+                        }
+                    }
+
+                    // Check that victims are ordered by increasing common
+                    // ancestor child index distance. There is no strong
+                    // rationale for this, but it balances work stealing without
+                    // randomization and could ensure better performance if
+                    // hwloc/OS enumeration is done in such a way that hardware
+                    // with close indices is located closer to each other.
+                    let child_distance = match (height_above_thief, (height_above_victim, common_ancestor_node_child)) {
+                        // If the victim is a worker child of the common
+                        // ancestor, it should not have node ancestors
+                        (_, (0, Some(_))) => unreachable!(),
+
+                        // Thief and victim are both direct worker children of
+                        // the common ancestor: use worker child distance
+                        (0, (0, None)) => thief_idx.abs_diff(victim_idx),
+
+                        // Thief is a worker child of the common ancestor but
+                        // victim is below a node child of the common ancestor:
+                        // use an artificial distance to order this after worker
+                        // victims, since node children of the common ancestor
+                        // should be enumerated after worker children
+                        (0, (_, Some(_))) => usize::MAX,
+
+                        // If the victim is below a node child of the common
+                        // ancestor, it should have node ancestors
+                        (0, (_, None)) => unreachable!(),
+
+                        // At this point, we've covered all cases where
+                        // height_above_thief == 0, so we've established the
+                        // thief is below a node child of the common ancestor.
+                        //
+                        // Order victims that are direct worker children of the
+                        // common ancestor first, as the zero distance...
+                        (_, (0, None)) => 0,
+
+                        // ...then victims which are descendants of a node child
+                        // of the common ancestor, shifting distances above the
+                        // artificial zero distance that was already used.
+                        (_, (_, Some(victim_child_idx))) => 1 + {
+                            let thief_child_idx = thief_ancestor_nodes[height_above_thief - 1];
+                            thief_child_idx.abs_diff(victim_child_idx)
+                        },
+
+                        // Once again, if the victim is below a node child of
+                        // the common ancestor, it should have node ancestors
+                        (_, (_, None)) => unreachable!(),
+                    };
+                    match child_distance.cmp(&last_common_ancestor_child_distance) {
+                        CmpOrdering::Less => panic!("victims are not ordered by common ancestor child distance"),
+                        CmpOrdering::Equal => {}
+                        CmpOrdering::Greater => {
+                            last_common_ancestor_child_distance = child_distance;
+                        }
+                    }
+            }
+
+            // Check find_work_to_steal enumerates all victims
+            assert!(remaining_victims.is_empty());
         }
     }
 }
