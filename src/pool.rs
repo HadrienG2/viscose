@@ -13,6 +13,7 @@ use hwlocality::{
     cpu::{binding::CpuBindingFlags, cpuset::CpuSet},
     topology::Topology,
 };
+use rand::Rng;
 use std::{
     borrow::Borrow,
     collections::HashMap,
@@ -160,8 +161,14 @@ impl FlatPool {
             .cpu_to_worker
             .get(&caller_cpu.first_set().unwrap())
             .copied()
-            // FIXME: Pick true closest CPU
-            .unwrap_or(self.workers.len() / 2);
+            // FIXME: Pick true closest CPU instead of a random one, this can be
+            //        done using a common ancestor search in the topology but I
+            //        should probably cache the search results for every
+            //        topology CPU to speed up lookup.
+            .unwrap_or_else(|| {
+                let mut rng = rand::thread_rng();
+                rng.gen_range(0..self.workers.len())
+            });
 
         // Schedule the work to be executed
         self.shared.inject_job(job, best_worker_idx);
