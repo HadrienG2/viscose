@@ -104,7 +104,7 @@ impl HierarchicalState {
         //
         // - Don't need AcqRel (which would require replacing the load with a
         //   RMW) since we're not trying to get any other thread in sync with
-        //   our current state.
+        //   our current state during this transaction.
         // - Don't need SeqCst since there is no need for everyone to agree on
         //   the global order in which workers look for work.
         let load = Ordering::Acquire;
