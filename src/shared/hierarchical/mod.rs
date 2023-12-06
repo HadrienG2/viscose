@@ -295,10 +295,17 @@ impl ChildrenLink {
         thief_bit: &BitRef<'self_, true>,
         load: Ordering,
     ) -> Option<impl Iterator<Item = usize> + 'self_> {
-        // Need at least Acquire ordering to ensure work is visible
-        let load = crate::at_least_acquire(load);
-        let bit_iter = self.work_availability.iter_set_around::<false, true>(thief_bit, load)?;
-        Some(bit_iter.map(|bit| self.first_child_idx + bit.linear_idx(&self.work_availability)))
+        self.find_relatives_around(thief_bit, load, AtomicFlags::iter_set_around::<false, true>)
+    }
+
+    /// Like `find_relatives_to_rob`, but finds relatives that are looking for
+    /// work instead of relatives that might have extra work to give
+    pub fn find_jobless_relatives<'self_>(
+        &'self_ self,
+        giver_bit: &BitRef<'self_, true>,
+        load: Ordering,
+    ) -> Option<impl Iterator<Item = usize> + 'self_> {
+        self.find_relatives_around(giver_bit, load, AtomicFlags::iter_unset_around::<false, true>)
     }
 
     /// Find children that might have work to steal
@@ -309,6 +316,67 @@ impl ChildrenLink {
         &self,
         load: Ordering,
     ) -> Option<impl Iterator<Item = usize> + '_> {
+        self.find_strangers(load, AtomicFlags::iter_set_from)
+    }
+
+    /// Find children that are looking for work
+    ///
+    /// Like `find_stranger_to_rob`, but finds children that are looking ofr
+    /// work instead of children that might have extra work to give
+    pub fn find_jobless_stranger(
+        &self,
+        load: Ordering
+    ) -> Option<impl Iterator<Item = usize> + '_> {
+        self.find_strangers(load, AtomicFlags::iter_unset_from)
+    }
+
+    /// Translate a global child object index into a local work availability bit
+    /// index if this object is truly our child
+    fn child_bit_idx(&self, global_child_idx: usize) -> usize {
+        let bit_idx = global_child_idx
+            .checked_sub(self.first_child_idx)
+            .expect("global index too low to be a child");
+        assert!(
+            bit_idx < self.num_children(),
+            "global index too high to be a child"
+        );
+        bit_idx
+    }
+
+    /// Find children that might have/want work to steal around a certain child
+    ///
+    /// This is the common subset of `find_relatives_to_rob` and
+    /// `find_jobless_relatives`. `iter_around` should be set to
+    /// `AtomicFlags::iter_set_around` if you want to steal work and
+    /// `AtomicFlags::iter_unset_around` if you want to give work, in both case
+    /// with `INCLUDE_CENTER` set to false and `CACHE_SEARCH_MASKS` set to true.
+    pub fn find_relatives_around<'self_, IterAround>(
+        &'self_ self,
+        center_bit: &BitRef<'self_, true>,
+        load: Ordering,
+        iter_around: impl FnOnce(&'self_ AtomicFlags, &BitRef<'self_, true>, Ordering) -> Option<IterAround>
+    ) -> Option<impl Iterator<Item = usize> + 'self_>
+        where IterAround: Iterator<Item = BitRef<'self_, false>> + 'self_
+    {
+        // Need at least Acquire ordering to ensure work is visible
+        let load = crate::at_least_acquire(load);
+        let bit_iter = iter_around(&self.work_availability, center_bit, load)?;
+        Some(bit_iter.map(|bit| self.first_child_idx + bit.linear_idx(&self.work_availability)))
+    }
+
+    /// Find children that might have/want work to steal
+    ///
+    /// This is the common subset of `find_strangers_to_rob` and
+    /// `find_jobless_stranger`. `iter_from` should be set to
+    /// `AtomicFlags::iter_set_from` if you want to steal work and
+    /// `AtomicFlags::iter_unset_from` if you want to give work.
+    pub fn find_strangers<'self_, IterFrom>(
+        &'self_ self,
+        load: Ordering,
+        iter_from: impl FnOnce(&'self_ AtomicFlags, &BitRef<'self_, false>, Ordering) -> Option<IterFrom>,
+    ) -> Option<impl Iterator<Item = usize> + 'self_>
+        where IterFrom: Iterator<Item = BitRef<'self_, false>> + 'self_
+    {
         // Need at least Acquire ordering to ensure work is visible
         let load = crate::at_least_acquire(load);
 
@@ -324,21 +392,8 @@ impl ChildrenLink {
 
         // Iterate over all set work availability bits, starting from that point
         // of the work availability flags and wrapping around
-        let bit_iter = work_availability.iter_set(&start_bit, load)?;
+        let bit_iter = iter_from(work_availability, &start_bit, load)?;
         Some(bit_iter.map(|bit| self.first_child_idx + bit.linear_idx(work_availability)))
-    }
-
-    /// Translate a global child object index into a local work availability bit
-    /// index if this object is truly our child
-    fn child_bit_idx(&self, global_child_idx: usize) -> usize {
-        let bit_idx = global_child_idx
-            .checked_sub(self.first_child_idx)
-            .expect("global index too low to be a child");
-        assert!(
-            bit_idx < self.num_children(),
-            "global index too high to be a child"
-        );
-        bit_idx
     }
 }
 
