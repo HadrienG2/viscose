@@ -104,33 +104,30 @@ impl AtomicFlags {
     ///     .chain(self.iter().take(start_idx + 1))
     ///     .filter(|bit| bit.is_set())
     /// ```
-    pub fn iter_set<'self_, const CACHE_SEARCH_MASKS: bool>(
+    pub fn iter_set_from<'self_, const CACHE_SEARCH_MASKS: bool>(
         &'self_ self,
         start: &BitRef<'self_, CACHE_SEARCH_MASKS>,
         order: Ordering,
     ) -> Option<impl Iterator<Item = BitRef<'self_, false>> + Clone + FusedIterator + 'self_> {
-        let first = self.bit(0);
-        let start_idx = start.linear_idx(self);
-        Some(
-            // Start iterating at specified position, ignore absence of output.
-            BitIterator::<true, true>::new(self, start, order)
-                .into_iter()
-                .flatten()
-                .chain(
-                    // Once first iterator is done, resume from the beginning.
-                    // First emit first bit if appropriate...
-                    std::iter::once(first.clone()).filter(move |first| first.is_set(order)),
-                )
-                .chain(
-                    // ...then emit remaining bits, ignoring absence of output.
-                    BitIterator::<true, true>::new(self, &first, order)
-                        .into_iter()
-                        .flatten()
-                        // ...and end iteration at initial starting point,
-                        // inclusive because BitIterator is exclusive.
-                        .take_while(move |bit| bit.linear_idx(self) <= start_idx),
-                ),
-        )
+        self.iter_from::<true, CACHE_SEARCH_MASKS>(start, order)
+    }
+
+    /// Iterate over the global bit positions of set flags, starting and ending
+    /// at a certain position with circular wraparound
+    ///
+    /// This is basically an optimized version of
+    ///
+    /// ```rust,ignore
+    /// self.iter().skip(start_idx + 1)
+    ///     .chain(self.iter().take(start_idx + 1))
+    ///     .filter(|bit| !bit.is_set())
+    /// ```
+    pub fn iter_unset_from<'self_, const CACHE_SEARCH_MASKS: bool>(
+        &'self_ self,
+        start: &BitRef<'self_, CACHE_SEARCH_MASKS>,
+        order: Ordering,
+    ) -> Option<impl Iterator<Item = BitRef<'self_, false>> + Clone + FusedIterator + 'self_> {
+        self.iter_from::<false, CACHE_SEARCH_MASKS>(start, order)
     }
 
     /// Iterate over the global bit positions of set flags at increasing
@@ -197,6 +194,46 @@ impl AtomicFlags {
         } else {
             NonZeroWord::new((1 << num_bits) - 1).unwrap()
         }
+    }
+
+    /// Iterate over the global bit positions of set or unset flags, starting
+    /// and ending at a certain position with circular wraparound
+    ///
+    /// This is basically an optimized version of
+    ///
+    /// ```rust,ignore
+    /// self.iter().skip(start_idx + 1)
+    ///     .chain(self.iter().take(start_idx + 1))
+    ///     .filter(|bit| bit.is_set() == FIND_SET)
+    /// ```
+    pub fn iter_from<'self_, const FIND_SET: bool, const CACHE_SEARCH_MASKS: bool>(
+        &'self_ self,
+        start: &BitRef<'self_, CACHE_SEARCH_MASKS>,
+        order: Ordering,
+    ) -> Option<impl Iterator<Item = BitRef<'self_, false>> + Clone + FusedIterator + 'self_> {
+        let first = self.bit(0);
+        let start_idx = start.linear_idx(self);
+        Some(
+            // Start iterating at specified position, ignore absence of output.
+            BitIterator::<FIND_SET, true>::new(self, start, order)
+                .into_iter()
+                .flatten()
+                .chain(
+                    // Once first iterator is done, resume from the beginning.
+                    // Emit first bit if appropriate...
+                    std::iter::once(first.clone())
+                        .filter(move |first| first.is_set(order) == FIND_SET),
+                )
+                .chain(
+                    // ...then emit remaining bits, ignoring absence of output.
+                    BitIterator::<FIND_SET, true>::new(self, &first, order)
+                        .into_iter()
+                        .flatten()
+                        // ...and end iteration at initial starting point,
+                        // inclusive because BitIterator is exclusive.
+                        .take_while(move |bit| bit.linear_idx(self) <= start_idx),
+                ),
+        )
     }
 }
 //
@@ -371,7 +408,7 @@ pub(crate) mod tests {
             prop_assert_eq!(&flags, &initial_flags);
 
             let iter_set_out =
-                flags.iter_set(&bit_ref, Ordering::Relaxed)
+                flags.iter_set_from(&bit_ref, Ordering::Relaxed)
                     .into_iter().flatten()
                     .collect::<Vec<_>>();
             let expected_iter_set_out =
@@ -380,6 +417,18 @@ pub(crate) mod tests {
                     .filter(|bit| bit.is_set(Ordering::Relaxed))
                     .collect::<Vec<_>>();
             prop_assert_eq!(iter_set_out, expected_iter_set_out);
+            prop_assert_eq!(&flags, &initial_flags);
+
+            let iter_unset_out =
+                flags.iter_unset_from(&bit_ref, Ordering::Relaxed)
+                    .into_iter().flatten()
+                    .collect::<Vec<_>>();
+            let expected_iter_unset_out =
+                flags.iter().skip(bit_idx + 1)
+                    .chain(flags.iter().take(bit_idx + 1))
+                    .filter(|bit| !bit.is_set(Ordering::Relaxed))
+                    .collect::<Vec<_>>();
+            prop_assert_eq!(iter_unset_out, expected_iter_unset_out);
             prop_assert_eq!(&flags, &initial_flags);
 
             let is_set = bit_ref.is_set(Ordering::Relaxed);
