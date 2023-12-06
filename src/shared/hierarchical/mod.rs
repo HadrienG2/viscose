@@ -52,14 +52,9 @@ impl HierarchicalState {
         HierarchicalStateBuilder::from_topology_affinity(topology, affinity.borrow()).build()
     }
 
-    /// Access the global work injector
-    pub fn injector(&self) -> &Injector<DynJob> {
-        &self.injector
-    }
-
-    /// Access the worker futexes
-    pub fn worker_futexes(&self) -> impl Iterator<Item = &'_ WorkerFutex> {
-        self.workers.iter().map(|child| &child.object.futex)
+    /// Access the worker interfaces
+    pub fn worker_interfaces(&self) -> impl Iterator<Item = &'_ WorkerInterface> {
+        self.workers.iter().map(|child| &child.object)
     }
 
     /// Generate a worker-private work availability path

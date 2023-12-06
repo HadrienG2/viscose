@@ -2,7 +2,6 @@
 
 use crate::{
     shared::{
-        futex::StealLocation,
         job::{AbortOnUnwind, DynJob, Job, Notify},
         SharedState,
     },
@@ -165,16 +164,7 @@ impl FlatPool {
             .unwrap_or(self.workers.len() / 2);
 
         // Schedule the work to be executed
-        self.shared.injector().push(job);
-
-        // Find the nearest available thread and recommend it to process this
-        //
-        // Need Release ordering to make sure they see the pushed work
-        self.shared.suggest_stealing::<true, false>(
-            &self.shared.work_availability.bit(best_worker_idx),
-            StealLocation::Injector,
-            Ordering::Release,
-        );
+        self.shared.inject_job(job, best_worker_idx);
     }
 }
 //

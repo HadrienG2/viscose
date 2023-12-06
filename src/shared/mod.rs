@@ -11,7 +11,7 @@ use self::{
     job::DynJob,
 };
 use crossbeam::{
-    deque::{self, Injector, Stealer},
+    deque::{self, Injector, Steal, Stealer},
     utils::CachePadded,
 };
 use hwlocality::{bitmap::BitmapIndex, cpu::cpuset::CpuSet, Topology};
@@ -42,7 +42,7 @@ pub(crate) struct SharedState {
     /// The flag is set with Release ordering, so if the readout of a set flag
     /// is performed with Acquire ordering or followed by an Acquire barrier,
     /// the pushed work should be observable.
-    pub work_availability: AtomicFlags,
+    work_availability: AtomicFlags,
 }
 //
 impl SharedState {
@@ -82,11 +82,6 @@ impl SharedState {
         (result, worker_configs.into())
     }
 
-    /// Access the global work injector
-    pub fn injector(&self) -> &Injector<DynJob> {
-        &self.injector
-    }
-
     /// Access the worker interfaces
     pub fn worker_interfaces(&self) -> impl Iterator<Item = &'_ WorkerInterface> {
         self.workers.iter().map(Deref::deref)
@@ -122,9 +117,47 @@ impl SharedState {
             .map(|iter| iter.map(|bit| bit.linear_idx(work_availability)))
     }
 
+    /// Given a worker with work available for stealing, find the closest cousin
+    /// that doesn't have work, if any, and suggest that it steal from there
+    pub fn suggest_stealing_from_worker<'self_>(
+        &'self_ self,
+        target_idx: usize,
+        target_availability: &BitRef<'self_, true>,
+        update: Ordering,
+    ) {
+        self.suggest_stealing::<false, true>(
+            target_availability,
+            StealLocation::Worker(target_idx),
+            update,
+        )
+    }
+
+    /// Inject work from outside the thread pool, and tell the worker closest to
+    /// the originating locality that doesn't have work about it
+    pub fn inject_job(&self, job: DynJob, local_worker_idx: usize) {
+        self.injector.push(job);
+        self.suggest_stealing::<true, false>(
+            &self.work_availability.bit(local_worker_idx),
+            StealLocation::Injector,
+            // Need at least Release ordering to ensure injected job is visible,
+            // and stronger-than-Release ordering is not necessary:
+            //
+            // - Don't need AcqRel ordering since we're not reading info to
+            //   synchronize the injector thread with the worker.
+            // - Don't need SeqCst because there is no need to enforce a global
+            //   order on the job injection events.
+            Ordering::Release,
+        )
+    }
+
+    /// Try to steal a job from the global work injector
+    pub fn steal_from_injector(&self) -> Steal<DynJob> {
+        self.injector.steal()
+    }
+
     /// Recommend that the worker closest to a certain originating locality
     /// steal a task from the specified location
-    pub fn suggest_stealing<'self_, const INCLUDE_CENTER: bool, const CACHE_SEARCH_MASKS: bool>(
+    fn suggest_stealing<'self_, const INCLUDE_CENTER: bool, const CACHE_SEARCH_MASKS: bool>(
         &'self_ self,
         local_worker: &BitRef<'self_, CACHE_SEARCH_MASKS>,
         task_location: StealLocation,
@@ -161,7 +194,7 @@ impl SharedState {
                 // Can use Relaxed ordering on failure because failing to
                 // suggest work to a worker has no observable consequences and
                 // isn't used to inform any decision other than looking up the
-                // state of the next worker. Worker states are independent.
+                // state of the next worker, which is independent from this one.
                 let closest_asleep = closest_asleep.linear_idx(&self_.work_availability);
                 let accepted = self_.workers[closest_asleep].futex.suggest_steal(
                     task_location,
