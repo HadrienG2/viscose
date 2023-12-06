@@ -90,10 +90,14 @@ impl HierarchicalState {
             then it should have a parent node index",
         );
 
-        // Need at least Acquire load ordering to ensure that after reading out
-        // a worker's set work availability flag, the worker's work is visible,
-        // and after reading out a node's set work availability flag, the node
-        // childrens' set work availability flags are also visible.
+        // All loads need to have at least Acquire ordering because...
+        //
+        // - Between reading a worker's individual work availability bit and
+        //   trying to steal from that worker, an Acquire barrier is needed to
+        //   make sure that the underlying work is actually visible.
+        // - When observing a node's set work availability bit, an Acquire
+        //   barrier is needed to make sure that associated updates to the work
+        //   availability bits of child nodes and workers are visible.
         let load = crate::at_least_acquire(load);
 
         // At each point in time, we are processing the subtree rooted at a
