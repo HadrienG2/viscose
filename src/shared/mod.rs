@@ -105,20 +105,34 @@ impl SharedState {
     pub fn find_work_to_steal<'result>(
         &'result self,
         worker_availability: &BitRef<'result, true>,
-        load: Ordering,
     ) -> Option<impl Iterator<Item = usize> + 'result> {
         let work_availability = &self.work_availability;
         work_availability
             .iter_set_around::<false, true>(
                 worker_availability,
-                // Need at least Acquire ordering to ensure work is visible
-                crate::at_least_acquire(load),
+                // Need at least Acquire ordering to ensure that the work we
+                // observed to be available is actually visible in the worker's
+                // queue, and don't need anything stronger:
+                //
+                // - Don't need AcqRel (which would require replacing the load
+                //   with a RMW) since we're not trying to get any other thread
+                //   in sync with our current state.
+                // - Don't need SeqCst since there is no need for everyone to
+                //   agree on the global order in which workers look for work.
+                Ordering::Acquire,
             )
             .map(|iter| iter.map(|bit| bit.linear_idx(work_availability)))
     }
 
     /// Given a worker with work available for stealing, find the closest cousin
     /// that doesn't have work, if any, and suggest that it steal from there
+    ///
+    /// There should be a `Release` barrier between the moment where work is
+    /// pushed in the worker's work queue and the moment where work is signaled
+    /// to be available like this. You can either bundle the `Release` barrier
+    /// into this transaction, or put a separate `atomic::fence(Release)` before
+    /// this transaction and make it `Relaxed` if you have multiple work
+    /// availability signaling transactions to do.
     pub fn suggest_stealing_from_worker<'self_>(
         &'self_ self,
         target_idx: usize,
@@ -139,13 +153,13 @@ impl SharedState {
         self.suggest_stealing::<true, false>(
             &self.work_availability.bit(local_worker_idx),
             StealLocation::Injector,
-            // Need at least Release ordering to ensure injected job is visible,
-            // and stronger-than-Release ordering is not necessary:
+            // Need at least Release ordering to ensure injected job is visible
+            // to the target and don't need anything stronger:
             //
-            // - Don't need AcqRel ordering since we're not reading info to
-            //   synchronize the injector thread with the worker.
-            // - Don't need SeqCst because there is no need to enforce a global
-            //   order on the job injection events.
+            // - Don't need AcqRel ordering since the thread that's pushing work
+            //   does not want to get in sync with the current worker state.
+            // - Don't need SeqCst since there is no need for everyone to agree
+            //   on the global order of job injection events.
             Ordering::Release,
         )
     }
@@ -165,8 +179,9 @@ impl SharedState {
     ) {
         // Check if there are job-less neighbors to submit work to...
         //
-        // Need Acquire ordering so the futex is read/modified after the work
-        // availability flag, no work availability caching/speculation allowed.
+        // Need Acquire ordering so the futex is only read/modified after a work
+        // unavailability signal is observed: compilers and CPUs should not
+        // cache the work availability bit value or speculate on it here.
         let Some(mut asleep_neighbors) = self
             .work_availability
             .iter_unset_around::<INCLUDE_CENTER, CACHE_SEARCH_MASKS>(

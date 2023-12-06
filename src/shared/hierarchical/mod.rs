@@ -77,7 +77,6 @@ impl HierarchicalState {
         &'result self,
         worker_idx: usize,
         worker_availability: &'result WorkAvailabilityPath<'result>,
-        load: Ordering,
     ) -> Option<impl Iterator<Item = usize> + 'result> {
         // We'll explore workers from increasingly remote parents
         let mut ancestor_bits = worker_availability.ancestors();
@@ -94,11 +93,20 @@ impl HierarchicalState {
         //
         // - Between reading a worker's individual work availability bit and
         //   trying to steal from that worker, an Acquire barrier is needed to
-        //   make sure that the underlying work is actually visible.
+        //   make sure that the associated work in the queue is actually visible
+        //   to the caller thread.
         // - When observing a node's set work availability bit, an Acquire
         //   barrier is needed to make sure that associated updates to the work
         //   availability bits of child nodes and workers are visible.
-        let load = crate::at_least_acquire(load);
+        //
+        // Further, load ordering does not need to be stronger than Acquire:
+        //
+        // - Don't need AcqRel (which would require replacing the load with a
+        //   RMW) since we're not trying to get any other thread in sync with
+        //   our current state.
+        // - Don't need SeqCst since there is no need for everyone to agree on
+        //   the global order in which workers look for work.
+        let load = Ordering::Acquire;
 
         // At each point in time, we are processing the subtree rooted at a
         // certain ancestor of the thief, and within that subtree we are
@@ -575,7 +583,7 @@ pub(crate) mod tests {
             // Check find_work_to_steal enumerates victims in the expected order
             let victims =
                 state
-                    .find_work_to_steal(thief_idx, &thief_availability, Ordering::Relaxed)
+                    .find_work_to_steal(thief_idx, &thief_availability)
                     .into_iter().flatten();
             for victim_idx in victims {
                 // Make sure this was an expected work-stealing victim and that

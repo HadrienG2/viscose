@@ -130,7 +130,8 @@ impl<'scope> Scope<'scope> {
 
         // ...and personally notify the closest starving thread about it
         // This doesn't need to be ordered after the setting of work_available
-        // because workers following a recommendation don't read work_available.
+        // because workers following a direct work-stealing recommendation do
+        // not check the work_availability bits.
         self.0.shared.suggest_stealing_from_worker(
             self.0.idx,
             &self.0.work_available.bit,
@@ -158,12 +159,12 @@ struct NotifyJoin<'worker> {
 // SAFETY: The join is made observable with Release ordering
 unsafe impl Notify for NotifyJoin<'_> {
     fn notify(self) {
-        // Announce job completion
+        // Mark the remote task as finished
         //
         // This makes the join observable, so it must be Release
         self.remote_finished.store(true, Ordering::Release);
 
-        // Announce join completion
+        // Ping the worker about the finished join, waking it up if necessary
         //
         // This may replace a previous join notifications that wasn't observed
         // by the worker, but that's okay: due to atomic variable coherence, a
@@ -171,9 +172,9 @@ unsafe impl Notify for NotifyJoin<'_> {
         // transitively sees the machine effects associated with all futex
         // updates performed by previous joins.
         //
-        // This must be Release because otherwise one could get the notification
-        // before remote_finished is true, which would lead to an incorrectly
-        // failed join() check and thus lost wakeup.
+        // This must be Release because otherwise a worker could be awakened
+        // without observing remote_finished to be true, which would lead to an
+        // incorrectly failed join() completion check and thus a lost wakeup.
         self.futex.notify_join(Ordering::Release);
     }
 }

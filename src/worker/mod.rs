@@ -282,11 +282,7 @@ impl<'pool> Worker<'pool> {
     /// of `self.futex`, so that `self.futex` can be updated if appropriate.
     fn steal_from_anyone(&self) -> Option<StealLocation> {
         // Are there other workers we could steal work from?
-        //
-        // Need Acquire so stealing happens after observing available work.
-        if let Some(neighbors_with_work) = self
-            .shared
-            .find_work_to_steal(&self.work_available.bit, Ordering::Acquire)
+        if let Some(neighbors_with_work) = self.shared.find_work_to_steal(&self.work_available.bit)
         {
             // Try to steal from other workers at increasing distances
             for idx in neighbors_with_work {
