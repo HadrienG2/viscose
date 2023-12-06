@@ -91,13 +91,14 @@ impl HierarchicalState {
 
         // All loads need to have at least Acquire ordering because...
         //
-        // - Between reading a worker's individual work availability bit and
+        // - Between observing a worker's work availability bit to be set and
         //   trying to steal from that worker, an Acquire barrier is needed to
-        //   make sure that the associated work in the queue is actually visible
-        //   to the caller thread.
-        // - When observing a node's set work availability bit, an Acquire
-        //   barrier is needed to make sure that associated updates to the work
-        //   availability bits of child nodes and workers are visible.
+        //   make sure that the associated work in the queue is visible.
+        // - Between observing a node's work availability bit to be set and
+        //   querying the work availability bits of its children, an Acquire
+        //   barrier is needed to make sure that the updates to the work
+        //   availability bits of child nodes and workers that led the node's
+        //   work availability bit to be set are visible.
         //
         // Further, load ordering does not need to be stronger than Acquire:
         //
