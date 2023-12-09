@@ -75,12 +75,12 @@ impl HierarchicalState {
     /// from a certain "thief" worker
     pub fn find_work_to_steal<'result>(
         &'result self,
-        worker_idx: usize,
-        worker_availability: &'result WorkAvailabilityPath<'result>,
+        thief_worker_idx: usize,
+        thief_availability: &'result WorkAvailabilityPath<'result>,
     ) -> Option<impl Iterator<Item = usize> + 'result> {
         self.find_workers(
-            worker_idx,
-            worker_availability.ancestors().map(Cow::Borrowed),
+            thief_worker_idx,
+            thief_availability.ancestors().map(Cow::Borrowed),
             |children, thief_bit, load| children.find_relatives_to_rob(thief_bit, load),
             |children, load| children.find_strangers_to_rob(load)
         )
@@ -97,8 +97,8 @@ impl HierarchicalState {
     /// availability signaling transactions to do.
     pub fn suggest_stealing_from_worker<'self_>(
         &'self_ self,
-        target_idx: usize,
-        target_availability: &BitRef<'self_, true>,
+        target_worker_idx: usize,
+        target_availability: &WorkAvailabilityPath<'self_>,
         update: Ordering,
     ) {
         unimplemented!()

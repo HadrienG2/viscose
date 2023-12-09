@@ -104,12 +104,12 @@ impl SharedState {
     /// from a certain "thief" worker
     pub fn find_work_to_steal<'result>(
         &'result self,
-        worker_availability: &BitRef<'result, true>,
+        thief_availability: &BitRef<'result, true>,
     ) -> Option<impl Iterator<Item = usize> + 'result> {
         let work_availability = &self.work_availability;
         work_availability
             .iter_set_around::<false, true>(
-                worker_availability,
+                thief_availability,
                 // Need at least Acquire ordering to ensure that the work we
                 // observed to be available is actually visible in the worker's
                 // queue, and don't need anything stronger:
@@ -135,13 +135,13 @@ impl SharedState {
     /// availability signaling transactions to do.
     pub fn suggest_stealing_from_worker<'self_>(
         &'self_ self,
-        target_idx: usize,
+        target_worker_idx: usize,
         target_availability: &BitRef<'self_, true>,
         update: Ordering,
     ) {
         self.suggest_stealing::<false, true>(
             target_availability,
-            StealLocation::Worker(target_idx),
+            StealLocation::Worker(target_worker_idx),
             update,
         )
     }
