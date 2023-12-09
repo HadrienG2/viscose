@@ -12,7 +12,7 @@ use self::{
     builder::HierarchicalStateBuilder,
     path::WorkAvailabilityPath,
 };
-use super::{flags::AtomicFlags, job::DynJob, WorkerConfig, WorkerInterface};
+use super::{flags::AtomicFlags, job::DynJob, WorkerConfig, WorkerInterface, futex::StealLocation};
 use crate::bench::BitRef;
 use crossbeam::{deque::{Injector, Steal}, utils::CachePadded};
 use hwlocality::{cpu::cpuset::CpuSet, Topology};
@@ -101,7 +101,12 @@ impl HierarchicalState {
         target_availability: &WorkAvailabilityPath<'self_>,
         update: Ordering,
     ) {
-        unimplemented!()
+        self.suggest_stealing::<false, true>(
+            target_worker_idx,
+            target_availability.ancestors().map(Cow::Borrowed),
+            StealLocation::Worker(target_worker_idx),
+            update,
+        )
     }
 
     /// Inject work from outside the thread pool, and tell the worker closest to
@@ -109,6 +114,19 @@ impl HierarchicalState {
     pub fn inject_job(&self, job: DynJob, local_worker_idx: usize) {
         self.injector.push(job);
         unimplemented!()
+        /* self.suggest_stealing::<true, false>(
+            local_worker_idx,
+            /* TODO: Equivalent of target_availability.ancestors(), but lazy */,
+            StealLocation::Injector,
+            // Need at least Release ordering to ensure injected job is visible
+            // to the target and don't need anything stronger:
+            //
+            // - Don't need AcqRel ordering since the thread that's pushing work
+            //   does not want to get in sync with the target worker's state.
+            // - Don't need SeqCst since there is no need for everyone to agree
+            //   on the global order of job injection events.
+            Ordering::Release,
+        ); */
     }
 
     /// Try to steal a job from the global work injector
@@ -129,11 +147,11 @@ impl HierarchicalState {
     ///   `find_jobless_relatives` when giving work.
     /// - `find_strangers` should be `find_strangers_to_rob` when stealing work,
     ///   `find_jobless_strangers` when giving work.
-    fn find_workers<'result, Relatives, Strangers>(
+    fn find_workers<'result, const CACHE_SEARCH_MASKS: bool, Relatives, Strangers>(
         &'result self,
         local_worker_idx: usize,
-        mut ancestor_bits: impl Iterator<Item = Cow<'result, BitRef<'result, true>>> + 'result,
-        mut find_relatives: impl FnMut(&'result ChildrenLink, &BitRef<'result, true>, Ordering) -> Option<Relatives> + 'result,
+        mut ancestor_bits: impl Iterator<Item = Cow<'result, BitRef<'result, CACHE_SEARCH_MASKS>>> + 'result,
+        mut find_relatives: impl FnMut(&'result ChildrenLink, &BitRef<'result, CACHE_SEARCH_MASKS>, Ordering) -> Option<Relatives> + 'result,
         mut find_strangers: impl FnMut(&'result ChildrenLink, Ordering) -> Option<Strangers> + 'result,
     ) -> Option<impl Iterator<Item = usize> + 'result>
         where
@@ -245,6 +263,66 @@ impl HierarchicalState {
                 }
             })
             .into_iter()
+        )
+    }
+
+    /// Suggest stealing work from a particular worker
+    fn suggest_stealing<'self_, const INCLUDE_CENTER: bool, const CACHE_SEARCH_MASKS: bool>(
+        &'self_ self,
+        local_worker_idx: usize,
+        ancestor_bits: impl Iterator<Item = Cow<'self_, BitRef<'self_, CACHE_SEARCH_MASKS>>> + 'self_,
+        task_location: StealLocation,
+        update: Ordering,
+    ) {
+        // Check if there are job-less neighbors to submit work to...
+        //
+        // Need Acquire ordering so the futex is only read/modified after a work
+        // unavailability signal is observed: compilers and CPUs should not
+        // cache the work availability bit value or speculate on it here.
+        let Some(mut asleep_neighbors) = self.find_workers(
+            local_worker_idx,
+            ancestor_bits,
+            |children, target_bit, load| children.find_jobless_relatives::<INCLUDE_CENTER, CACHE_SEARCH_MASKS>(target_bit, load),
+            |children, load| children.find_jobless_strangers(load)
+        )
+        else {
+            return;
+        };
+
+        // ...and if so, tell the closest one about our newly submitted job
+        #[cold]
+        fn unlikely(
+            self_: &HierarchicalState,
+            jobless_neighbors: impl Iterator<Item = usize>,
+            local_worker_idx: usize,
+            task_location: StealLocation,
+            update: Ordering,
+        ) {
+            // Iterate over increasingly remote job-less neighbors
+            for closest_asleep in jobless_neighbors {
+                // Update their futex recommendation as appropriate
+                //
+                // Can use Relaxed ordering on failure because failing to
+                // suggest work to a worker has no observable consequences and
+                // isn't used to inform any decision other than looking up the
+                // state of the next worker, which is independent from this one.
+                let accepted = self_.workers[closest_asleep].object.futex.suggest_steal(
+                    task_location,
+                    local_worker_idx,
+                    update,
+                    Ordering::Relaxed,
+                );
+                if accepted.is_ok() {
+                    return;
+                }
+            }
+        }
+        unlikely(
+            self,
+            &mut asleep_neighbors,
+            local_worker_idx,
+            task_location,
+            update,
         )
     }
 }
@@ -369,12 +447,16 @@ impl ChildrenLink {
 
     /// Like `find_relatives_to_rob`, but finds relatives that are looking for
     /// work instead of relatives that might have extra work to give
-    pub fn find_jobless_relatives<'self_>(
+    ///
+    /// This is more generic than `find_relatives_to_rob` because we need to
+    /// find jobless workers in two different circumstances: when injecting work
+    /// from outside the thread pool and when spawning work inside of it.
+    pub fn find_jobless_relatives<'self_, const INCLUDE_CENTER: bool, const CACHE_SEARCH_MASKS: bool>(
         &'self_ self,
-        giver_bit: &BitRef<'self_, true>,
+        giver_bit: &BitRef<'self_, CACHE_SEARCH_MASKS>,
         load: Ordering,
     ) -> Option<impl Iterator<Item = usize> + 'self_> {
-        self.find_relatives_around(giver_bit, load, AtomicFlags::iter_unset_around::<false, true>)
+        self.find_relatives_around(giver_bit, load, AtomicFlags::iter_unset_around::<INCLUDE_CENTER, CACHE_SEARCH_MASKS>)
     }
 
     /// Find children that might have work to steal
@@ -392,7 +474,7 @@ impl ChildrenLink {
     ///
     /// Like `find_stranger_to_rob`, but finds children that are looking ofr
     /// work instead of children that might have extra work to give
-    pub fn find_jobless_stranger(
+    pub fn find_jobless_strangers(
         &self,
         load: Ordering
     ) -> Option<impl Iterator<Item = usize> + '_> {
@@ -419,11 +501,11 @@ impl ChildrenLink {
     /// `AtomicFlags::iter_set_around` if you want to steal work and
     /// `AtomicFlags::iter_unset_around` if you want to give work, in both case
     /// with `INCLUDE_CENTER` set to false and `CACHE_SEARCH_MASKS` set to true.
-    pub fn find_relatives_around<'self_, IterAround>(
+    pub fn find_relatives_around<'self_, const CACHE_SEARCH_MASKS: bool, IterAround>(
         &'self_ self,
-        center_bit: &BitRef<'self_, true>,
+        center_bit: &BitRef<'self_, CACHE_SEARCH_MASKS>,
         load: Ordering,
-        iter_around: impl FnOnce(&'self_ AtomicFlags, &BitRef<'self_, true>, Ordering) -> Option<IterAround>
+        iter_around: impl FnOnce(&'self_ AtomicFlags, &BitRef<'self_, CACHE_SEARCH_MASKS>, Ordering) -> Option<IterAround>
     ) -> Option<impl Iterator<Item = usize> + 'self_>
         where IterAround: Iterator<Item = BitRef<'self_, false>> + 'self_
     {
@@ -468,20 +550,20 @@ impl ChildrenLink {
 
 /// Relationship of a worker to a node of the [`HierarchicalState`]
 #[derive(Debug, Eq, PartialEq)]
-enum LocalBit<'bit_ref, 'flags: 'bit_ref> {
+enum LocalBit<'bit_ref, 'flags: 'bit_ref, const CACHE_SEARCH_MASKS: bool> {
     /// Direct worker child
-    Worker(Cow<'bit_ref, BitRef<'flags, true>>),
+    Worker(Cow<'bit_ref, BitRef<'flags, CACHE_SEARCH_MASKS>>),
 
     /// Indirect descendant via this direct node child
-    Node(Cow<'bit_ref, BitRef<'flags, true>>),
+    Node(Cow<'bit_ref, BitRef<'flags, CACHE_SEARCH_MASKS>>),
 
     /// Not a descendant
     Neither,
 }
 //
-impl<'bit_ref, 'flags: 'bit_ref> LocalBit<'bit_ref, 'flags> {
+impl<'bit_ref, 'flags: 'bit_ref, const CACHE_SEARCH_MASKS: bool> LocalBit<'bit_ref, 'flags, CACHE_SEARCH_MASKS> {
     /// If the worker is a direct worker child, take its [`BitRef`]
-    fn take_worker(&mut self) -> Option<Cow<'bit_ref, BitRef<'flags, true>>> {
+    fn take_worker(&mut self) -> Option<Cow<'bit_ref, BitRef<'flags, CACHE_SEARCH_MASKS>>> {
         if let Self::Worker(_) = self {
             let Self::Worker(bit) = std::mem::replace(self, Self::Neither) else {
                 unreachable!()
@@ -493,7 +575,7 @@ impl<'bit_ref, 'flags: 'bit_ref> LocalBit<'bit_ref, 'flags> {
     }
 
     /// If the worker descends from a node child, take that child's [`BitRef`]
-    fn take_node(&mut self) -> Option<Cow<'bit_ref, BitRef<'flags, true>>> {
+    fn take_node(&mut self) -> Option<Cow<'bit_ref, BitRef<'flags, CACHE_SEARCH_MASKS>>> {
         if let Self::Node(_) = self {
             let Self::Node(bit) = std::mem::replace(self, Self::Neither) else {
                 unreachable!()
