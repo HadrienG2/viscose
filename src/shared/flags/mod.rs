@@ -99,7 +99,7 @@ impl AtomicFlags {
     ///
     /// This is basically an optimized version of
     ///
-    /// ```rust,ignore
+    /// ```rust,compile_fail
     /// self.iter().skip(start_idx + 1)
     ///     .chain(self.iter().take(start_idx + 1))
     ///     .filter(|bit| bit.is_set())
@@ -117,7 +117,7 @@ impl AtomicFlags {
     ///
     /// This is basically an optimized version of
     ///
-    /// ```rust,ignore
+    /// ```rust,compile_fail
     /// self.iter().skip(start_idx + 1)
     ///     .chain(self.iter().take(start_idx + 1))
     ///     .filter(|bit| !bit.is_set())
@@ -201,7 +201,7 @@ impl AtomicFlags {
     ///
     /// This is basically an optimized version of
     ///
-    /// ```rust,ignore
+    /// ```rust,compile_fail
     /// self.iter().skip(start_idx + 1)
     ///     .chain(self.iter().take(start_idx + 1))
     ///     .filter(|bit| bit.is_set() == FIND_SET)
