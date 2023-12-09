@@ -115,7 +115,7 @@ impl<'pool> Worker<'pool> {
         // Learn more about the state of the world using our futex
         //
         // Acquire ordering ensures we see the world like the previous thread
-        // that updated the futex did.
+        // that updated the futex with Release ordering did.
         let futex_state = self.futex.load_from_worker(Ordering::Acquire);
 
         // Try to steal work from other workers and the global injector, and

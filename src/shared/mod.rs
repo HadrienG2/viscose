@@ -157,7 +157,7 @@ impl SharedState {
             // to the target and don't need anything stronger:
             //
             // - Don't need AcqRel ordering since the thread that's pushing work
-            //   does not want to get in sync with the current worker state.
+            //   does not want to get in sync with the target worker's state.
             // - Don't need SeqCst since there is no need for everyone to agree
             //   on the global order of job injection events.
             Ordering::Release,

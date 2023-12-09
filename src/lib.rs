@@ -1,4 +1,9 @@
-#![warn(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
+#![warn(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::dbg_macro,
+    clippy::unimplemented
+)]
 
 #[cfg(feature = "bench")]
 pub mod bench;
@@ -64,7 +69,7 @@ fn at_least_acquire(order: Ordering) -> Ordering {
         Ordering::Relaxed | Ordering::Acquire => Ordering::Acquire,
         Ordering::Release | Ordering::AcqRel => Ordering::AcqRel,
         Ordering::SeqCst => Ordering::SeqCst,
-        _ => unimplemented!(),
+        _ => unreachable!(),
     }
 }
 
@@ -75,7 +80,7 @@ fn at_least_release(order: Ordering) -> Ordering {
         Ordering::Relaxed | Ordering::Release => Ordering::Release,
         Ordering::Acquire | Ordering::AcqRel => Ordering::AcqRel,
         Ordering::SeqCst => Ordering::SeqCst,
-        _ => unimplemented!(),
+        _ => unreachable!(),
     }
 }
 
