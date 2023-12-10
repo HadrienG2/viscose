@@ -113,10 +113,9 @@ impl HierarchicalState {
     /// the originating locality that doesn't have work about it
     pub fn inject_job(&self, job: DynJob, local_worker_idx: usize) {
         self.injector.push(job);
-        unimplemented!()
-        /* self.suggest_stealing::<true, false>(
+        self.suggest_stealing::<true, false>(
             local_worker_idx,
-            /* TODO: Equivalent of target_availability.ancestors(), but lazy */,
+            WorkAvailabilityPath::lazy_ancestors(self, local_worker_idx).map(Cow::Owned),
             StealLocation::Injector,
             // Need at least Release ordering to ensure injected job is visible
             // to the target and don't need anything stronger:
@@ -126,7 +125,7 @@ impl HierarchicalState {
             // - Don't need SeqCst since there is no need for everyone to agree
             //   on the global order of job injection events.
             Ordering::Release,
-        ); */
+        );
     }
 
     /// Try to steal a job from the global work injector
@@ -417,9 +416,19 @@ impl ChildrenLink {
     /// their ancestor nodes in the work availability tree. It is a bit
     /// expensive to compute initially, but ensures faster operations on work
     /// availability bits in the long run.
-    pub fn child_availability(&self, global_child_idx: usize) -> BitRef<'_, true> {
+    pub fn child_availability_with_cache(&self, global_child_idx: usize) -> BitRef<'_, true> {
         let bit_idx = self.child_bit_idx(global_child_idx);
         self.work_availability.bit_with_cache(bit_idx)
+    }
+
+    /// Like `child_availability_with_cache()`, but optimizes for accessor
+    /// construction speed rather than accessor usage speed
+    ///
+    /// This is what you want if for whatever reason, you are forced to build a
+    /// child availability accessor, use it once, and then throw it away.
+    pub fn child_availability(&self, global_child_idx: usize) -> BitRef<'_, false> {
+        let bit_idx = self.child_bit_idx(global_child_idx);
+        self.work_availability.bit(bit_idx)
     }
 
     /// Find children that might have work to steal around a certain child
