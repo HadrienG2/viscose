@@ -77,25 +77,6 @@ pub trait SharedState: Send + Sized + Sync + 'static {
     fn steal_from_injector(&self) -> Steal<DynJob<Self>>;
 }
 
-/// Minimal work availability bit interface
-///
-/// All methods return the former work availability state, and may be
-/// implemented as a no-op that returns `None` if there is no other worker to
-/// advertise work to.
-#[doc(hidden)]
-pub trait WorkerAvailability {
-    /// Truth that this worker currently advertises having work available
-    ///
-    /// May return `None` if there is no other worker to advertise work to.
-    fn is_set(&self, order: Ordering) -> Option<bool>;
-
-    /// Notify the world that this worker has work available for stealing
-    fn fetch_set(&self, order: Ordering) -> Option<bool>;
-
-    /// Notify the world that this worker is looking for work
-    fn fetch_clear(&self, order: Ordering) -> Option<bool>;
-}
-
 /// Internal state needed to configure a new worker
 #[derive(Debug)]
 #[doc(hidden)]

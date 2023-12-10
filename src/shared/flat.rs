@@ -10,7 +10,7 @@ use super::{
     futex::{StealLocation, WorkerFutex},
     hierarchical::path::WorkAvailabilityPath,
     job::DynJob,
-    SharedState, WorkerAvailability, WorkerConfig, WorkerInterface,
+    SharedState, WorkerConfig, WorkerInterface,
 };
 use crossbeam::{
     deque::{Injector, Steal},
@@ -26,6 +26,7 @@ use std::{
 /// State shared between all thread pool users and workers, with
 /// non-hierarchical work availability tracking.
 #[derive(Debug)]
+#[doc(hidden)]
 pub struct FlatState {
     /// Global work injector
     injector: Injector<DynJob<Self>>,
@@ -210,19 +211,5 @@ impl FlatState {
             task_location,
             update,
         )
-    }
-}
-//
-impl WorkerAvailability for BitRef<'_, true> {
-    fn is_set(&self, order: Ordering) -> Option<bool> {
-        Some(self.is_set(order))
-    }
-
-    fn fetch_set(&self, order: Ordering) -> Option<bool> {
-        Some(self.fetch_set(order))
-    }
-
-    fn fetch_clear(&self, order: Ordering) -> Option<bool> {
-        Some(self.fetch_clear(order))
     }
 }

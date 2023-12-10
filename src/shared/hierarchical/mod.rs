@@ -25,6 +25,7 @@ use std::{
 /// State shared between all thread pool users and workers, with hierarchical
 /// work availability tracking.
 #[derive(Debug)]
+#[doc(hidden)]
 pub struct HierarchicalState {
     /// Global injector
     injector: Injector<DynJob<Self>>,

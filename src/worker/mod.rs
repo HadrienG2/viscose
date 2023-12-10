@@ -8,7 +8,7 @@ use crate::{
         futex::{StealLocation, WorkerFutex, WorkerFutexState},
         hierarchical::path::WorkAvailabilityPath,
         job::DynJob,
-        SharedState, WorkerAvailability,
+        SharedState,
     },
     MAX_SPIN_ITERS_PER_CHECK, OS_WAIT_DELAY, SPIN_ITERS_BEFORE_YIELD, YIELD_DURATION,
 };

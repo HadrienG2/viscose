@@ -1,10 +1,7 @@
 //! Node path from a worker to the top of the `work_availability_tree`
 
 use super::{ChildrenLink, HierarchicalState};
-use crate::shared::{
-    flags::{bitref::BitRef, AtomicFlags},
-    WorkerAvailability,
-};
+use crate::shared::flags::{bitref::BitRef, AtomicFlags};
 use std::{
     iter::FusedIterator,
     sync::atomic::{self, Ordering},
@@ -18,20 +15,6 @@ use std::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[doc(hidden)]
 pub struct WorkAvailabilityPath<'shared>(Box<[BitRef<'shared, true>]>);
-//
-impl WorkerAvailability for WorkAvailabilityPath<'_> {
-    fn is_set(&self, order: Ordering) -> Option<bool> {
-        self.0.first().map(|bit| bit.is_set(order))
-    }
-
-    fn fetch_set(&self, order: Ordering) -> Option<bool> {
-        self.fetch_op(BitRef::check_empty_and_set, order)
-    }
-
-    fn fetch_clear(&self, order: Ordering) -> Option<bool> {
-        self.fetch_op(BitRef::clear_and_check_emptied, order)
-    }
-}
 //
 impl<'shared> WorkAvailabilityPath<'shared> {
     /// Compute the full work availability path for a given worker
@@ -55,6 +38,29 @@ impl<'shared> WorkAvailabilityPath<'shared> {
         worker_idx: usize,
     ) -> Self {
         Self(vec![flags.bit_with_cache(worker_idx)].into())
+    }
+
+    /// Truth that this worker currently advertises having work available
+    ///
+    /// May return `None` if there is no other worker to advertise work to.
+    pub(crate) fn is_set(&self, order: Ordering) -> Option<bool> {
+        self.0.first().map(|bit| bit.is_set(order))
+    }
+
+    /// Notify the world that this worker has work available for stealing
+    ///
+    /// Returns former flag state or `None` if there is no other worker to
+    /// advertise work to and thus the `fetch_set()` was a no-op.
+    pub(crate) fn fetch_set(&self, order: Ordering) -> Option<bool> {
+        self.fetch_op(BitRef::check_empty_and_set, order)
+    }
+
+    /// Notify the world that this worker is looking for work
+    ///
+    /// Returns former flag state or `None` if there is no other worker to
+    /// advertise work to and thus the `fetch_set()` was a no-op.
+    pub(crate) fn fetch_clear(&self, order: Ordering) -> Option<bool> {
+        self.fetch_op(BitRef::clear_and_check_emptied, order)
     }
 
     /// Semantically equivalent to creating a new path, yielding the ancestors,
