@@ -78,7 +78,6 @@ impl SharedState for HierarchicalState {
         )
     }
 
-    #[inline]
     fn suggest_stealing_from_worker<'self_>(
         &'self_ self,
         target_worker_idx: usize,
@@ -117,7 +116,6 @@ impl SharedState for HierarchicalState {
 //
 impl HierarchicalState {
     /// Suggest stealing work from a particular worker
-    #[inline(always)]
     fn suggest_stealing<'self_, const INCLUDE_CENTER: bool, const CACHE_SEARCH_MASKS: bool>(
         &'self_ self,
         local_worker_idx: usize,
@@ -295,7 +293,6 @@ impl ChildrenLink {
     /// This is more generic than `find_relatives_to_rob` because we need to
     /// find jobless workers in two different circumstances: when injecting work
     /// from outside the thread pool and when spawning work inside of it.
-    #[inline]
     pub fn find_jobless_siblings<
         'self_,
         const INCLUDE_CENTER: bool,

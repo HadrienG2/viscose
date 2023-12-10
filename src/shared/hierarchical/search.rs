@@ -2,7 +2,9 @@
 
 use super::{Child, ChildrenLink, HierarchicalState, Node};
 use crate::shared::flags::bitref::BitRef;
-use std::{borrow::Cow, collections::VecDeque, sync::atomic::Ordering};
+use std::{
+    borrow::Cow, cell::RefCell, collections::VecDeque, sync::atomic::Ordering, thread_local,
+};
 
 /// Enumerate workers that match a certain work availability condition
 /// (either they have work available for stealing, or they are looking for
@@ -47,12 +49,17 @@ where
     let worker_iter = find_siblings(&curr_node.worker_children, &worker_bit, LOAD_ORDER)
         .map(NodeChildren::Siblings);
 
+    // Grab a deque of next subtree nodes from the allocation cache
+    let mut next_subtree_nodes =
+        DEQUES.with(|deques| deques.borrow_mut().pop().unwrap_or_default());
+    next_subtree_nodes.clear();
+
     // Yield iterator over increasingly remote workers
     Some(WorkerSearch {
         state,
         worker_iter,
         curr_node,
-        next_subtree_nodes: VecDeque::new(),
+        next_subtree_nodes,
         ancestor_bits,
         curr_ancestor: parent,
         node_bit: None,
@@ -214,6 +221,39 @@ where
                 .map(NodeChildren::Strangers);
         }
     }
+}
+//
+impl<
+        AncestorBits,
+        FindSiblings,
+        FindStrangers,
+        Siblings,
+        Strangers,
+        const CACHE_SEARCH_MASKS: bool,
+    > Drop
+    for WorkerSearch<
+        '_,
+        AncestorBits,
+        FindSiblings,
+        FindStrangers,
+        Siblings,
+        Strangers,
+        CACHE_SEARCH_MASKS,
+    >
+{
+    #[inline(always)]
+    fn drop(&mut self) {
+        DEQUES.with(|deques| {
+            deques
+                .borrow_mut()
+                .push(std::mem::take(&mut self.next_subtree_nodes))
+        })
+    }
+}
+
+thread_local! {
+    /// VecDeque allocation cache
+    static DEQUES: RefCell<Vec<VecDeque<usize>>> = RefCell::new(Vec::new());
 }
 
 /// Iterator over either neighboring or "foreign" children in a node child list
