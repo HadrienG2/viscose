@@ -77,17 +77,6 @@ fn at_least_acquire(order: Ordering) -> Ordering {
     }
 }
 
-/// Add a Release barrier to a user-specified atomic operation ordering
-#[inline]
-fn at_least_release(order: Ordering) -> Ordering {
-    match order {
-        Ordering::Relaxed | Ordering::Release => Ordering::Release,
-        Ordering::Acquire | Ordering::AcqRel => Ordering::AcqRel,
-        Ordering::SeqCst => Ordering::SeqCst,
-        _ => unreachable!(),
-    }
-}
-
 // Set up optional logging
 #[doc(hidden)]
 #[macro_export]

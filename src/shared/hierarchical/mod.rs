@@ -25,7 +25,7 @@ use std::{
 /// State shared between all thread pool users and workers, with hierarchical
 /// work availability tracking.
 #[derive(Debug)]
-pub(crate) struct HierarchicalState {
+pub struct HierarchicalState {
     /// Global injector
     injector: Injector<DynJob<Self>>,
 
@@ -54,8 +54,6 @@ impl SharedState for HierarchicalState {
     fn worker_interfaces(&self) -> impl Iterator<Item = &'_ WorkerInterface<Self>> {
         self.workers.iter().map(|child| &child.object)
     }
-
-    type WorkerAvailability<'a> = WorkAvailabilityPath<'a>;
 
     fn worker_availability(&self, worker_idx: usize) -> WorkAvailabilityPath<'_> {
         WorkAvailabilityPath::new(self, worker_idx)

@@ -134,7 +134,8 @@ impl<Res: Send, Shared: SharedState, ImplWork: Work<Res, Shared>, ImplNotify: No
 
 /// Type-erased handle to a [`Job`]
 #[derive(Debug, Eq, Hash, PartialEq)]
-pub(crate) struct DynJob<Shared: SharedState> {
+#[doc(hidden)]
+pub struct DynJob<Shared: SharedState> {
     /// Type-erased `&mut JobState<...>` pointer
     state: *mut (),
 

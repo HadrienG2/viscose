@@ -6,7 +6,7 @@ pub(crate) mod futex;
 pub(crate) mod hierarchical;
 pub(crate) mod job;
 
-use self::{futex::WorkerFutex, job::DynJob};
+use self::{futex::WorkerFutex, hierarchical::path::WorkAvailabilityPath, job::DynJob};
 use crossbeam::deque::{self, Steal, Stealer};
 use hwlocality::{bitmap::BitmapIndex, cpu::cpuset::CpuSet, Topology};
 use std::{
@@ -28,24 +28,18 @@ pub trait SharedState: Send + Sized + Sync + 'static {
     #[doc(hidden)]
     fn worker_interfaces(&self) -> impl Iterator<Item = &'_ WorkerInterface<Self>>;
 
-    /// Worker-private work availability bit
+    /// Make a worker availability signal path
     ///
     /// Workers can use this to signal when they have extra work available to
     /// steal and when they stop having work available (and thus are looking for
     /// more work).
-    #[doc(hidden)]
-    type WorkerAvailability<'a>: Clone + Debug + Eq + PartialEq + WorkerAvailability
-    where
-        Self: 'a;
-
-    /// Make a worker availability bit
     ///
     /// This accessor is meant to constructed by workers at thread pool
     /// initialization time and then retained for the entire lifetime of the
     /// thread pool. As a result, it is optimized for efficiency of repeated
     /// usage, but initial construction may be expensive.
     #[doc(hidden)]
-    fn worker_availability(&self, worker_idx: usize) -> Self::WorkerAvailability<'_>;
+    fn worker_availability(&self, worker_idx: usize) -> WorkAvailabilityPath<'_>;
 
     /// Enumerate workers with work available to steal at increasing distances
     /// from a certain "thief" worker
@@ -53,7 +47,7 @@ pub trait SharedState: Send + Sized + Sync + 'static {
     fn find_work_to_steal<'result>(
         &'result self,
         thief_worker_idx: usize,
-        thief_availability: &'result Self::WorkerAvailability<'result>,
+        thief_availability: &'result WorkAvailabilityPath<'result>,
     ) -> Option<impl Iterator<Item = usize> + 'result>;
 
     /// Given a worker with work available for stealing, find the closest cousin
@@ -69,7 +63,7 @@ pub trait SharedState: Send + Sized + Sync + 'static {
     fn suggest_stealing_from_worker<'self_>(
         &'self_ self,
         target_worker_idx: usize,
-        target_availability: &Self::WorkerAvailability<'self_>,
+        target_availability: &WorkAvailabilityPath<'self_>,
         update: Ordering,
     );
 
@@ -107,10 +101,10 @@ pub trait WorkerAvailability {
 #[doc(hidden)]
 pub struct WorkerConfig<Shared: SharedState> {
     /// Work queue
-    pub work_queue: deque::Worker<DynJob<Shared>>,
+    pub(crate) work_queue: deque::Worker<DynJob<Shared>>,
 
     /// CPU which this worker should be pinned to
-    pub cpu: BitmapIndex,
+    pub(crate) cpu: BitmapIndex,
 }
 
 /// External interface to a single worker in a thread pool
@@ -118,11 +112,11 @@ pub struct WorkerConfig<Shared: SharedState> {
 #[doc(hidden)]
 pub struct WorkerInterface<Shared: SharedState> {
     /// A way to steal from the worker
-    pub stealer: Stealer<DynJob<Shared>>,
+    pub(crate) stealer: Stealer<DynJob<Shared>>,
 
     /// Futex that the worker sleeps on when it has nothing to do, used to
     /// instruct it what to do when it is awakened.
-    pub futex: WorkerFutex,
+    pub(crate) futex: WorkerFutex,
 }
 
 /// Prepare to add a new worker to the thread pool

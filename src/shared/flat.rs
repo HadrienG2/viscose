@@ -8,6 +8,7 @@
 use super::{
     flags::{bitref::BitRef, AtomicFlags},
     futex::{StealLocation, WorkerFutex},
+    hierarchical::path::WorkAvailabilityPath,
     job::DynJob,
     SharedState, WorkerAvailability, WorkerConfig, WorkerInterface,
 };
@@ -25,7 +26,7 @@ use std::{
 /// State shared between all thread pool users and workers, with
 /// non-hierarchical work availability tracking.
 #[derive(Debug)]
-pub(crate) struct FlatState {
+pub struct FlatState {
     /// Global work injector
     injector: Injector<DynJob<Self>>,
 
@@ -86,21 +87,19 @@ impl SharedState for FlatState {
         self.workers.iter().map(Deref::deref)
     }
 
-    type WorkerAvailability<'a> = BitRef<'a, true>;
-
-    fn worker_availability(&self, worker_idx: usize) -> BitRef<'_, true> {
-        self.work_availability.bit_with_cache(worker_idx)
+    fn worker_availability(&self, worker_idx: usize) -> WorkAvailabilityPath<'_> {
+        WorkAvailabilityPath::new_flat_with_cache(&self.work_availability, worker_idx)
     }
 
     fn find_work_to_steal<'result>(
         &'result self,
         _thief_worker_idx: usize,
-        thief_availability: &'result BitRef<'result, true>,
+        thief_availability: &'result WorkAvailabilityPath<'result>,
     ) -> Option<impl Iterator<Item = usize> + 'result> {
         let work_availability = &self.work_availability;
         work_availability
             .iter_set_around::<false, true>(
-                thief_availability,
+                thief_availability.flat_bit(),
                 // Need at least Acquire ordering to ensure that the work we
                 // observed to be available is actually visible in the worker's
                 // queue, and don't need anything stronger:
@@ -115,14 +114,15 @@ impl SharedState for FlatState {
             .map(|iter| iter.map(|bit| bit.linear_idx(work_availability)))
     }
 
+    #[inline]
     fn suggest_stealing_from_worker<'self_>(
         &'self_ self,
         target_worker_idx: usize,
-        target_availability: &BitRef<'self_, true>,
+        target_availability: &WorkAvailabilityPath<'self_>,
         update: Ordering,
     ) {
         self.suggest_stealing::<false, true>(
-            target_availability,
+            target_availability.flat_bit(),
             StealLocation::Worker(target_worker_idx),
             update,
         )

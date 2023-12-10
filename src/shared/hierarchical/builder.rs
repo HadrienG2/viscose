@@ -364,11 +364,6 @@ impl HierarchicalStateBuilder {
         (result, self.worker_configs.into())
     }
 
-    /// Affinity mask
-    fn cpuset(&self) -> &CpuSet {
-        &self.cpuset
-    }
-
     /// Apply our affinity mask to the cpuset of a [`TopologyObject`] proposed
     /// for insertion into the tree
     fn restrict_cpuset(&self, object: &TopologyObject) -> CpuSet {

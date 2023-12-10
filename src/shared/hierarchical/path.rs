@@ -1,7 +1,10 @@
 //! Node path from a worker to the top of the `work_availability_tree`
 
 use super::{ChildrenLink, HierarchicalState};
-use crate::shared::{flags::bitref::BitRef, WorkerAvailability};
+use crate::shared::{
+    flags::{bitref::BitRef, AtomicFlags},
+    WorkerAvailability,
+};
 use std::{
     iter::FusedIterator,
     sync::atomic::{self, Ordering},
@@ -13,7 +16,8 @@ use std::{
 /// parent node's `worker_children`. Subsequent `BitRef`s target the
 /// `work_availability` of ancestor nodes' `node_children`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct WorkAvailabilityPath<'shared>(Box<[BitRef<'shared, true>]>);
+#[doc(hidden)]
+pub struct WorkAvailabilityPath<'shared>(Box<[BitRef<'shared, true>]>);
 //
 impl WorkerAvailability for WorkAvailabilityPath<'_> {
     fn is_set(&self, order: Ordering) -> Option<bool> {
@@ -45,6 +49,14 @@ impl<'shared> WorkAvailabilityPath<'shared> {
         )
     }
 
+    /// Simplified version of `new()` for flat pools
+    pub(in crate::shared) fn new_flat_with_cache(
+        flags: &'shared AtomicFlags,
+        worker_idx: usize,
+    ) -> Self {
+        Self(vec![flags.bit_with_cache(worker_idx)].into())
+    }
+
     /// Semantically equivalent to creating a new path, yielding the ancestors,
     /// and dropping the path, but optimized for this short-lived path use case
     pub(super) fn lazy_ancestors(
@@ -64,6 +76,16 @@ impl<'shared> WorkAvailabilityPath<'shared> {
         &'self_ self,
     ) -> impl ExactSizeIterator<Item = &'self_ BitRef<'shared, true>> + FusedIterator {
         self.0.iter()
+    }
+
+    /// Simplified version of of `num_ancestors()`/`ancestors()` for flat pools
+    pub(in crate::shared) fn flat_bit(&self) -> &BitRef<'shared, true> {
+        debug_assert_eq!(
+            self.num_ancestors(),
+            1,
+            "flat work availability path should have only one component"
+        );
+        &self.0[0]
     }
 
     /// Shared commonalities between `new()` and `lazy_ancestors()`

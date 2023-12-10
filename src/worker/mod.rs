@@ -6,6 +6,7 @@ use self::scope::Scope;
 use crate::{
     shared::{
         futex::{StealLocation, WorkerFutex, WorkerFutexState},
+        hierarchical::path::WorkAvailabilityPath,
         job::DynJob,
         SharedState, WorkerAvailability,
     },
@@ -30,7 +31,7 @@ pub(crate) struct Worker<'pool, Shared: SharedState> {
     ///
     /// Tracks whether we think there is work available to steal in our work
     /// queue (this information may become obsolete if the work gets stolen)
-    work_available: WorkAvailabilityBit<'pool, Shared>,
+    work_available: WorkAvailabilityBit<'pool>,
 
     /// Quick access to this thread's futex
     ///
@@ -323,9 +324,9 @@ impl<'pool, Shared: SharedState> Worker<'pool, Shared> {
 /// worker fails to pop work from its work queue. May be incorrectly set if
 /// other workers have stolen work, but will never be incorrectly unset.
 #[derive(Clone, Debug)]
-struct WorkAvailabilityBit<'pool, Shared: SharedState> {
+struct WorkAvailabilityBit<'pool> {
     /// Availability bit of this worker within the shared state
-    bit: Shared::WorkerAvailability<'pool>,
+    bit: WorkAvailabilityPath<'pool>,
 
     /// Truth that `bit` is currently set
     ///
@@ -335,9 +336,9 @@ struct WorkAvailabilityBit<'pool, Shared: SharedState> {
     bit_is_set: Cell<bool>,
 }
 //
-impl<'pool, Shared: SharedState> WorkAvailabilityBit<'pool, Shared> {
+impl<'pool> WorkAvailabilityBit<'pool> {
     /// Set up work availability notifications
-    fn new(shared: &'pool Shared, worker_idx: usize) -> Self {
+    fn new<Shared: SharedState>(shared: &'pool Shared, worker_idx: usize) -> Self {
         let bit = shared.worker_availability(worker_idx);
         // Can be a relaxed load since no one else should be modifying this bit
         let bit_is_set = Cell::new(bit.is_set(Ordering::Relaxed).unwrap_or(false));
