@@ -1,7 +1,9 @@
 //! Thread pool job
 
 use crate::{worker::scope::Scope, Work};
-use std::{cell::UnsafeCell, panic::AssertUnwindSafe};
+use std::{cell::UnsafeCell, marker::PhantomData, panic::AssertUnwindSafe};
+
+use super::SharedState;
 
 /// Aborts the process if dropped
 ///
@@ -33,14 +35,23 @@ impl Drop for AbortOnUnwind {
 /// - Once a job completion signal has been received with Acquire memory
 ///   ordering, you may extract the result and propagate panics with
 ///   `result_or_panic()`.
-pub(crate) struct Job<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify>(
-    UnsafeCell<JobState<Res, ImplWork, ImplNotify>>,
-);
+pub(crate) struct Job<
+    Res: Send,
+    Shared: SharedState,
+    ImplWork: Work<Res, Shared>,
+    ImplNotify: Notify,
+>(UnsafeCell<JobState<Res, Shared, ImplWork, ImplNotify>>);
 //
-impl<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify> Job<Res, ImplWork, ImplNotify> {
+impl<Res: Send, Shared: SharedState, ImplWork: Work<Res, Shared>, ImplNotify: Notify>
+    Job<Res, Shared, ImplWork, ImplNotify>
+{
     /// Prepare [`Work`] for execution by the thread pool
     pub fn new(notify: ImplNotify, work: ImplWork) -> Self {
-        Self(UnsafeCell::new(JobState::Scheduled(notify, work)))
+        Self(UnsafeCell::new(JobState::Scheduled(
+            notify,
+            work,
+            PhantomData,
+        )))
     }
 
     /// Create a type-erased handle that can be pushed on a work queue
@@ -49,11 +60,11 @@ impl<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify> Job<Res, ImplWork, Impl
     ///
     /// Should only be called once, as preparation for submitting the job to the
     /// thread pool.
-    pub unsafe fn as_dyn(&mut self) -> DynJob {
+    pub unsafe fn as_dyn(&mut self) -> DynJob<Shared> {
         let state = self.0.get();
         let state = state.cast::<()>();
-        let run = |state: *mut (), scope: &Scope<'_>| {
-            let state = state.cast::<JobState<Res, ImplWork, ImplNotify>>();
+        let run = |state: *mut (), scope: &Scope<'_, Shared>| {
+            let state = state.cast::<JobState<Res, Shared, ImplWork, ImplNotify>>();
             // SAFETY: Per `Job` API contract
             unsafe { (*state).run(scope) };
         };
@@ -69,7 +80,7 @@ impl<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify> Job<Res, ImplWork, Impl
     #[track_caller]
     pub unsafe fn result_or_panic(mut self) -> Res {
         match std::mem::replace(self.0.get_mut(), JobState::Collected) {
-            JobState::Scheduled(_, _) | JobState::Running => {
+            JobState::Scheduled(_, _, _) | JobState::Running => {
                 panic!("Job result shouldn't be collected before completion notification")
             }
             JobState::Finished(result) => crate::result_or_panic(result),
@@ -80,9 +91,9 @@ impl<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify> Job<Res, ImplWork, Impl
 
 /// [`Job`] state machine
 #[derive(Debug)]
-enum JobState<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify> {
+enum JobState<Res: Send, Shared: SharedState, ImplWork: Work<Res, Shared>, ImplNotify: Notify> {
     /// Job has not started executing yet
-    Scheduled(ImplNotify, ImplWork),
+    Scheduled(ImplNotify, ImplWork, PhantomData<Shared>),
 
     /// Job is executing on some worker thread
     Running,
@@ -94,15 +105,17 @@ enum JobState<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify> {
     Collected,
 }
 //
-impl<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify> JobState<Res, ImplWork, ImplNotify> {
+impl<Res: Send, Shared: SharedState, ImplWork: Work<Res, Shared>, ImplNotify: Notify>
+    JobState<Res, Shared, ImplWork, ImplNotify>
+{
     /// Run the job
     ///
     /// # Safety
     ///
     /// This should only be called once, on a job fresh from the work queue.
-    unsafe fn run(&mut self, scope: &Scope<'_>) {
+    unsafe fn run(&mut self, scope: &Scope<'_, Shared>) {
         let (notify, work) = match std::mem::replace(self, Self::Running) {
-            Self::Scheduled(notify, work) => (notify, work),
+            Self::Scheduled(notify, work, PhantomData) => (notify, work),
             other => {
                 if cfg!(debug_assertions) {
                     panic!("attempted to execute a Job in an invalid state");
@@ -121,23 +134,23 @@ impl<Res: Send, ImplWork: Work<Res>, ImplNotify: Notify> JobState<Res, ImplWork,
 
 /// Type-erased handle to a [`Job`]
 #[derive(Debug, Eq, Hash, PartialEq)]
-pub(crate) struct DynJob {
+pub(crate) struct DynJob<Shared: SharedState> {
     /// Type-erased `&mut JobState<...>` pointer
     state: *mut (),
 
     /// Type-erased `JobState<...>::run()` method
     ///
     /// The first parameter must be `self.job`.
-    run: fn(*mut (), &Scope<'_>),
+    run: fn(*mut (), &Scope<'_, Shared>),
 }
 //
-impl DynJob {
+impl<Shared: SharedState> DynJob<Shared> {
     /// Execute the job
     ///
     /// # Safety
     ///
     /// See top-level [`Job`] documentation.
-    pub unsafe fn run(self, scope: &Scope<'_>) {
+    pub unsafe fn run(self, scope: &Scope<'_, Shared>) {
         (self.run)(self.state, scope)
     }
 }
@@ -147,7 +160,7 @@ impl DynJob {
 //         current thread will not touch the Job in any way until the other
 //         thread is done with the DynJob, which means that for all intents and
 //         purposes we effectively own the inner Work.
-unsafe impl Send for DynJob {}
+unsafe impl<Shared: SharedState> Send for DynJob<Shared> {}
 
 /// Mechanism to notify the program that a job is done executing
 ///

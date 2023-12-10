@@ -3,7 +3,12 @@ use viscose::bench;
 
 fn criterion_benchmark(c: &mut Criterion) {
     bench::for_each_locality(
-        |rayon_name, mut make_rayon_pool, flat_name, mut make_flat_pool| {
+        |rayon_name,
+         mut make_rayon_pool,
+         flat_name,
+         mut make_flat_pool,
+         hierarchical_name,
+         mut make_hierarchical_pool| {
             fn bench_backend(
                 c: &mut Criterion,
                 backend_name: &str,
@@ -30,7 +35,14 @@ fn criterion_benchmark(c: &mut Criterion) {
                 let flat_pool = make_flat_pool();
                 bench_backend(c, flat_name, |b: &mut Bencher, size| {
                     flat_pool
-                        .run(|scope| b.iter(|| bench::fibonacci_flat(scope, pessimize::hide(size))))
+                        .run(|scope| b.iter(|| bench::fibonacci_pool(scope, pessimize::hide(size))))
+                })
+            }
+            {
+                let hierarchical_pool = make_hierarchical_pool();
+                bench_backend(c, hierarchical_name, |b: &mut Bencher, size| {
+                    hierarchical_pool
+                        .run(|scope| b.iter(|| bench::fibonacci_pool(scope, pessimize::hide(size))))
                 })
             }
         },

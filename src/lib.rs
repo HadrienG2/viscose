@@ -11,9 +11,9 @@ mod pool;
 mod shared;
 mod worker;
 
+pub use crate::{pool::ThreadPool, worker::scope::Scope};
+use shared::SharedState;
 use std::{sync::atomic::Ordering, time::Duration};
-
-pub use crate::{pool::FlatPool, worker::scope::Scope};
 
 /// Minimal busy-waiting time between declaring sleepiness and falling asleep
 ///
@@ -36,12 +36,16 @@ const MAX_SPIN_ITERS_PER_CHECK: u8 = 8;
 ///
 /// The input [`Scope`] allows the scheduled work to interact with the thread
 /// pool by e.g. spawning new tasks.
-pub trait Work<Res: Send>: for<'scope> FnOnce(&Scope<'scope>) -> Res + Send {}
+pub trait Work<Res: Send, Shared: SharedState>:
+    for<'scope> FnOnce(&Scope<'scope, Shared>) -> Res + Send
+{
+}
 //
-impl<Res, Body> Work<Res> for Body
+impl<Res, Shared, Body> Work<Res, Shared> for Body
 where
     Res: Send,
-    Body: for<'scope> FnOnce(&Scope<'scope>) -> Res + Send,
+    Shared: SharedState,
+    Body: for<'scope> FnOnce(&Scope<'scope, Shared>) -> Res + Send,
 {
 }
 
@@ -148,6 +152,7 @@ pub(crate) fn topology() -> &'static std::sync::Arc<hwlocality::Topology> {
     INSTANCE.get_or_init(|| Arc::new(Topology::new().unwrap()))
 }
 
+#[allow(unused_imports)]
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

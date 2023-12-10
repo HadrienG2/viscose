@@ -27,9 +27,9 @@ use std::{
 /// Simple flat pinned thread pool, used to check hypothesis that pinning and
 /// avoidance of TLS alone won't let us significantly outperform rayon
 #[derive(Debug)]
-pub struct FlatPool {
+pub struct ThreadPool<Shared: SharedState> {
     /// Shared state
-    shared: Arc<SharedState>,
+    shared: Arc<Shared>,
 
     /// Hwloc topology
     topology: Arc<Topology>,
@@ -41,7 +41,7 @@ pub struct FlatPool {
     workers: Vec<JoinHandle<()>>,
 }
 //
-impl FlatPool {
+impl<Shared: SharedState> ThreadPool<Shared> {
     /// Create a thread pool that uses all system CPU cores
     pub fn new() -> Self {
         let topology = Arc::new(Topology::new().unwrap());
@@ -53,7 +53,7 @@ impl FlatPool {
     /// Only CPU cores that belong to this CpuSet will be used.
     pub fn with_affinity(topology: Arc<Topology>, affinity: impl Borrow<CpuSet>) -> Self {
         // Set up the shared state and work queues
-        let (shared, worker_configs) = SharedState::with_worker_config(&topology, affinity);
+        let (shared, worker_configs) = Shared::with_worker_config(&topology, affinity);
 
         // Start worker threads
         let mut cpu_to_worker = HashMap::with_capacity(worker_configs.len());
@@ -64,7 +64,7 @@ impl FlatPool {
             workers.push(
                 std::thread::Builder::new()
                     .name(format!(
-                        "FlatPool worker #{worker_idx} (CPU {})",
+                        "ThreadPool worker #{worker_idx} (CPU {})",
                         worker_config.cpu
                     ))
                     .spawn(move || {
@@ -80,7 +80,7 @@ impl FlatPool {
                         std::mem::drop(topology);
 
                         // Start processing work
-                        Worker::run(&shared, worker_idx, worker_config.work_queue);
+                        Worker::run(&*shared, worker_idx, worker_config.work_queue);
                     })
                     .expect("failed to spawn worker thread"),
             );
@@ -99,7 +99,7 @@ impl FlatPool {
     /// Synchronously execute work inside of the thread pool
     pub fn run<W, Res>(&self, work: W) -> Res
     where
-        W: Work<Res>,
+        W: Work<Res, Shared>,
         Res: Send,
     {
         // Propagate worker thread panics
@@ -150,7 +150,7 @@ impl FlatPool {
     /// notification has not been received. This entails in particular that all
     /// code including spawn_unchecked until the point where the remote task has
     /// signaled completion should translate unwinding panics to aborts.
-    unsafe fn spawn_unchecked(&self, job: DynJob) {
+    unsafe fn spawn_unchecked(&self, job: DynJob<Shared>) {
         // Determine the caller's current CPU location to decide which worker
         // thread would be best placed for processing this task
         let caller_cpu = self
@@ -175,13 +175,13 @@ impl FlatPool {
     }
 }
 //
-impl Default for FlatPool {
+impl<Shared: SharedState> Default for ThreadPool<Shared> {
     fn default() -> Self {
         Self::new()
     }
 }
 //
-impl Drop for FlatPool {
+impl<Shared: SharedState> Drop for ThreadPool<Shared> {
     fn drop(&mut self) {
         // Tell workers that no further work will be coming and wake them all up
         //
@@ -219,10 +219,20 @@ unsafe impl Notify for NotifyParked<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::{flat::FlatState, hierarchical::HierarchicalState};
+
+    fn check_lifecycle<Shared: SharedState>() {
+        // Check that thread pool initializes and shuts down correctly
+        ThreadPool::<Shared>::new();
+    }
 
     #[test]
-    fn lifecycle() {
-        // Check that thread pool initializes and shuts down correctly
-        FlatPool::new();
+    fn lifecycle_flat() {
+        check_lifecycle::<FlatState>()
+    }
+
+    #[test]
+    fn lifecycle_hierarchical() {
+        check_lifecycle::<HierarchicalState>()
     }
 }

@@ -12,10 +12,10 @@ pub(crate) struct HierarchicalStateBuilder {
     cpuset: CpuSet,
 
     /// Configurations for future workers attached to the tree
-    worker_configs: Vec<WorkerConfig>,
+    worker_configs: Vec<WorkerConfig<HierarchicalState>>,
 
     /// Public interfaces of workers attached to the tree
-    worker_interfaces: Vec<CachePadded<Child<WorkerInterface>>>,
+    worker_interfaces: Vec<CachePadded<Child<WorkerInterface<HierarchicalState>>>>,
 
     /// Tree for local work availability signaling
     work_availability_tree: Vec<Child<Node>>,
@@ -343,7 +343,12 @@ impl HierarchicalStateBuilder {
     }
 
     /// Finish building the tree
-    pub fn build(self) -> (Arc<HierarchicalState>, Box<[WorkerConfig]>) {
+    pub fn build(
+        self,
+    ) -> (
+        Arc<HierarchicalState>,
+        Box<[WorkerConfig<HierarchicalState>]>,
+    ) {
         // Make sure the final state meets expectations
         assert_eq!(self.worker_configs.len(), self.expected_workers());
         assert_eq!(self.worker_interfaces.len(), self.expected_workers());

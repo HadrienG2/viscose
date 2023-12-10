@@ -3,7 +3,12 @@ use viscose::bench::{self, bench_local_floats};
 
 fn criterion_benchmark(c: &mut Criterion) {
     bench::for_each_locality(
-        |rayon_name, mut make_rayon_pool, flat_name, mut make_flat_pool| {
+        |rayon_name,
+         mut make_rayon_pool,
+         flat_name,
+         mut make_flat_pool,
+         hierarchical_name,
+         mut make_hierarchical_pool| {
             macro_rules! bench_norm_sqr {
             () => {
                 // I picked these values because...
@@ -53,7 +58,25 @@ fn criterion_benchmark(c: &mut Criterion) {
                         |b: &mut Bencher, slice| {
                             flat_pool.run(|scope| {
                                 b.iter(|| {
-                                    bench::norm_sqr_flat::<BLOCK_SIZE, ILP_STREAMS>(
+                                    bench::norm_sqr_pool::<BLOCK_SIZE, ILP_STREAMS, _>(
+                                        scope,
+                                        pessimize::hide(slice),
+                                    )
+                                })
+                            })
+                        },
+                    );
+                }
+                {
+                    let hierarchical_pool = make_hierarchical_pool();
+                    bench_local_floats::<BLOCK_SIZE>(
+                        c,
+                        bench_name,
+                        hierarchical_name,
+                        |b: &mut Bencher, slice| {
+                            hierarchical_pool.run(|scope| {
+                                b.iter(|| {
+                                    bench::norm_sqr_pool::<BLOCK_SIZE, ILP_STREAMS, _>(
                                         scope,
                                         pessimize::hide(slice),
                                     )

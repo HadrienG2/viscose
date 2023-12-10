@@ -1,7 +1,7 @@
 //! Node path from a worker to the top of the `work_availability_tree`
 
 use super::{ChildrenLink, HierarchicalState};
-use crate::shared::flags::bitref::BitRef;
+use crate::shared::{flags::bitref::BitRef, WorkerAvailability};
 use std::{
     iter::FusedIterator,
     sync::atomic::{self, Ordering},
@@ -15,12 +15,26 @@ use std::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkAvailabilityPath<'shared>(Box<[BitRef<'shared, true>]>);
 //
+impl WorkerAvailability for WorkAvailabilityPath<'_> {
+    fn is_set(&self, order: Ordering) -> Option<bool> {
+        self.0.first().map(|bit| bit.is_set(order))
+    }
+
+    fn fetch_set(&self, order: Ordering) -> Option<bool> {
+        self.fetch_op(BitRef::check_empty_and_set, order)
+    }
+
+    fn fetch_clear(&self, order: Ordering) -> Option<bool> {
+        self.fetch_op(BitRef::clear_and_check_emptied, order)
+    }
+}
+//
 impl<'shared> WorkAvailabilityPath<'shared> {
     /// Compute the full work availability path for a given worker
     ///
     /// This is a fairly expensive computation, and workers are very strongly
     /// advised to cache the result instead or repeating the query.
-    pub fn new(shared: &'shared HierarchicalState, worker_idx: usize) -> Self {
+    pub(super) fn new(shared: &'shared HierarchicalState, worker_idx: usize) -> Self {
         Self(
             Self::lazy_ancestors_impl(
                 shared,
@@ -38,22 +52,6 @@ impl<'shared> WorkAvailabilityPath<'shared> {
         worker_idx: usize,
     ) -> impl FusedIterator<Item = BitRef<'shared, false>> {
         Self::lazy_ancestors_impl(shared, worker_idx, ChildrenLink::child_availability)
-    }
-
-    /// Set this worker's work availability bit, propagating information that
-    /// work is available throughout the hierarchy
-    ///
-    /// Return the former worker-private work availability bit value, if any
-    pub fn fetch_set(&self, order: Ordering) -> Option<bool> {
-        self.fetch_op(BitRef::check_empty_and_set, order)
-    }
-
-    /// Clear this worker's work availability bit, propagating information that
-    /// work isn't available anymore throughout the hierarchy
-    ///
-    /// Return the former worker-private work availability bit value, if any
-    pub fn fetch_clear(&self, order: Ordering) -> Option<bool> {
-        self.fetch_op(BitRef::clear_and_check_emptied, order)
     }
 
     /// Number of ancestor nodes above this worker in the tree
@@ -184,7 +182,10 @@ impl<'shared> WorkAvailabilityPath<'shared> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::hierarchical::{Child, Node};
+    use crate::shared::{
+        hierarchical::{Child, Node},
+        SharedState,
+    };
     use hwlocality::cpu::cpuset::CpuSet;
     use proptest::{collection::SizeRange, prelude::*};
     use std::sync::Arc;

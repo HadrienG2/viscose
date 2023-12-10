@@ -12,7 +12,7 @@ use self::{
     builder::HierarchicalStateBuilder,
     path::WorkAvailabilityPath,
 };
-use super::{flags::AtomicFlags, job::DynJob, WorkerConfig, WorkerInterface, futex::StealLocation};
+use super::{flags::AtomicFlags, job::DynJob, WorkerConfig, WorkerInterface, futex::StealLocation, SharedState};
 use crate::bench::BitRef;
 use crossbeam::{deque::{Injector, Steal}, utils::CachePadded};
 use hwlocality::{cpu::cpuset::CpuSet, Topology};
@@ -27,13 +27,13 @@ use std::{
 #[derive(Debug)]
 pub(crate) struct HierarchicalState {
     /// Global injector
-    injector: Injector<DynJob>,
+    injector: Injector<DynJob<Self>>,
 
     /// One worker interface per worker thread
     ///
     /// All workers associated with a given tree node reside at consecutive
     /// indices, but the ordering of workers is otherwise unspecified.
-    workers: Box<[CachePadded<Child<WorkerInterface>>]>,
+    workers: Box<[CachePadded<Child<WorkerInterface<Self>>>]>,
 
     /// One node per hwloc TopologyObject with multiple children.
     ///
@@ -43,37 +43,25 @@ pub(crate) struct HierarchicalState {
     work_availability_tree: Box<[Child<Node>]>,
 }
 //
-impl HierarchicalState {
-    /// Set up the shared and worker-local state
-    pub fn with_worker_config(
+impl SharedState for HierarchicalState {
+    fn with_worker_config(
         topology: &Topology,
         affinity: impl Borrow<CpuSet>,
-    ) -> (Arc<Self>, Box<[WorkerConfig]>) {
+    ) -> (Arc<Self>, Box<[WorkerConfig<Self>]>) {
         HierarchicalStateBuilder::from_topology_affinity(topology, affinity.borrow()).build()
     }
 
-    /// Access the worker interfaces
-    pub fn worker_interfaces(&self) -> impl Iterator<Item = &'_ WorkerInterface> {
+    fn worker_interfaces(&self) -> impl Iterator<Item = &'_ WorkerInterface<Self>> {
         self.workers.iter().map(|child| &child.object)
     }
 
-    /// Generate a worker-private work availability path
-    ///
-    /// Workers can use this to signal when they have work available to steal
-    /// and when they stop having work available to steal. It is also used as a
-    /// worker identifier in other methods of this class.
-    ///
-    /// This accessor is meant to constructed by workers at thread pool
-    /// initialization time and then retained for the entire lifetime of the
-    /// thread pool. As a result, it is optimized for efficiency of repeated
-    /// usage, but initial construction may be expensive.
-    pub fn worker_availability(&self, worker_idx: usize) -> WorkAvailabilityPath<'_> {
+    type WorkerAvailability<'a> = WorkAvailabilityPath<'a>;
+
+    fn worker_availability(&self, worker_idx: usize) -> WorkAvailabilityPath<'_> {
         WorkAvailabilityPath::new(self, worker_idx)
     }
 
-    /// Enumerate workers with work available to steal at increasing distances
-    /// from a certain "thief" worker
-    pub fn find_work_to_steal<'result>(
+    fn find_work_to_steal<'result>(
         &'result self,
         thief_worker_idx: usize,
         thief_availability: &'result WorkAvailabilityPath<'result>,
@@ -86,16 +74,7 @@ impl HierarchicalState {
         )
     }
 
-    /// Given a worker with work available for stealing, find the closest cousin
-    /// that doesn't have work, if any, and suggest that it steal from there
-    ///
-    /// There should be a `Release` barrier between the moment where work is
-    /// pushed in the worker's work queue and the moment where work is signaled
-    /// to be available like this. You can either bundle the `Release` barrier
-    /// into this transaction, or put a separate `atomic::fence(Release)` before
-    /// this transaction and make it `Relaxed` if you have multiple work
-    /// availability signaling transactions to do.
-    pub fn suggest_stealing_from_worker<'self_>(
+    fn suggest_stealing_from_worker<'self_>(
         &'self_ self,
         target_worker_idx: usize,
         target_availability: &WorkAvailabilityPath<'self_>,
@@ -109,9 +88,7 @@ impl HierarchicalState {
         )
     }
 
-    /// Inject work from outside the thread pool, and tell the worker closest to
-    /// the originating locality that doesn't have work about it
-    pub fn inject_job(&self, job: DynJob, local_worker_idx: usize) {
+    fn inject_job(&self, job: DynJob<Self>, local_worker_idx: usize) {
         self.injector.push(job);
         self.suggest_stealing::<true, false>(
             local_worker_idx,
@@ -128,11 +105,12 @@ impl HierarchicalState {
         );
     }
 
-    /// Try to steal a job from the global work injector
-    pub fn steal_from_injector(&self) -> Steal<DynJob> {
+    fn steal_from_injector(&self) -> Steal<DynJob<Self>> {
         self.injector.steal()
     }
-
+}
+//
+impl HierarchicalState {
     /// Enumerate workers that match a certain work availability condition
     /// (either they have work available for stealing, or they are looking for
     /// work) at increasing distances from a certain "local" worker

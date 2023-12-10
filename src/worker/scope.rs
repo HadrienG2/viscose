@@ -8,6 +8,7 @@ use crate::{
     shared::{
         futex::WorkerFutex,
         job::{AbortOnUnwind, DynJob, Job, Notify},
+        SharedState,
     },
     Work,
 };
@@ -23,9 +24,9 @@ use std::{
 /// worker thread insid of the thread pool, and can be used to schedule work on
 /// said thread pool.
 #[derive(Debug)]
-pub struct Scope<'scope>(AssertUnwindSafe<&'scope Worker<'scope>>);
+pub struct Scope<'scope, Shared: SharedState>(AssertUnwindSafe<&'scope Worker<'scope, Shared>>);
 //
-impl<'scope> Scope<'scope> {
+impl<'scope, Shared: SharedState> Scope<'scope, Shared> {
     /// Provide an opportunity for fork-join parallelism
     ///
     /// Run the `local` task, while leaving the `remote` task available for
@@ -39,7 +40,7 @@ impl<'scope> Scope<'scope> {
     ) -> (LocalRes, RemoteRes)
     where
         LocalFn: FnOnce() -> LocalRes,
-        RemoteFn: Work<RemoteRes>,
+        RemoteFn: Work<RemoteRes, Shared>,
         RemoteRes: Send,
     {
         // Set up remote job and its completion notification mechanism
@@ -97,7 +98,7 @@ impl<'scope> Scope<'scope> {
     }
 
     /// Set up a scope associated with a particular worker thread
-    pub(super) fn new(worker: &'scope Worker<'scope>) -> Self {
+    pub(super) fn new(worker: &'scope Worker<'scope, Shared>) -> Self {
         Self(AssertUnwindSafe(worker))
     }
 
@@ -113,7 +114,7 @@ impl<'scope> Scope<'scope> {
     /// code including spawn_unchecked until the point where the remote task has
     /// signaled completion should translate unwinding panics to aborts.
     #[inline(always)]
-    unsafe fn spawn_unchecked(&self, job: DynJob) {
+    unsafe fn spawn_unchecked(&self, job: DynJob<Shared>) {
         // Schedule the work to be executed
         self.0.work_queue.push(job);
 
