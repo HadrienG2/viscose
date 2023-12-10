@@ -448,6 +448,7 @@ mod tests {
         let flat = ThreadPool::<Shared>::new();
         flat.run(|scope| {
             for i in 0..=34 {
+                eprintln!("Starting fibonacci_pool({i})");
                 assert_eq!(fibonacci_pool(scope, i), fibonacci_ref(i));
             }
         });

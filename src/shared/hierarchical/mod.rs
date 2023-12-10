@@ -7,19 +7,23 @@
 
 mod builder;
 pub(crate) mod path;
+mod search;
 
-use self::{
-    builder::HierarchicalStateBuilder,
-    path::WorkAvailabilityPath,
+use self::{builder::HierarchicalStateBuilder, path::WorkAvailabilityPath};
+use super::{
+    flags::AtomicFlags, futex::StealLocation, job::DynJob, SharedState, WorkerConfig,
+    WorkerInterface,
 };
-use super::{flags::AtomicFlags, job::DynJob, WorkerConfig, WorkerInterface, futex::StealLocation, SharedState};
 use crate::bench::BitRef;
-use crossbeam::{deque::{Injector, Steal}, utils::CachePadded};
+use crossbeam::{
+    deque::{Injector, Steal},
+    utils::CachePadded,
+};
 use hwlocality::{cpu::cpuset::CpuSet, Topology};
 use rand::Rng;
 use std::{
     borrow::{Borrow, Cow},
-    sync::{atomic::Ordering, Arc}, collections::VecDeque,
+    sync::{atomic::Ordering, Arc},
 };
 
 /// State shared between all thread pool users and workers, with hierarchical
@@ -65,14 +69,16 @@ impl SharedState for HierarchicalState {
         thief_worker_idx: usize,
         thief_availability: &'result WorkAvailabilityPath<'result>,
     ) -> Option<impl Iterator<Item = usize> + 'result> {
-        self.find_workers(
+        search::find_workers(
+            self,
             thief_worker_idx,
             thief_availability.ancestors().map(Cow::Borrowed),
-            |children, thief_bit, load| children.find_relatives_to_rob(thief_bit, load),
-            |children, load| children.find_strangers_to_rob(load)
+            ChildrenLink::find_siblings_to_rob,
+            ChildrenLink::find_strangers_to_rob,
         )
     }
 
+    #[inline]
     fn suggest_stealing_from_worker<'self_>(
         &'self_ self,
         target_worker_idx: usize,
@@ -110,139 +116,8 @@ impl SharedState for HierarchicalState {
 }
 //
 impl HierarchicalState {
-    /// Enumerate workers that match a certain work availability condition
-    /// (either they have work available for stealing, or they are looking for
-    /// work) at increasing distances from a certain "local" worker
-    ///
-    /// - `local_worker_idx` should identify the local worker around which we're
-    ///   searching for opportunities to steal or give work
-    /// - `ancestor_bits` should yield owned or borrowed [`BitRef`]s to each
-    ///   node ancestor of the local worker, in order, as if you were iterating
-    ///   over that worker's `WorkAvailabilityPath`.
-    /// - `find_relatives` should be `find_relatives_to_rob` when stealing work,
-    ///   `find_jobless_relatives` when giving work.
-    /// - `find_strangers` should be `find_strangers_to_rob` when stealing work,
-    ///   `find_jobless_strangers` when giving work.
-    fn find_workers<'result, const CACHE_SEARCH_MASKS: bool, Relatives, Strangers>(
-        &'result self,
-        local_worker_idx: usize,
-        mut ancestor_bits: impl Iterator<Item = Cow<'result, BitRef<'result, CACHE_SEARCH_MASKS>>> + 'result,
-        mut find_relatives: impl FnMut(&'result ChildrenLink, &BitRef<'result, CACHE_SEARCH_MASKS>, Ordering) -> Option<Relatives> + 'result,
-        mut find_strangers: impl FnMut(&'result ChildrenLink, Ordering) -> Option<Strangers> + 'result,
-    ) -> Option<impl Iterator<Item = usize> + 'result>
-        where
-            Relatives: Iterator<Item = usize> + 'result,
-            Strangers: Iterator<Item = usize> + 'result,
-    {
-        // Locate our direct parent or return None in case we have no parent
-        // (this means there are no other workers to exchange work with)
-        let worker_bit = ancestor_bits.next()?;
-        let parent_idx = self.workers[local_worker_idx].parent.expect(
-            "if a worker has a parent in its WorkAvailabilityPath, \
-            then it should have a parent node index",
-        );
-
-        // All loads need to have at least Acquire ordering because...
-        //
-        // - Between observing the value of a worker's work availability bit and
-        //   trying to act on the rest of that worker's state accordingly, an
-        //   Acquire barrier is needed to make sure that we have an up-to-date
-        //   view of the worker's state in question (as of the last work
-        //   availability bit update at least).
-        // - Between observing a node's work availability bit and querying the
-        //   work availability bits of its children, an Acquire barrier is
-        //   needed to make sure that the updates to the work availability bits
-        //   of child nodes and workers that eventually led the node's work
-        //   availability bit to be updated are visible.
-        //
-        // Further, load ordering doesn't need to be stronger than Acquire:
-        //
-        // - Don't need AcqRel (which would require replacing the load with a
-        //   RMW) since we're not trying to get any other thread in sync with
-        //   our current state during this specific lock-free transaction.
-        // - Don't need SeqCst since there is no need for everyone to agree on
-        //   the global order in which work is looked for and exchanged.
-        let load = Ordering::Acquire;
-
-        // At each point in time, we are processing the subtree rooted at a
-        // certain ancestor of the thief, and within that subtree we are
-        // processing a certain Node. The local worker may be a direct child of
-        // that node, an indirect descendant, or neither.
-        let mut ancestor_idx = parent_idx;
-        let mut node_idx = parent_idx;
-        let mut local_bit = LocalBit::Worker(worker_bit);
-
-        // Nodes that we are going to process next in the subtree of the current
-        // ancestor. The local worker is not a descendent of any of these nodes.
-        let mut next_subtree_nodes = VecDeque::new();
-
-        // Yield iterator over increasingly remote workers
-        // NOTE: genawaiter is just used as a convenience here as the iterator
-        //       state machine used here starts to get quite complex to code by
-        //       hand. But if genawaiter shows up too much in perf profiles,
-        //       just bite the bullet and implement the iterator manually...
-        Some(
-            genawaiter::rc::Gen::new(|co| async move {
-                'process_nodes: loop {
-                    // Access the current node
-                    let node = &self.work_availability_tree[node_idx].object;
-
-                    // Enumerate direct matching worker children
-                    if let Some(worker_bit) = local_bit.take_worker() {
-                        if let Some(workers) = find_relatives(&node.worker_children, worker_bit.borrow(), load) {
-                            for victim_idx in workers {
-                                co.yield_(victim_idx).await;
-                            }
-                        }
-                    } else if let Some(workers) = find_strangers(&node.worker_children, load) {
-                        for victim_idx in workers {
-                            co.yield_(victim_idx).await;
-                        }
-                    }
-
-                    // Schedule looking at the node's matching node children later
-                    if let Some(node_bit) = local_bit.take_node() {
-                        if let Some(nodes) = find_relatives(&node.node_children, node_bit.borrow(), load) {
-                            for node_idx in nodes {
-                                next_subtree_nodes.push_back(node_idx);
-                            }
-                        }
-                    } else if let Some(nodes) = find_strangers(&node.node_children, load) {
-                        for node_idx in nodes {
-                            next_subtree_nodes.push_back(node_idx);
-                        }
-                    }
-
-                    // Now we need to determine which node we're going to look at
-                    // next. First check if there are more nodes to process in the
-                    // subtree of the current ancestor. Process subtree nodes
-                    // breadth-first for an optimal memory access pattern.
-                    if let Some(next_node_idx) = next_subtree_nodes.pop_front() {
-                        node_idx = next_node_idx;
-                        continue 'process_nodes;
-                    }
-
-                    // If we ran out of nodes, then it means we're done exploring
-                    // the subtree associated with our current ancestor, so it's
-                    // time to go to the next ancestor.
-                    let Some(node_bit) = ancestor_bits.next() else {
-                        // ...or end the search if we've run out of ancestors.
-                        break 'process_nodes;
-                    };
-                    let ancestor = &self.work_availability_tree[ancestor_idx];
-                    ancestor_idx = ancestor.parent.expect(
-                        "if an ancestor node has a parent in the WorkAvailabilityPath, \
-                        then it should have a parent node index"
-                    );
-                    node_idx = ancestor_idx;
-                    local_bit = LocalBit::Node(node_bit);
-                }
-            })
-            .into_iter()
-        )
-    }
-
     /// Suggest stealing work from a particular worker
+    #[inline(always)]
     fn suggest_stealing<'self_, const INCLUDE_CENTER: bool, const CACHE_SEARCH_MASKS: bool>(
         &'self_ self,
         local_worker_idx: usize,
@@ -255,51 +130,34 @@ impl HierarchicalState {
         // Need Acquire ordering so the futex is only read/modified after a work
         // unavailability signal is observed: compilers and CPUs should not
         // cache the work availability bit value or speculate on it here.
-        let Some(mut asleep_neighbors) = self.find_workers(
+        let Some(asleep_neighbors) = search::find_workers(
+            self,
             local_worker_idx,
             ancestor_bits,
-            |children, target_bit, load| children.find_jobless_relatives::<INCLUDE_CENTER, CACHE_SEARCH_MASKS>(target_bit, load),
-            |children, load| children.find_jobless_strangers(load)
-        )
-        else {
+            ChildrenLink::find_jobless_siblings::<INCLUDE_CENTER, CACHE_SEARCH_MASKS>,
+            ChildrenLink::find_jobless_strangers,
+        ) else {
             return;
         };
 
-        // ...and if so, tell the closest one about our newly submitted job
-        #[cold]
-        fn unlikely(
-            self_: &HierarchicalState,
-            jobless_neighbors: impl Iterator<Item = usize>,
-            local_worker_idx: usize,
-            task_location: StealLocation,
-            update: Ordering,
-        ) {
-            // Iterate over increasingly remote job-less neighbors
-            for closest_asleep in jobless_neighbors {
-                // Update their futex recommendation as appropriate
-                //
-                // Can use Relaxed ordering on failure because failing to
-                // suggest work to a worker has no observable consequences and
-                // isn't used to inform any decision other than looking up the
-                // state of the next worker, which is independent from this one.
-                let accepted = self_.workers[closest_asleep].object.futex.suggest_steal(
-                    task_location,
-                    local_worker_idx,
-                    update,
-                    Ordering::Relaxed,
-                );
-                if accepted.is_ok() {
-                    return;
-                }
+        // Iterate over increasingly remote job-less neighbors
+        for closest_asleep in asleep_neighbors {
+            // Update their futex recommendation as appropriate
+            //
+            // Can use Relaxed ordering on failure because failing to
+            // suggest work to a worker has no observable consequences and
+            // isn't used to inform any decision other than looking up the
+            // state of the next worker, which is independent from this one.
+            let accepted = self.workers[closest_asleep].object.futex.suggest_steal(
+                task_location,
+                local_worker_idx,
+                update,
+                Ordering::Relaxed,
+            );
+            if accepted.is_ok() {
+                return;
             }
         }
-        unlikely(
-            self,
-            &mut asleep_neighbors,
-            local_worker_idx,
-            task_location,
-            update,
-        )
     }
 }
 
@@ -423,12 +281,12 @@ impl ChildrenLink {
     ///
     /// The provided `thief_bit` indicates which child is looking for work.
     /// Potential targets will be enumerated at increasing distance from it.
-    pub fn find_relatives_to_rob<'self_>(
+    pub fn find_siblings_to_rob<'self_>(
         &'self_ self,
         thief_bit: &BitRef<'self_, true>,
         load: Ordering,
     ) -> Option<impl Iterator<Item = usize> + 'self_> {
-        self.find_relatives_around(thief_bit, load, AtomicFlags::iter_set_around::<false, true>)
+        self.find_siblings(thief_bit, load, AtomicFlags::iter_set_around::<false, true>)
     }
 
     /// Like `find_relatives_to_rob`, but finds relatives that are looking for
@@ -437,12 +295,21 @@ impl ChildrenLink {
     /// This is more generic than `find_relatives_to_rob` because we need to
     /// find jobless workers in two different circumstances: when injecting work
     /// from outside the thread pool and when spawning work inside of it.
-    pub fn find_jobless_relatives<'self_, const INCLUDE_CENTER: bool, const CACHE_SEARCH_MASKS: bool>(
+    #[inline]
+    pub fn find_jobless_siblings<
+        'self_,
+        const INCLUDE_CENTER: bool,
+        const CACHE_SEARCH_MASKS: bool,
+    >(
         &'self_ self,
         giver_bit: &BitRef<'self_, CACHE_SEARCH_MASKS>,
         load: Ordering,
     ) -> Option<impl Iterator<Item = usize> + 'self_> {
-        self.find_relatives_around(giver_bit, load, AtomicFlags::iter_unset_around::<INCLUDE_CENTER, CACHE_SEARCH_MASKS>)
+        self.find_siblings(
+            giver_bit,
+            load,
+            AtomicFlags::iter_unset_around::<INCLUDE_CENTER, CACHE_SEARCH_MASKS>,
+        )
     }
 
     /// Find children that might have work to steal
@@ -460,9 +327,10 @@ impl ChildrenLink {
     ///
     /// Like `find_stranger_to_rob`, but finds children that are looking ofr
     /// work instead of children that might have extra work to give
+    #[inline]
     pub fn find_jobless_strangers(
         &self,
-        load: Ordering
+        load: Ordering,
     ) -> Option<impl Iterator<Item = usize> + '_> {
         self.find_strangers(load, AtomicFlags::iter_unset_from)
     }
@@ -482,18 +350,23 @@ impl ChildrenLink {
 
     /// Find children that might have/want work to steal around a certain child
     ///
-    /// This is the common subset of `find_relatives_to_rob` and
-    /// `find_jobless_relatives`. `iter_around` should be set to
+    /// This is the common subset of `find_siblings_to_rob` and
+    /// `find_jobless_siblings`. `iter_around` should be set to
     /// `AtomicFlags::iter_set_around` if you want to steal work and
     /// `AtomicFlags::iter_unset_around` if you want to give work, in both case
     /// with `INCLUDE_CENTER` set to false and `CACHE_SEARCH_MASKS` set to true.
-    pub fn find_relatives_around<'self_, const CACHE_SEARCH_MASKS: bool, IterAround>(
+    pub fn find_siblings<'self_, const CACHE_SEARCH_MASKS: bool, IterAround>(
         &'self_ self,
         center_bit: &BitRef<'self_, CACHE_SEARCH_MASKS>,
         load: Ordering,
-        iter_around: impl FnOnce(&'self_ AtomicFlags, &BitRef<'self_, CACHE_SEARCH_MASKS>, Ordering) -> Option<IterAround>
+        iter_around: impl FnOnce(
+            &'self_ AtomicFlags,
+            &BitRef<'self_, CACHE_SEARCH_MASKS>,
+            Ordering,
+        ) -> Option<IterAround>,
     ) -> Option<impl Iterator<Item = usize> + 'self_>
-        where IterAround: Iterator<Item = BitRef<'self_, false>> + 'self_
+    where
+        IterAround: Iterator<Item = BitRef<'self_, false>> + 'self_,
     {
         // Need at least Acquire ordering to ensure work is visible
         let load = crate::at_least_acquire(load);
@@ -510,9 +383,14 @@ impl ChildrenLink {
     pub fn find_strangers<'self_, IterFrom>(
         &'self_ self,
         load: Ordering,
-        iter_from: impl FnOnce(&'self_ AtomicFlags, &BitRef<'self_, false>, Ordering) -> Option<IterFrom>,
+        iter_from: impl FnOnce(
+            &'self_ AtomicFlags,
+            &BitRef<'self_, false>,
+            Ordering,
+        ) -> Option<IterFrom>,
     ) -> Option<impl Iterator<Item = usize> + 'self_>
-        where IterFrom: Iterator<Item = BitRef<'self_, false>> + 'self_
+    where
+        IterFrom: Iterator<Item = BitRef<'self_, false>> + 'self_,
     {
         // Need at least Acquire ordering to ensure work is visible
         let load = crate::at_least_acquire(load);
@@ -534,50 +412,14 @@ impl ChildrenLink {
     }
 }
 
-/// Relationship of a worker to a node of the [`HierarchicalState`]
-#[derive(Debug, Eq, PartialEq)]
-enum LocalBit<'bit_ref, 'flags: 'bit_ref, const CACHE_SEARCH_MASKS: bool> {
-    /// Direct worker child
-    Worker(Cow<'bit_ref, BitRef<'flags, CACHE_SEARCH_MASKS>>),
-
-    /// Indirect descendant via this direct node child
-    Node(Cow<'bit_ref, BitRef<'flags, CACHE_SEARCH_MASKS>>),
-
-    /// Not a descendant
-    Neither,
-}
-//
-impl<'bit_ref, 'flags: 'bit_ref, const CACHE_SEARCH_MASKS: bool> LocalBit<'bit_ref, 'flags, CACHE_SEARCH_MASKS> {
-    /// If the worker is a direct worker child, take its [`BitRef`]
-    fn take_worker(&mut self) -> Option<Cow<'bit_ref, BitRef<'flags, CACHE_SEARCH_MASKS>>> {
-        if let Self::Worker(_) = self {
-            let Self::Worker(bit) = std::mem::replace(self, Self::Neither) else {
-                unreachable!()
-            };
-            Some(bit)
-        } else {
-            None
-        }
-    }
-
-    /// If the worker descends from a node child, take that child's [`BitRef`]
-    fn take_node(&mut self) -> Option<Cow<'bit_ref, BitRef<'flags, CACHE_SEARCH_MASKS>>> {
-        if let Self::Node(_) = self {
-            let Self::Node(bit) = std::mem::replace(self, Self::Neither) else {
-                unreachable!()
-            };
-            Some(bit)
-        } else {
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use proptest::prelude::*;
-    use std::{collections::{VecDeque, HashSet}, sync::atomic::Ordering};
+    use std::{
+        collections::{HashSet, VecDeque},
+        sync::atomic::Ordering,
+    };
 
     /// Arbitrary HierarchicalState
     ///
@@ -721,7 +563,7 @@ pub(crate) mod tests {
                 // this victim has only been yielded once
                 assert!(remaining_victims.remove(&victim_idx));
 
-                // Find common ancestor of thief and victim, and its direct node 
+                // Find common ancestor of thief and victim, and its direct node
                 // child pointing towards the victim
                 let mut common_ancestor_node_child = None;
                 let (height_above_victim, height_above_thief) =
