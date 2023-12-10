@@ -1,6 +1,6 @@
 //! Node path from a worker to the top of the `work_availability_tree`
 
-use super::HierarchicalState;
+use super::{ChildrenLink, HierarchicalState};
 use crate::shared::flags::bitref::BitRef;
 use std::{
     iter::FusedIterator,
@@ -16,92 +16,28 @@ use std::{
 pub(crate) struct WorkAvailabilityPath<'shared>(Box<[BitRef<'shared, true>]>);
 //
 impl<'shared> WorkAvailabilityPath<'shared> {
-    /// Compute the work availability path for a given worker
+    /// Compute the full work availability path for a given worker
     ///
     /// This is a fairly expensive computation, and workers are very strongly
     /// advised to cache the result instead or repeating the query.
     pub fn new(shared: &'shared HierarchicalState, worker_idx: usize) -> Self {
-        // Handle uniprocessor system special case (single worker w/o a parent)
-        if shared.work_availability_tree.is_empty() {
-            assert_eq!(worker_idx, 0);
-            return Self(Vec::new().into_boxed_slice());
-        }
-
-        // Find the direct parent of the worker and the availability of the
-        // worker within this parent's worker child list.
-        let mut parent_idx = shared.workers[worker_idx].parent.unwrap();
-        let mut parent = &shared.work_availability_tree[parent_idx];
-        let worker_bit = parent
-            .object
-            .worker_children
-            .child_availability_with_cache(worker_idx);
-
-        // Recurse up the tree to get the full work availability path
-        let mut path = vec![worker_bit];
-        loop {
-            // Find parent node, if any
-            let Some(grandparent_idx) = parent.parent else {
-                break;
-            };
-            let grandparent = &shared.work_availability_tree[grandparent_idx];
-
-            // Push work availability bit for this node with parent node
-            let parent_bit = grandparent
-                .object
-                .node_children
-                .child_availability_with_cache(parent_idx);
-            path.push(parent_bit);
-
-            // Adjust iteration state to use grandparent as new parent
-            parent_idx = grandparent_idx;
-            parent = grandparent;
-        }
-        Self(path.into())
+        Self(
+            Self::lazy_ancestors_impl(
+                shared,
+                worker_idx,
+                ChildrenLink::child_availability_with_cache,
+            )
+            .collect(),
+        )
     }
 
     /// Semantically equivalent to creating a new path, yielding the ancestors,
     /// and dropping the path, but optimized for this short-lived path use case
-    pub fn lazy_ancestors(
+    pub(super) fn lazy_ancestors(
         shared: &'shared HierarchicalState,
         worker_idx: usize,
     ) -> impl FusedIterator<Item = BitRef<'shared, false>> {
-        // Find the direct parent of the worker, if any...
-        shared.workers[worker_idx]
-            .parent
-            .into_iter()
-            .flat_map(move |mut parent_idx| {
-                // ...and the availability of the worker within the direct
-                // parent's worker child list.
-                let mut parent = &shared.work_availability_tree[parent_idx];
-                let mut next_bit =
-                    Some(parent.object.worker_children.child_availability(worker_idx));
-
-                // Lazily recurse up the tree to get the full work availability path
-                std::iter::from_fn(move || {
-                    // Take the prepared result for this iteration. If there is
-                    // none, iteration is over.
-                    let result = next_bit.take()?;
-
-                    // Find parent of current node, if any
-                    let Some(grandparent_idx) = parent.parent else {
-                        return Some(result);
-                    };
-                    let grandparent = &shared.work_availability_tree[grandparent_idx];
-
-                    // Find work availability bit for this node within parent
-                    next_bit = Some(
-                        grandparent
-                            .object
-                            .node_children
-                            .child_availability(parent_idx),
-                    );
-
-                    // Une grandparent as parent in next iteration
-                    parent_idx = grandparent_idx;
-                    parent = grandparent;
-                    Some(result)
-                })
-            })
+        Self::lazy_ancestors_impl(shared, worker_idx, ChildrenLink::child_availability)
     }
 
     /// Set this worker's work availability bit, propagating information that
@@ -132,7 +68,56 @@ impl<'shared> WorkAvailabilityPath<'shared> {
         self.0.iter()
     }
 
-    /// Shared commonalities between `fetch_set` and `fetch_clear`
+    /// Shared commonalities between `new()` and `lazy_ancestors()`
+    fn lazy_ancestors_impl<const CACHE_SEARCH_MASKS: bool>(
+        shared: &'shared HierarchicalState,
+        worker_idx: usize,
+        get_child_availability: impl FnMut(
+            &'shared ChildrenLink,
+            usize,
+        ) -> BitRef<'shared, CACHE_SEARCH_MASKS>,
+    ) -> impl FusedIterator<Item = BitRef<'shared, CACHE_SEARCH_MASKS>> {
+        // Find the direct parent of the worker, if any...
+        let mut get_child_availability = Some(get_child_availability);
+        shared.workers[worker_idx]
+            .parent
+            .into_iter()
+            .flat_map(move |mut parent_idx| {
+                // ...and the availability of the worker within the direct
+                // parent's worker child list.
+                let mut parent = &shared.work_availability_tree[parent_idx];
+                let mut get_child_availability = get_child_availability.take().unwrap();
+                let mut next_bit = Some(get_child_availability(
+                    &parent.object.worker_children,
+                    worker_idx,
+                ));
+
+                // Lazily recurse up the tree to get the full work availability path
+                std::iter::from_fn(move || {
+                    // Take the prepared result for this iteration. If there is
+                    // none, iteration is over.
+                    let result = next_bit.take()?;
+
+                    // Find parent of current node, if any
+                    let Some(grandparent_idx) = parent.parent else {
+                        return Some(result);
+                    };
+                    let grandparent = &shared.work_availability_tree[grandparent_idx];
+
+                    // Find work availability bit for this node within parent
+                    let parent_bit =
+                        get_child_availability(&grandparent.object.node_children, parent_idx);
+                    next_bit = Some(parent_bit);
+
+                    // Une grandparent as parent in next iteration
+                    parent_idx = grandparent_idx;
+                    parent = grandparent;
+                    Some(result)
+                })
+            })
+    }
+
+    /// Shared commonalities between `fetch_set()` and `fetch_clear()`
     ///
     /// `final_bit` is the bit value that the worker's work availability bit is
     /// expected to have after work completes. Since workers cache their work
@@ -148,7 +133,7 @@ impl<'shared> WorkAvailabilityPath<'shared> {
         match order {
             Ordering::Relaxed | Ordering::Acquire | Ordering::Release | Ordering::AcqRel => {}
             Ordering::SeqCst => atomic::fence(order),
-            _ => unimplemented!(),
+            _ => unreachable!(),
         }
 
         // Propagate the info that this worker started or stopped having work
@@ -190,7 +175,7 @@ impl<'shared> WorkAvailabilityPath<'shared> {
         match order {
             Ordering::Relaxed | Ordering::Release => {}
             Ordering::Acquire | Ordering::AcqRel | Ordering::SeqCst => atomic::fence(order),
-            _ => unimplemented!(),
+            _ => unreachable!(),
         }
         old_worker_bit
     }
@@ -257,7 +242,7 @@ mod tests {
 
                     // Check that lazy path computation yields the same path
                     let lazy_path = WorkAvailabilityPath::lazy_ancestors(&state, global_worker_idx).collect::<Box<[_]>>();
-                    assert_eq!(lazy_path, path.0);
+                    assert_eq!(&lazy_path[..], &path.0[..]);
                     assert_eq!(state.work_availability_tree, initial_tree);
 
                     // Check that first path element points to the worker's parent
