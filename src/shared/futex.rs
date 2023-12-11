@@ -78,7 +78,7 @@ impl WorkerFutex {
                 // joins to wake it up at this point then you have a worker
                 // thread deadlock on your hands...
                 crate::unlikely(|| {
-                    log::error!("\
+                    crate::error!("\
                         A worker thread has more join()s in flight than the ABA-safe limit of {} concurrent joins. \
                         This worker thread has a small chance of deadlocking under bad scheduling circumstances. \
                         Consider tightening your program's sequential processing threshold, as it is highly \
@@ -161,7 +161,7 @@ impl WorkerFutex {
         let result = self.0.compare_exchange(
             initial.to_raw(),
             sleeping_raw,
-            Self::at_least_acquire(sleep),
+            crate::at_least_acquire(sleep),
             wake,
         );
 
@@ -211,7 +211,7 @@ impl WorkerFutex {
         // Need Acquire ordering on success so that the action of updating the
         // location cannot be reordered after that of waking up the worker
         debug_assert!(worker_idx < Self::MAX_WORKERS);
-        let update = Self::at_least_acquire(update);
+        let update = crate::at_least_acquire(update);
 
         // Check out the current futex state
         let mut current_raw = self.0.load(load);
@@ -262,7 +262,7 @@ impl WorkerFutex {
         // Need Acquire ordering so this is not reordered after wake_if_asleep.
         // Failed load ordering can be Relaxed as we're not reading any other
         // state and the operation will eventually succeed.
-        let order = Self::at_least_acquire(order);
+        let order = crate::at_least_acquire(order);
         let old_raw = self
             .0
             .fetch_update(order, Ordering::Relaxed, |old_raw| {
@@ -293,7 +293,7 @@ impl WorkerFutex {
         // Need Acquire ordering so this is not reordered after wake_if_asleep
         let old_raw = self.0.fetch_and(
             !(FUTEX_BIT_WORK_INCOMING | FUTEX_BIT_SLEEPING),
-            Self::at_least_acquire(order),
+            crate::at_least_acquire(order),
         );
 
         // Thread pool shutdown should only happen once in the futex's lifetime
@@ -331,17 +331,6 @@ impl WorkerFutex {
                 assert!(old.work_incoming());
             }
             atomic_wait::wake_all(&self.0)
-        }
-    }
-
-    /// Add an Acquire barrier to a user-specified ordering
-    #[inline]
-    fn at_least_acquire(order: Ordering) -> Ordering {
-        match order {
-            Ordering::Relaxed | Ordering::Acquire => Ordering::Acquire,
-            Ordering::Release | Ordering::AcqRel => Ordering::AcqRel,
-            Ordering::SeqCst => Ordering::SeqCst,
-            _ => unimplemented!(),
         }
     }
 }

@@ -3,7 +3,7 @@ use viscose::bench::{self, bench_local_floats};
 
 fn criterion_benchmark(c: &mut Criterion) {
     bench::for_each_locality(
-        |rayon_name, mut make_rayon_pool, flat_name, mut make_flat_pool| {
+        |rayon_name, mut make_rayon_pool, our_name, mut make_our_pool| {
             macro_rules! bench_sum {
             () => {
                 // I picked these values because...
@@ -45,15 +45,15 @@ fn criterion_benchmark(c: &mut Criterion) {
                     );
                 }
                 {
-                    let flat_pool = make_flat_pool();
+                    let our_pool = make_our_pool();
                     bench_local_floats::<BLOCK_SIZE>(
                         c,
                         bench_name,
-                        flat_name,
+                        our_name,
                         |b: &mut Bencher, slice| {
-                            flat_pool.run(|scope| {
+                            our_pool.run(|scope| {
                                 b.iter(|| {
-                                    bench::sum_flat::<BLOCK_SIZE, ILP_STREAMS>(
+                                    bench::sum_ours::<BLOCK_SIZE, ILP_STREAMS>(
                                         scope,
                                         pessimize::hide(slice),
                                     )

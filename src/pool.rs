@@ -2,7 +2,6 @@
 
 use crate::{
     shared::{
-        futex::StealLocation,
         job::{AbortOnUnwind, DynJob, Job, Notify},
         SharedState,
     },
@@ -14,6 +13,7 @@ use hwlocality::{
     cpu::{binding::CpuBindingFlags, cpuset::CpuSet},
     topology::Topology,
 };
+use rand::Rng;
 use std::{
     borrow::Borrow,
     collections::HashMap,
@@ -27,7 +27,7 @@ use std::{
 /// Simple flat pinned thread pool, used to check hypothesis that pinning and
 /// avoidance of TLS alone won't let us significantly outperform rayon
 #[derive(Debug)]
-pub struct FlatPool {
+pub struct ThreadPool {
     /// Shared state
     shared: Arc<SharedState>,
 
@@ -41,7 +41,7 @@ pub struct FlatPool {
     workers: Vec<JoinHandle<()>>,
 }
 //
-impl FlatPool {
+impl ThreadPool {
     /// Create a thread pool that uses all system CPU cores
     pub fn new() -> Self {
         let topology = Arc::new(Topology::new().unwrap());
@@ -67,7 +67,7 @@ impl FlatPool {
                 let topology = topology.clone();
                 let shared = shared.clone();
                 std::thread::Builder::new()
-                    .name(format!("FlatPool worker #{worker_idx} (CPU {cpu})"))
+                    .name(format!("ThreadPool worker #{worker_idx} (CPU {cpu})"))
                     .spawn(move || {
                         // Pin the worker thread to its assigned CPU
                         topology
@@ -83,7 +83,7 @@ impl FlatPool {
                         // Start processing work
                         Worker::run(&shared, worker_idx, work_queue);
                     })
-                    .unwrap()
+                    .expect("failed to spawn worker thread")
             })
             .collect();
 
@@ -164,34 +164,31 @@ impl FlatPool {
             .topology
             .last_cpu_location(CpuBindingFlags::THREAD)
             .unwrap();
-        let best_worker_idx = self
+        let local_worker_idx = self
             .cpu_to_worker
             .get(&caller_cpu.first_set().unwrap())
             .copied()
-            // FIXME: Pick true closest CPU
-            .unwrap_or(self.workers.len() / 2);
+            // FIXME: Pick true closest CPU instead of a random one, this can be
+            //        done using a common ancestor search in the topology but I
+            //        should probably cache the search results for every
+            //        topology CPU to speed up lookup.
+            .unwrap_or_else(|| {
+                let mut rng = rand::thread_rng();
+                rng.gen_range(0..self.workers.len())
+            });
 
         // Schedule the work to be executed
-        self.shared.injector.push(job);
-
-        // Find the nearest available thread and recommend it to process this
-        //
-        // Need Release ordering to make sure they see the pushed work
-        self.shared.recommend_steal::<true, false>(
-            &self.shared.work_availability.bit(best_worker_idx),
-            StealLocation::Injector,
-            Ordering::Release,
-        );
+        self.shared.inject_job(job, local_worker_idx);
     }
 }
 //
-impl Default for FlatPool {
+impl Default for ThreadPool {
     fn default() -> Self {
         Self::new()
     }
 }
 //
-impl Drop for FlatPool {
+impl Drop for ThreadPool {
     fn drop(&mut self) {
         // Tell workers that no further work will be coming and wake them all up
         //
@@ -233,6 +230,6 @@ mod tests {
     #[test]
     fn lifecycle() {
         // Check that thread pool initializes and shuts down correctly
-        FlatPool::new();
+        ThreadPool::new();
     }
 }

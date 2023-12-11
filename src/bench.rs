@@ -1,14 +1,11 @@
 //! Benchmarking utilities
 
-use crate::{pool::FlatPool, worker::scope::Scope};
+use crate::{pool::ThreadPool, worker::scope::Scope};
 use criterion::{Bencher, Criterion};
 use crossbeam::utils::CachePadded;
-use hwlocality::{cpu::binding::CpuBindingFlags, object::types::ObjectType, Topology};
+use hwlocality::{cpu::binding::CpuBindingFlags, object::types::ObjectType};
 use iterator_ilp::IteratorILP;
-use std::{
-    collections::BTreeSet,
-    sync::{Arc, Once, OnceLock},
-};
+use std::{collections::BTreeSet, sync::OnceLock};
 
 /// Re-export atomic flags for benchmarking
 pub use crate::shared::flags::{bitref::BitRef, AtomicFlags};
@@ -19,11 +16,11 @@ pub fn for_each_locality(
         &str,
         Box<dyn FnMut() -> rayon::ThreadPool>,
         &str,
-        Box<dyn FnMut() -> FlatPool>,
+        Box<dyn FnMut() -> ThreadPool>,
     ),
 ) {
-    setup_logger_once();
-    let topology = topology();
+    crate::setup_logger_once();
+    let topology = crate::topology();
     let mut seen_affinities = BTreeSet::new();
     for ty in [
         ObjectType::L1Cache,
@@ -63,7 +60,7 @@ pub fn for_each_locality(
 
             // Prepare to build thread pools
             let affinity2 = affinity.clone();
-            let make_flat_pool = move || FlatPool::with_affinity(topology.clone(), &affinity2);
+            let make_our_pool = move || ThreadPool::with_affinity(topology.clone(), &affinity2);
             let make_rayon_pool = move || {
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(affinity.weight().unwrap())
@@ -77,7 +74,7 @@ pub fn for_each_locality(
                 &format!("{locality_name}/rayon"),
                 Box::new(make_rayon_pool),
                 &format!("{locality_name}/flat"),
-                Box::new(make_flat_pool),
+                Box::new(make_our_pool),
             )
         }
     }
@@ -98,13 +95,13 @@ pub fn fibonacci_rayon(n: u64) -> u64 {
     }
 }
 
-/// Like `fibonacci_rayon()`, but uses a `FlatPool`
+/// Like `fibonacci_rayon()`, but uses a `ThreadPool`
 #[inline]
-pub fn fibonacci_flat(scope: &Scope<'_>, n: u64) -> u64 {
+pub fn fibonacci_ours(scope: &Scope<'_>, n: u64) -> u64 {
     if n > 1 {
         let (x, y) = scope.join(
-            || fibonacci_flat(scope, n - 1),
-            move |scope| fibonacci_flat(scope, n - 2),
+            || fibonacci_ours(scope, n - 1),
+            move |scope| fibonacci_ours(scope, n - 2),
         );
         x + y
     } else {
@@ -255,7 +252,7 @@ pub fn bench_local_floats<const BLOCK_SIZE: usize>(
 fn max_data_size_pow2() -> u32 {
     static RESULT: OnceLock<u32> = OnceLock::new();
     *RESULT.get_or_init(|| {
-        let cache_stats = topology().cpu_cache_stats().unwrap();
+        let cache_stats = crate::topology().cpu_cache_stats().unwrap();
         let total_l3_capacity = cache_stats.total_data_cache_sizes().last().unwrap();
         let mut max_size = 2 * total_l3_capacity;
         if !max_size.is_power_of_two() {
@@ -282,17 +279,17 @@ pub fn square_rayon<const BLOCK_SIZE: usize>(slice: &mut LocalFloatsSlice<'_, BL
     );
 }
 
-/// Like `square_rayon()`, but using a `FlatPool`
+/// Like `square_rayon()`, but using a `ThreadPool`
 #[inline]
-pub fn square_flat<const BLOCK_SIZE: usize>(
+pub fn square_ours<const BLOCK_SIZE: usize>(
     scope: &Scope<'_>,
     slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
 ) {
     slice.process(
         |[mut left, mut right]| {
             scope.join(
-                || square_flat(scope, &mut left),
-                move |scope| square_flat(scope, &mut right),
+                || square_ours(scope, &mut left),
+                move |scope| square_ours(scope, &mut right),
             );
         },
         |block, locality| {
@@ -326,17 +323,17 @@ pub fn sum_rayon<const BLOCK_SIZE: usize, const ILP_STREAMS: usize>(
     )
 }
 
-/// Like `sum_rayon()`, but uses a `FlatPool`
+/// Like `sum_rayon()`, but uses a `ThreadPool`
 #[inline]
-pub fn sum_flat<const BLOCK_SIZE: usize, const ILP_STREAMS: usize>(
+pub fn sum_ours<const BLOCK_SIZE: usize, const ILP_STREAMS: usize>(
     scope: &Scope<'_>,
     slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
 ) -> f32 {
     slice.process(
         |[mut left, mut right]| {
             let (left, right) = scope.join(
-                || sum_flat::<BLOCK_SIZE, ILP_STREAMS>(scope, &mut left),
-                move |scope| sum_flat::<BLOCK_SIZE, ILP_STREAMS>(scope, &mut right),
+                || sum_ours::<BLOCK_SIZE, ILP_STREAMS>(scope, &mut left),
+                move |scope| sum_ours::<BLOCK_SIZE, ILP_STREAMS>(scope, &mut right),
             );
             left + right
         },
@@ -345,7 +342,7 @@ pub fn sum_flat<const BLOCK_SIZE: usize, const ILP_STREAMS: usize>(
     )
 }
 
-/// Memory-bound recursive squared vector norm computation based on FlatPool
+/// Memory-bound recursive squared vector norm computation based on ThreadPool
 ///
 /// This computation is not written for optimal efficiency (a single-pass
 /// algorithm would be more efficient), but to highlight the importance of NUMA
@@ -380,21 +377,21 @@ pub fn norm_sqr_rayon<const BLOCK_SIZE: usize, const REDUCE_ILP_STREAMS: usize>(
     )
 }
 
-/// Like `norm_sqr_rayon()`, but uses a `FlatPool`
+/// Like `norm_sqr_rayon()`, but uses a `ThreadPool`
 #[inline]
-pub fn norm_sqr_flat<const BLOCK_SIZE: usize, const REDUCE_ILP_STREAMS: usize>(
+pub fn norm_sqr_ours<const BLOCK_SIZE: usize, const REDUCE_ILP_STREAMS: usize>(
     scope: &Scope<'_>,
     slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
 ) -> f32 {
     slice.process(
         |[mut left, mut right]| {
             scope.join(
-                || square_flat(scope, &mut left),
-                |scope| square_flat(scope, &mut right),
+                || square_ours(scope, &mut left),
+                |scope| square_ours(scope, &mut right),
             );
             let (left, right) = scope.join(
-                || sum_flat::<BLOCK_SIZE, REDUCE_ILP_STREAMS>(scope, &mut left),
-                move |scope| sum_flat::<BLOCK_SIZE, REDUCE_ILP_STREAMS>(scope, &mut right),
+                || sum_ours::<BLOCK_SIZE, REDUCE_ILP_STREAMS>(scope, &mut left),
+                move |scope| sum_ours::<BLOCK_SIZE, REDUCE_ILP_STREAMS>(scope, &mut right),
             );
             left + right
         },
@@ -409,24 +406,10 @@ pub fn norm_sqr_flat<const BLOCK_SIZE: usize, const REDUCE_ILP_STREAMS: usize>(
     )
 }
 
-/// Topology instance shared by all above functions
-fn topology() -> &'static Arc<Topology> {
-    static INSTANCE: OnceLock<Arc<Topology>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Arc::new(Topology::new().unwrap()))
-}
-
-/// Ensure logging to stderr is set up during benchmarking
-fn setup_logger_once() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        env_logger::init();
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pool::FlatPool;
+    use crate::pool::ThreadPool;
 
     /// Reference computation of the N-th fibonacci sequence term
     fn fibonacci_ref(n: u64) -> u64 {
@@ -442,10 +425,10 @@ mod tests {
 
     #[test]
     fn fibonacci() {
-        let flat = FlatPool::new();
-        flat.run(|scope| {
+        let pool = ThreadPool::new();
+        pool.run(|scope| {
             for i in 0..=34 {
-                assert_eq!(fibonacci_flat(scope, i), fibonacci_ref(i));
+                assert_eq!(fibonacci_ours(scope, i), fibonacci_ref(i));
             }
         });
     }

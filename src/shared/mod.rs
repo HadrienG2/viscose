@@ -10,7 +10,7 @@ use self::{
     job::DynJob,
 };
 use crossbeam::{
-    deque::{self, Injector, Stealer},
+    deque::{self, Injector, Steal, Stealer},
     utils::CachePadded,
 };
 use std::sync::{atomic::Ordering, Arc};
@@ -20,7 +20,7 @@ use std::sync::{atomic::Ordering, Arc};
 #[derive(Debug, Default)]
 pub(crate) struct SharedState {
     /// Global work injector
-    pub injector: Injector<DynJob>,
+    injector: Injector<DynJob>,
 
     /// Worker interfaces
     pub workers: Box<[CachePadded<WorkerInterface>]>,
@@ -64,7 +64,7 @@ impl SharedState {
 
     /// Recommend that the work-less thread closest to a certain originating
     /// locality steal a task from the specified location
-    pub fn recommend_steal<'self_, const INCLUDE_CENTER: bool, const CACHE_ITER_MASKS: bool>(
+    pub fn recommend_stealing<'self_, const INCLUDE_CENTER: bool, const CACHE_ITER_MASKS: bool>(
         &'self_ self,
         local_worker: &BitRef<'self_, CACHE_ITER_MASKS>,
         task_location: StealLocation,
@@ -122,15 +122,49 @@ impl SharedState {
 
     /// Enumerate workers that a thief could steal work from, at increasing
     /// distance from said thief
-    pub fn find_steals<'self_, const CACHE_ITER_MASKS: bool>(
+    pub fn find_workers_to_rob<'self_, const CACHE_ITER_MASKS: bool>(
         &'self_ self,
         thief: &BitRef<'self_, CACHE_ITER_MASKS>,
-        load: Ordering,
     ) -> Option<impl Iterator<Item = usize> + '_> {
         let work_availability = &self.work_availability;
         work_availability
-            .iter_set_around::<false, CACHE_ITER_MASKS>(thief, load)
+            // We need Acquire ordering so that when we later attempt to steal
+            // from the worker, we are guaranteed to see the work in its work
+            // queue, if no one else stole it since.
+            //
+            // We don't need stronger-than-Acquire ordering because we're not
+            // trying to get anyone else in sync with us (which is what Release
+            // is for) and we're not trying to get all thread to agree on a
+            // global order of searches for work (which is what SeqCst is for).
+            .iter_set_around::<false, CACHE_ITER_MASKS>(thief, Ordering::Acquire)
             .map(|iter| iter.map(|bit| bit.linear_idx(work_availability)))
+    }
+
+    /// Inject work into the thread pool
+    ///
+    /// # Safety
+    ///
+    /// The [`Job`] API contract must be honored as long as the completion
+    /// notification has not been received. This entails in particular that all
+    /// code including spawn_unchecked until the point where the remote task has
+    /// signaled completion should translate unwinding panics to aborts.
+    pub unsafe fn inject_job(&self, job: DynJob, local_worker_idx: usize) {
+        // Schedule the work to be executed
+        self.injector.push(job);
+
+        // Find the nearest available thread and recommend it to process this
+        //
+        // Need Release ordering to make sure they see the pushed work
+        self.recommend_stealing::<true, false>(
+            &self.work_availability.bit(local_worker_idx),
+            StealLocation::Injector,
+            Ordering::Release,
+        );
+    }
+
+    /// Steal a job from the global work injector
+    pub fn steal_from_injector(&self) -> Steal<DynJob> {
+        self.injector.steal()
     }
 }
 

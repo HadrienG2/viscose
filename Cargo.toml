@@ -33,7 +33,10 @@ edition = "2021"
 # of the join() hot code path and adding a dependency on the log library, it
 # lets the thread pool implementation emit an error log when the limit is
 # reached, which lets you know about it and take corrective action.
-detect-excessive-joins = ["dep:log"]
+detect-excessive-joins = ["log"]
+
+# Enable general-purpose logging
+log = ["dep:log"]
 
 # Enable benchmarking code (must be enabled for benchmarks to compile)
 bench = ["dep:criterion", "dep:env_logger", "dep:iterator_ilp", "dep:pessimize", "dep:rayon"]
@@ -45,7 +48,8 @@ default = ["detect-excessive-joins", "bench"]
 # Core dependencies
 atomic-wait = { version = "1.1.0", default-features = false }
 crossbeam = { version = "0.8.2", features = ["crossbeam-deque"] }
-hwlocality = { git = "https://github.com/HadrienG2/hwlocality.git", features = ["hwloc-2_2_0"] }
+hwlocality = { git = "https://github.com/HadrienG2/hwlocality.git", features = ["hwloc-2_2_0", "proptest"] }
+rand = "0.8"
 
 # Used to optionally warn about dangerous or inefficient library usage
 log = { version = "0.4", optional = true }

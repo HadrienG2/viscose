@@ -111,7 +111,7 @@ impl<'pool> Worker<'pool> {
         // Learn more about the state of the world using our futex
         //
         // Acquire ordering ensures we see the world like the previous thread
-        // that updated the futex did.
+        // that updated the futex with Release ordering did.
         let futex_state = self.futex.load_from_worker(Ordering::Acquire);
 
         // Try to steal work from other workers and the global injector, and
@@ -262,7 +262,7 @@ impl<'pool> Worker<'pool> {
     /// Return truth that a task was successfully stolen and run.
     #[inline(always)]
     fn steal_from_injector(&self) -> bool {
-        self.steal_with(|| self.shared.injector.steal())
+        self.steal_with(|| self.shared.steal_from_injector())
     }
 
     /// Try to steal work from all possible sources
@@ -271,11 +271,7 @@ impl<'pool> Worker<'pool> {
     /// of `self.futex`, so that `self.futex` can be updated if appropriate.
     fn steal_from_anyone(&self) -> Option<StealLocation> {
         // Are there other workers we could steal work from?
-        //
-        // Need Acquire so stealing happens after observing available work.
-        if let Some(neighbors_with_work) = self
-            .shared
-            .find_steals(&self.work_available.bit, Ordering::Acquire)
+        if let Some(neighbors_with_work) = self.shared.find_workers_to_rob(&self.work_available.bit)
         {
             // Try to steal from other workers at increasing distances
             for idx in neighbors_with_work {
