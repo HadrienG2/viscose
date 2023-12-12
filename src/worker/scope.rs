@@ -6,7 +6,7 @@
 use super::Worker;
 use crate::{
     shared::{
-        futex::{StealLocation, WorkerFutex},
+        futex::WorkerFutex,
         job::{AbortOnUnwind, DynJob, Job, Notify},
     },
     Work,
