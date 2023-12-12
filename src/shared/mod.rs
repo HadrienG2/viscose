@@ -110,6 +110,7 @@ impl SharedState {
     /// recipient of the notification is guaranteed to observe the freshly
     /// pushed work. You can either bundle the `Release` barrier into this
     /// transaction or put a `Release` fence before this transaction.
+    #[inline]
     pub fn suggest_stealing_from_worker<'self_>(
         &'self_ self,
         local_worker: &BitRef<'self_, true>,
@@ -167,6 +168,7 @@ impl SharedState {
     /// recipient of the notification is guaranteed to observe the freshly
     /// pushed work. You can either bundle the `Release` barrier into this
     /// transaction or put a `Release` fence before this transaction.
+    #[inline]
     fn suggest_stealing<'self_, const INCLUDE_CENTER: bool, const CACHE_SEARCH_MASKS: bool>(
         &'self_ self,
         local_worker: &BitRef<'self_, CACHE_SEARCH_MASKS>,
