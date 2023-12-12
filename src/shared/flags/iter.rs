@@ -32,13 +32,14 @@ impl<'flags, const FIND_SET: bool, const INCLUDE_CENTER: bool>
 {
     /// Start iterating over set/uset bits around a central position
     #[inline(always)]
-    pub(crate) fn new<const CACHE_ITER_MASKS: bool>(
+    pub(crate) fn new<const CACHE_SEARCH_MASKS: bool>(
         flags: &'flags AtomicFlags,
-        center: &BitRef<'flags, CACHE_ITER_MASKS>,
+        center: &BitRef<'flags, CACHE_SEARCH_MASKS>,
         order: Ordering,
     ) -> Option<Self> {
-        let initial_state =
-            InitialState::new::<FIND_SET, INCLUDE_CENTER, CACHE_ITER_MASKS>(flags, center, order)?;
+        let initial_state = InitialState::new::<FIND_SET, INCLUDE_CENTER, CACHE_SEARCH_MASKS>(
+            flags, center, order,
+        )?;
         let left_bits = BitIterator::<'flags, FIND_SET, true>::from_initial_state(initial_state);
         let right_bits = BitIterator::<'flags, FIND_SET, false>::from_initial_state(initial_state);
         let yield_center = INCLUDE_CENTER && (center.is_set(order) == FIND_SET);
@@ -123,18 +124,19 @@ impl<'flags, const FIND_SET: bool, const GOING_LEFT: bool>
     ///
     /// The bit at initial position `after` will not be emitted.
     #[cfg(test)]
-    pub fn new<const CACHE_ITER_MASKS: bool>(
+    pub(crate) fn new<const CACHE_SEARCH_MASKS: bool>(
         flags: &'flags AtomicFlags,
-        after: &BitRef<'flags, CACHE_ITER_MASKS>,
+        after: &BitRef<'flags, CACHE_SEARCH_MASKS>,
         order: Ordering,
     ) -> Option<Self> {
-        let initial = InitialState::new::<FIND_SET, false, CACHE_ITER_MASKS>(flags, after, order)?;
+        let initial =
+            InitialState::new::<FIND_SET, false, CACHE_SEARCH_MASKS>(flags, after, order)?;
         Some(Self::from_initial_state(initial))
     }
 
     /// Start iteration from a prepared initial state
     #[inline]
-    pub(crate) fn from_initial_state(initial: InitialState<'flags>) -> Self {
+    fn from_initial_state(initial: InitialState<'flags>) -> Self {
         let InitialState {
             shared,
             word_idx,
@@ -361,9 +363,9 @@ impl<'flags> InitialState<'flags> {
     ///
     /// This will return None if it can be cheaply proven at this stage that no
     /// iteration is possible.
-    pub fn new<const FIND_SET: bool, const INCLUDE_START: bool, const CACHE_ITER_MASKS: bool>(
+    pub fn new<const FIND_SET: bool, const INCLUDE_START: bool, const CACHE_SEARCH_MASKS: bool>(
         flags: &'flags AtomicFlags,
-        start: &BitRef<'flags, CACHE_ITER_MASKS>,
+        start: &BitRef<'flags, CACHE_SEARCH_MASKS>,
         order: Ordering,
     ) -> Option<Self> {
         // Part that's independent of FIND_SET
@@ -372,7 +374,7 @@ impl<'flags> InitialState<'flags> {
         // If that's the only word in the flags and the bit value we're looking
         // for doesn't appear in it, we can skip iteration entirely
         if flags.words.len() == 1 {
-            let mask = start.iter_mask::<FIND_SET, INCLUDE_START>(flags);
+            let mask = start.search_mask::<FIND_SET, INCLUDE_START>(flags);
             let word_empty = if FIND_SET {
                 word & mask == Word::MIN
             } else {
@@ -393,9 +395,9 @@ impl<'flags> InitialState<'flags> {
     }
 
     /// Subset of the iteration work that's independent of FIND_SET
-    fn set_independent_init<const CACHE_ITER_MASKS: bool>(
+    fn set_independent_init<const CACHE_SEARCH_MASKS: bool>(
         flags: &'flags AtomicFlags,
-        start: &BitRef<'flags, CACHE_ITER_MASKS>,
+        start: &BitRef<'flags, CACHE_SEARCH_MASKS>,
         order: Ordering,
     ) -> (SharedState<'flags>, usize, u32, Word) {
         let word_idx = start.word_idx(flags);
@@ -406,34 +408,13 @@ impl<'flags> InitialState<'flags> {
     }
 }
 
-/// Mask to be used when evaluating whether single-word flags are empty
-pub(crate) fn init_mask<
-    'flags,
-    const FIND_SET: bool,
-    const INCLUDE_START: bool,
-    const CACHE_ITER_MASKS: bool,
->(
-    flags: &'flags AtomicFlags,
-    start: &BitRef<'flags, CACHE_ITER_MASKS>,
-) -> Word {
-    let word_idx = start.word_idx(flags);
-    let significant = Word::from(flags.significant_bits(word_idx));
-    let bit = start.bit_mask();
-    match [FIND_SET, INCLUDE_START] {
-        [false, false] => !significant | bit,
-        [false, true] => !significant,
-        [true, false] => significant & !bit,
-        [true, true] => significant,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::shared::flags::tests::flags_and_bit_idx;
     use proptest::prelude::*;
 
-    /// Check outcome of iterating over FlagIdxIterator
+    /// Check output of BitIterator
     fn check_iterate<const FIND_SET: bool, const GOING_LEFT: bool>(
         flags: &AtomicFlags,
         start_idx: usize,
@@ -466,7 +447,7 @@ mod tests {
         Ok(())
     }
 
-    /// Check outcome of iterating over NearestFlagIterator
+    /// Check output of NearestBitIterator
     fn check_nearest<const FIND_SET: bool, const INCLUDE_CENTER: bool>(
         flags: &AtomicFlags,
         center_idx: usize,
@@ -523,6 +504,4 @@ mod tests {
             check_nearest::<true, true>(&flags, start_idx)?;
         }
     }
-
-    // TODO: Moar tests
 }

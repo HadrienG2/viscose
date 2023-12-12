@@ -1,6 +1,6 @@
 //! Quick access to a bit within [`AtomicFlags`]
 
-use super::{iter, AtomicFlags, AtomicWord, NonZeroWord, Word, WORD_BITS};
+use super::{AtomicFlags, AtomicWord, NonZeroWord, Word, WORD_BITS};
 use std::{
     debug_assert,
     fmt::{self, Debug},
@@ -10,15 +10,15 @@ use std::{
 
 /// Quick access to a bit within [`AtomicFlags`]
 #[derive(Clone)]
-pub struct BitRef<'flags, const CACHE_ITER_MASKS: bool> {
+pub struct BitRef<'flags, const CACHE_SEARCH_MASKS: bool> {
     /// Word which the bit of interest belongs to
     word: &'flags AtomicWord,
 
     /// Index of the bit of interest within this word (smaller than Word::Bits)
     bit_shift: u32,
 
-    /// Cache of significant word bits if CACHE_ITER_MASKS is set
-    iter_masks_cache: Option<IteratorMasksCache>,
+    /// Cache of masks for bit value searches, if CACHE_SEARCH_MASKS is set
+    search_masks_cache: Option<SearchMasksCache>,
 }
 //
 impl<'flags> BitRef<'flags, false> {
@@ -30,7 +30,7 @@ impl<'flags> BitRef<'flags, false> {
             BitRef {
                 word: &flags.words[word_idx],
                 bit_shift,
-                iter_masks_cache: None,
+                search_masks_cache: None,
             }
         })
     }
@@ -41,22 +41,23 @@ impl<'flags> BitRef<'flags, false> {
     /// iteration around this specific bit, having this cache around can greatly
     /// speed things up in the common case where there is a single word of flags
     /// and all flags are set or unset.
-    pub fn with_cache(self, flags: &'flags AtomicFlags) -> BitRef<'flags, true> {
+    pub fn with_cache(&self, flags: &'flags AtomicFlags) -> BitRef<'flags, true> {
         BitRef {
             word: self.word,
             bit_shift: self.bit_shift,
-            iter_masks_cache: Some(IteratorMasksCache {
-                set_wo_self: iter::init_mask::<true, false, false>(flags, &self),
-                unset_wo_self: NonZeroWord::new(iter::init_mask::<false, false, false>(
-                    flags, &self,
-                ))
-                .unwrap(),
+            search_masks_cache: Some(SearchMasksCache {
+                set_with_self: NonZeroWord::new(self.compute_search_mask::<true, true>(flags))
+                    .unwrap(),
+                set_wo_self: self.compute_search_mask::<true, false>(flags),
+                unset_with_self: self.compute_search_mask::<false, true>(flags),
+                unset_wo_self: NonZeroWord::new(self.compute_search_mask::<false, false>(flags))
+                    .unwrap(),
             }),
         }
     }
 }
 //
-impl<'flags, const CACHE_ITER_MASKS: bool> BitRef<'flags, CACHE_ITER_MASKS> {
+impl<'flags, const CACHE_SEARCH_MASKS: bool> BitRef<'flags, CACHE_SEARCH_MASKS> {
     /// Check if this bit is set with specified memory ordering
     pub fn is_set(&self, order: Ordering) -> bool {
         self.word.load(order) & self.bit_mask() != 0
@@ -74,8 +75,12 @@ impl<'flags, const CACHE_ITER_MASKS: bool> BitRef<'flags, CACHE_ITER_MASKS> {
         self.word.fetch_and(!bit, order) & bit != 0
     }
 
-    /// Number of left bit shift from `origin` to `self`
-    pub fn offset_from(&self, origin: &Self, flags: &'flags AtomicFlags) -> usize {
+    /// Number of left bit shifts from `origin` to `self`
+    pub fn offset_from<const OTHER_CACHE: bool>(
+        &self,
+        origin: &BitRef<'flags, OTHER_CACHE>,
+        flags: &'flags AtomicFlags,
+    ) -> usize {
         self.linear_idx(flags) - origin.linear_idx(flags)
     }
 
@@ -125,34 +130,82 @@ impl<'flags, const CACHE_ITER_MASKS: bool> BitRef<'flags, CACHE_ITER_MASKS> {
         self.word_idx(flags) * WORD_BITS + self.bit_shift() as usize
     }
 
-    /// Initialization mask for a certain flavor of bit iterator
-    pub(crate) fn iter_mask<const FIND_SET: bool, const INCLUDE_SELF: bool>(
+    /// Bit mask used to search for a given bit value in a word of AtomicFlags
+    ///
+    /// Bit masks used to search for set bits have all significant bits set to 1
+    /// and other insignificant bits set to 0. They are AND-ed with the word
+    /// value to clear all set bits from the insignificant portion of the word,
+    /// so that they are ignored by the search for set bits.
+    ///
+    /// Bit masks used to search for unset bits have all significant bits set to
+    /// 0 and other insignificant bits set to 1. They are OR-ed with the word
+    /// value to set all the unset bits in the insignificant portion of the
+    /// word, so that they are ignored by the search for unset bits.
+    ///
+    /// Workers will often want to exclude their own bit from the search by
+    /// clearing INCLUDE_SELF, since they are looking to exchange work with
+    /// others, not themselves. However, threads external to the thread pool
+    /// must search over all bits.
+    pub(crate) fn search_mask<const FIND_SET: bool, const INCLUDE_SELF: bool>(
         &self,
         flags: &'flags AtomicFlags,
     ) -> Word {
-        if !INCLUDE_SELF && CACHE_ITER_MASKS {
-            let cache = unsafe { self.iter_masks_cache.as_ref().unwrap_unchecked() };
-            if FIND_SET {
-                cache.set_wo_self
-            } else {
-                Word::from(cache.unset_wo_self)
-            }
+        if CACHE_SEARCH_MASKS {
+            // SAFETY: Checked that CACHE_SEARCH_MASKS is true
+            unsafe { self.cached_search_mask_unchecked::<FIND_SET, INCLUDE_SELF>() }
         } else {
-            iter::init_mask::<FIND_SET, INCLUDE_SELF, CACHE_ITER_MASKS>(flags, self)
+            self.compute_search_mask::<FIND_SET, INCLUDE_SELF>(flags)
+        }
+    }
+
+    /// Compute the bit mask to search for a given bit value in a word
+    ///
+    /// See [`Self::search_mask()`] for details.
+    fn compute_search_mask<const FIND_SET: bool, const INCLUDE_START: bool>(
+        &self,
+        flags: &'flags AtomicFlags,
+    ) -> Word {
+        let word_idx = self.word_idx(flags);
+        let significant = Word::from(flags.significant_bits(word_idx));
+        let bit = self.bit_mask();
+        match [FIND_SET, INCLUDE_START] {
+            [false, false] => !significant | bit,
+            [false, true] => !significant,
+            [true, false] => significant & !bit,
+            [true, true] => significant,
+        }
+    }
+
+    /// Unchecked access to the cached version of `Self::search_mask()`
+    ///
+    /// # Safety
+    ///
+    /// This should only be called if `CACHE_SEARCH_MASKS` is true, and thus a
+    /// search masks cache is guaranteed to be present.
+    unsafe fn cached_search_mask_unchecked<const FIND_SET: bool, const INCLUDE_SELF: bool>(
+        &self,
+    ) -> Word {
+        // SAFETY: Per precondition
+        let cache = unsafe { self.search_masks_cache.as_ref().unwrap_unchecked() };
+        match (FIND_SET, INCLUDE_SELF) {
+            (false, false) => cache.unset_wo_self.into(),
+            (false, true) => cache.unset_with_self,
+            (true, false) => cache.set_wo_self,
+            (true, true) => cache.set_with_self.into(),
         }
     }
 
     /// Version of this bit reference without the iterator cache
-    pub(crate) fn without_cache(&self) -> BitRef<'flags, false> {
+    pub fn without_cache(&self) -> BitRef<'flags, false> {
         BitRef {
             word: self.word,
             bit_shift: self.bit_shift,
-            iter_masks_cache: None,
+            search_masks_cache: None,
         }
     }
 }
 //
-impl<'flags, const CACHE_ITER_MASKS: bool> Debug for BitRef<'flags, CACHE_ITER_MASKS> {
+impl<'flags, const CACHE_SEARCH_MASKS: bool> Debug for BitRef<'flags, CACHE_SEARCH_MASKS> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BitRef")
             .field(
@@ -160,14 +213,14 @@ impl<'flags, const CACHE_ITER_MASKS: bool> Debug for BitRef<'flags, CACHE_ITER_M
                 &format!("{:064b}", self.word.load(Ordering::Relaxed)),
             )
             .field("bit_shift", &self.bit_shift)
-            .field("iter_masks_cache", &self.iter_masks_cache)
+            .field("search_masks_cache", &self.search_masks_cache)
             .finish()
     }
 }
 //
-impl<'flags, const CACHE_ITER_MASKS: bool> Eq for BitRef<'flags, CACHE_ITER_MASKS> {}
+impl<'flags, const CACHE_SEARCH_MASKS: bool> Eq for BitRef<'flags, CACHE_SEARCH_MASKS> {}
 //
-impl<'flags, const CACHE_ITER_MASKS: bool> Hash for BitRef<'flags, CACHE_ITER_MASKS> {
+impl<'flags, const CACHE_SEARCH_MASKS: bool> Hash for BitRef<'flags, CACHE_SEARCH_MASKS> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let word: *const AtomicWord = self.word;
         word.hash(state);
@@ -183,14 +236,53 @@ impl<'flags, const LEFT_CACHED: bool, const RIGHT_CACHED: bool>
     }
 }
 
-/// Cached masks for neighbour iterators
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-struct IteratorMasksCache {
-    /// Iterator over unset indices, not including self
-    unset_wo_self: NonZeroWord,
+/// Cached masks for bit value searches
+#[derive(Copy, Clone, Eq, Hash, PartialEq)]
+struct SearchMasksCache {
+    /// Mask to be used when searching for set bits, including self
+    ///
+    /// All significant bits including self are set to 1, all other bits are set
+    /// to 0. Use by AND-ing with the current word value, neutral is Word::MIN.
+    ///
+    /// Cannot be all-zeroes because each word has at least one significant bit
+    /// (otherwise, why would we allocate it?)
+    set_with_self: NonZeroWord,
 
-    /// Iterator over set indices, not including self
+    /// Mask to be used when searching for set bits, not including self
+    ///
+    /// All significant bits except self are set to 1, all other bits are set to
+    /// 0. Use by AND-ing with the current word value, neutral is Word::MIN.
+    ///
+    /// Can be all-zeroes if self is the only significant bit.
     set_wo_self: Word,
+
+    /// Mask to be used when searching for unset bits, including self
+    ///
+    /// All significant bits including self are set to 0, all other bits are set
+    /// to 1. Use by OR-ing with the current word value, neutral is Word::MAX.
+    ///
+    /// Can be all-zeroes if all bits are significant.
+    unset_with_self: Word,
+
+    /// Mask to be used when searching for unset bits, not including self
+    ///
+    /// All significant bits except self are set to 0, all other bits are set to
+    /// 1. Use by OR-ing with the current word value, neutral is Word::MAX.
+    ///
+    /// Cannot be all-zeroes because at least one bit associated with self witll
+    /// be set to 1.
+    unset_wo_self: NonZeroWord,
+}
+//
+impl Debug for SearchMasksCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SearchMasksCache")
+            .field("set_with_self", &format!("{:064b}", self.set_with_self))
+            .field("set_wo_self", &format!("{:064b}", self.set_wo_self))
+            .field("unset_with_self", &format!("{:064b}", self.unset_with_self))
+            .field("unset_wo_self", &format!("{:064b}", self.unset_wo_self))
+            .finish()
+    }
 }
 
 // TODO: Add tests

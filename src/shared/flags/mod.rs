@@ -3,7 +3,7 @@
 pub(crate) mod bitref;
 mod iter;
 
-use self::bitref::BitRef;
+use self::{bitref::BitRef, iter::NearestBitIterator};
 #[cfg(test)]
 use proptest::prelude::*;
 use std::{
@@ -98,21 +98,21 @@ impl AtomicFlags {
     /// that not every bit readout requires a word readout.
     ///
     /// Returns None if it can be proven early that iteration will yield no bit
-    pub fn iter_set_around<'self_, const INCLUDE_CENTER: bool, const CACHE_ITER_MASKS: bool>(
+    pub fn iter_set_around<'self_, const INCLUDE_CENTER: bool, const CACHE_SEARCH_MASKS: bool>(
         &'self_ self,
-        center: &BitRef<'self_, CACHE_ITER_MASKS>,
+        center: &BitRef<'self_, CACHE_SEARCH_MASKS>,
         order: Ordering,
     ) -> Option<impl Iterator<Item = BitRef<'self_, false>> + 'self_> {
-        iter::NearestBitIterator::<true, INCLUDE_CENTER>::new(self, center, order)
+        NearestBitIterator::<true, INCLUDE_CENTER>::new(self, center, order)
     }
 
     /// Like iter_set_around, but looks for unset flags instead of set flags
-    pub fn iter_unset_around<'self_, const INCLUDE_CENTER: bool, const CACHE_ITER_MASKS: bool>(
+    pub fn iter_unset_around<'self_, const INCLUDE_CENTER: bool, const CACHE_SEARCH_MASKS: bool>(
         &'self_ self,
-        center: &BitRef<'self_, CACHE_ITER_MASKS>,
+        center: &BitRef<'self_, CACHE_SEARCH_MASKS>,
         order: Ordering,
     ) -> Option<impl Iterator<Item = BitRef<'self_, false>> + 'self_> {
-        iter::NearestBitIterator::<false, INCLUDE_CENTER>::new(self, center, order)
+        NearestBitIterator::<false, INCLUDE_CENTER>::new(self, center, order)
     }
 
     /// Iterate over the value of inner words
@@ -301,9 +301,7 @@ pub(crate) mod tests {
             prop_assert_eq!(hasher.hash_one(&clone), hasher.hash_one(&flags));
             prop_assert!(flags.words(Ordering::Relaxed).eq(flags.words.iter().map(|word| word.load(Ordering::Relaxed))));
         }
-    }
 
-    proptest! {
         #[test]
         fn op_idx((flags, bit_idx) in flags_and_bit_idx()) {
             let initial_flags = flags.clone();
