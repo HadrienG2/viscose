@@ -13,7 +13,11 @@ use crossbeam::{
     deque::{self, Injector, Steal, Stealer},
     utils::CachePadded,
 };
-use std::sync::{atomic::Ordering, Arc};
+use hwlocality::{bitmap::BitmapIndex, cpu::cpuset::CpuSet, Topology};
+use std::{
+    borrow::Borrow,
+    sync::{atomic::Ordering, Arc},
+};
 
 /// State that is shared between users of the thread pool and all thread pool
 /// workers
@@ -40,53 +44,156 @@ pub(crate) struct SharedState {
 }
 //
 impl SharedState {
-    /// Set up the shared state
-    pub fn with_work_queues(num_workers: usize) -> (Arc<Self>, Box<[deque::Worker<DynJob>]>) {
+    /// Set up the shared and worker-local state
+    pub fn with_worker_config(
+        topology: &Topology,
+        affinity: impl Borrow<CpuSet>,
+    ) -> (Arc<Self>, Box<[WorkerConfig]>) {
+        // Determine which CPUs we can actually use, and cross-check that the
+        // implementation supports that
+        let cpuset = topology.cpuset() & affinity;
+        let num_workers = cpuset.weight().unwrap();
+        assert_ne!(
+            num_workers, 0,
+            "a thread pool without threads can't make progress and will deadlock on first request"
+        );
         assert!(
             num_workers < WorkerFutex::MAX_WORKERS,
             "unsupported number of worker threads"
         );
-        let injector = Injector::new();
-        let mut work_queues = Vec::with_capacity(num_workers);
-        let mut workers = Vec::with_capacity(num_workers);
-        for _ in 0..num_workers {
-            let (worker, work_queue) = WorkerInterface::with_work_queue();
-            workers.push(CachePadded::new(worker));
-            work_queues.push(work_queue);
+
+        // Set up worker-local state
+        let mut worker_configs = Vec::with_capacity(num_workers);
+        let mut worker_interfaces = Vec::with_capacity(num_workers);
+        for cpu in cpuset {
+            let (config, interface) = new_worker(cpu);
+            worker_configs.push(config);
+            worker_interfaces.push(CachePadded::new(interface));
         }
+
+        // Set up global shared state
         let result = Arc::new(Self {
-            injector,
-            workers: workers.into(),
+            injector: Injector::new(),
+            workers: worker_interfaces.into(),
             work_availability: AtomicFlags::new(num_workers),
         });
-        (result, work_queues.into())
+        (result, worker_configs.into())
     }
 
-    /// Recommend that the work-less thread closest to a certain originating
-    /// locality steal a task from the specified location
-    pub fn recommend_stealing<'self_, const INCLUDE_CENTER: bool, const CACHE_ITER_MASKS: bool>(
+    /// Enumerate workers that a thief could steal work from, at increasing
+    /// distance from said thief
+    pub fn find_workers_to_rob<'self_, const CACHE_SEARCH_MASKS: bool>(
         &'self_ self,
-        local_worker: &BitRef<'self_, CACHE_ITER_MASKS>,
+        thief: &BitRef<'self_, CACHE_SEARCH_MASKS>,
+    ) -> Option<impl Iterator<Item = usize> + '_> {
+        let work_availability = &self.work_availability;
+        work_availability
+            // Need at least Acquire ordering to ensure that the work we
+            // observed to be available is actually visible in the worker's
+            // queue, and don't need anything stronger:
+            //
+            // - Don't need AcqRel (which would require replacing the load
+            //   with a RMW) since we're not trying to get any other thread
+            //   in sync with our current state.
+            // - Don't need SeqCst since there is no need for everyone to
+            //   agree on the global order in which workers look for work.
+            .iter_set_around::<false, CACHE_SEARCH_MASKS>(thief, Ordering::Acquire)
+            .map(|iter| iter.map(|bit| bit.linear_idx(work_availability)))
+    }
+
+    /// Given a worker that has just pushed new work in its work queue, find the
+    /// closest worker that is looking for work (if any) and suggest that it
+    /// steal from the pushing worker.
+    ///
+    /// There should be a `Release` barrier between the moment where the task is
+    /// pushed and the moment where this notification is sent, so that the
+    /// recipient of the notification is guaranteed to observe the freshly
+    /// pushed work. You can either bundle the `Release` barrier into this
+    /// transaction or put a `Release` fence before this transaction.
+    pub fn suggest_stealing_from_worker<'self_>(
+        &'self_ self,
+        local_worker: &BitRef<'self_, true>,
+        update: Ordering,
+    ) {
+        self.suggest_stealing::<false, true>(
+            local_worker,
+            StealLocation::Worker(local_worker.linear_idx(&self.work_availability)),
+            update,
+        );
+    }
+
+    /// Inject work into the thread pool
+    ///
+    /// # Safety
+    ///
+    /// The [`Job`] API contract must be honored as long as the completion
+    /// notification has not been received. This entails in particular that all
+    /// code including spawn_unchecked until the point where the remote task has
+    /// signaled completion should translate unwinding panics to aborts.
+    pub unsafe fn inject_job(&self, job: DynJob, local_worker_idx: usize) {
+        self.injector.push(job);
+        self.suggest_stealing::<true, false>(
+            &self.work_availability.bit(local_worker_idx),
+            StealLocation::Injector,
+            // Need at least Release ordering to ensure injected job is visible
+            // to the target and don't need anything stronger:
+            //
+            // - Don't need AcqRel ordering since the thread that's pushing work
+            //   does not want to get in sync with the target worker's state.
+            // - Don't need SeqCst since there is no need for everyone to agree
+            //   on the global order of job injection events.
+            Ordering::Release,
+        );
+    }
+
+    /// Steal a job from the global work injector
+    pub fn steal_from_injector(&self) -> Steal<DynJob> {
+        self.injector.steal()
+    }
+
+    /// Given a location where a new task has just been pushed and an assessment
+    /// of which worker would be best placed to process this task, find the
+    /// nearest worker that's looking for work (if any) and suggest that it
+    /// steal from the recommended location.
+    ///
+    /// `INCLUDE_CENTER` should be `false` when the task has been pushed into
+    /// the local worker's work queue (in this case the worker obviously has
+    /// work, so we should not include it in the search space for workers
+    /// looking for work). It should be `true` when the task is pushed into the
+    /// global injector, since any worker is potentially interested then.
+    ///
+    /// There should be a `Release` barrier between the moment where the task is
+    /// pushed and the moment where this notification is sent, so that the
+    /// recipient of the notification is guaranteed to observe the freshly
+    /// pushed work. You can either bundle the `Release` barrier into this
+    /// transaction or put a `Release` fence before this transaction.
+    fn suggest_stealing<'self_, const INCLUDE_CENTER: bool, const CACHE_SEARCH_MASKS: bool>(
+        &'self_ self,
+        local_worker: &BitRef<'self_, CACHE_SEARCH_MASKS>,
         task_location: StealLocation,
         update: Ordering,
     ) {
         // Check if there are job-less neighbors to submit work to...
         //
-        // Need Acquire ordering so the futex is read after the work
-        // availability flag, no work availability caching/speculation allowed.
+        // Need Acquire ordering so the futex is only read/modified after a work
+        // unavailability signal is observed: compilers and CPUs should not
+        // cache the work availability bit value or speculate on it here.
         let Some(mut asleep_neighbors) = self
             .work_availability
-            .iter_unset_around::<INCLUDE_CENTER, CACHE_ITER_MASKS>(local_worker, Ordering::Acquire)
+            .iter_unset_around::<INCLUDE_CENTER, CACHE_SEARCH_MASKS>(
+                local_worker,
+                Ordering::Acquire,
+            )
         else {
             return;
         };
 
         // ...and if so, tell the closest one about our newly submitted job
         #[cold]
-        fn unlikely<'self_, const CACHE_ITER_MASKS: bool>(
+        fn unlikely<'self_, const CACHE_SEARCH_MASKS: bool>(
             self_: &'self_ SharedState,
             asleep_neighbors: impl Iterator<Item = BitRef<'self_, false>>,
-            local_worker: &BitRef<'self_, CACHE_ITER_MASKS>,
+            local_worker: &BitRef<'self_, CACHE_SEARCH_MASKS>,
             task_location: StealLocation,
             update: Ordering,
         ) {
@@ -98,7 +205,7 @@ impl SharedState {
                 // Can use Relaxed ordering on failure because failing to
                 // suggest work to a worker has no observable consequences and
                 // isn't used to inform any decision other than looking up the
-                // state of the next worker. Worker states are independent.
+                // state of the next worker, which is independent from this one.
                 let closest_asleep = closest_asleep.linear_idx(&self_.work_availability);
                 let accepted = self_.workers[closest_asleep].futex.suggest_steal(
                     task_location,
@@ -119,53 +226,17 @@ impl SharedState {
             update,
         )
     }
+}
 
-    /// Enumerate workers that a thief could steal work from, at increasing
-    /// distance from said thief
-    pub fn find_workers_to_rob<'self_, const CACHE_ITER_MASKS: bool>(
-        &'self_ self,
-        thief: &BitRef<'self_, CACHE_ITER_MASKS>,
-    ) -> Option<impl Iterator<Item = usize> + '_> {
-        let work_availability = &self.work_availability;
-        work_availability
-            // We need Acquire ordering so that when we later attempt to steal
-            // from the worker, we are guaranteed to see the work in its work
-            // queue, if no one else stole it since.
-            //
-            // We don't need stronger-than-Acquire ordering because we're not
-            // trying to get anyone else in sync with us (which is what Release
-            // is for) and we're not trying to get all thread to agree on a
-            // global order of searches for work (which is what SeqCst is for).
-            .iter_set_around::<false, CACHE_ITER_MASKS>(thief, Ordering::Acquire)
-            .map(|iter| iter.map(|bit| bit.linear_idx(work_availability)))
-    }
+/// Internal state needed to configure a new worker
+#[derive(Debug)]
+#[doc(hidden)]
+pub(crate) struct WorkerConfig {
+    /// Work queue
+    pub work_queue: deque::Worker<DynJob>,
 
-    /// Inject work into the thread pool
-    ///
-    /// # Safety
-    ///
-    /// The [`Job`] API contract must be honored as long as the completion
-    /// notification has not been received. This entails in particular that all
-    /// code including spawn_unchecked until the point where the remote task has
-    /// signaled completion should translate unwinding panics to aborts.
-    pub unsafe fn inject_job(&self, job: DynJob, local_worker_idx: usize) {
-        // Schedule the work to be executed
-        self.injector.push(job);
-
-        // Find the nearest available thread and recommend it to process this
-        //
-        // Need Release ordering to make sure they see the pushed work
-        self.recommend_stealing::<true, false>(
-            &self.work_availability.bit(local_worker_idx),
-            StealLocation::Injector,
-            Ordering::Release,
-        );
-    }
-
-    /// Steal a job from the global work injector
-    pub fn steal_from_injector(&self) -> Steal<DynJob> {
-        self.injector.steal()
-    }
+    /// CPU which this worker should be pinned to
+    pub cpu: BitmapIndex,
 }
 
 /// External interface to a single worker in a thread pool
@@ -178,15 +249,20 @@ pub(crate) struct WorkerInterface {
     /// instruct it what to do when it is awakened.
     pub futex: WorkerFutex,
 }
-//
-impl WorkerInterface {
-    /// Set up a worker's work queue and external interface
-    pub fn with_work_queue() -> (Self, deque::Worker<DynJob>) {
-        let worker = deque::Worker::new_lifo();
-        let interface = Self {
-            stealer: worker.stealer(),
-            futex: WorkerFutex::new(),
-        };
-        (interface, worker)
-    }
+
+/// Prepare to add a new worker to the thread pool
+///
+/// This builds both the internal state that will be used to configure the
+/// worker on startup and the external interface that will be used by the rest
+/// of the world to communicate with the worker.
+pub(crate) fn new_worker(cpu: BitmapIndex) -> (WorkerConfig, WorkerInterface) {
+    let config = WorkerConfig {
+        work_queue: deque::Worker::new_lifo(),
+        cpu,
+    };
+    let interface = WorkerInterface {
+        stealer: config.work_queue.stealer(),
+        futex: WorkerFutex::new(),
+    };
+    (config, interface)
 }

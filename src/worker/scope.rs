@@ -132,11 +132,9 @@ impl<'scope> Scope<'scope> {
         // This doesn't need to be ordered after the setting of work_available
         // because workers following a direct work-stealing recommendation do
         // not check the work_availability bits.
-        self.0.shared.recommend_stealing::<false, true>(
-            &self.0.work_available.bit,
-            StealLocation::Worker(self.0.idx),
-            Ordering::Relaxed,
-        );
+        self.0
+            .shared
+            .suggest_stealing_from_worker(&self.0.work_available.bit, Ordering::Relaxed);
     }
 }
 //
