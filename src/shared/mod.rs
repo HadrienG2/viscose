@@ -49,10 +49,12 @@ impl SharedState {
         topology: &Topology,
         affinity: impl Borrow<CpuSet>,
     ) -> (Arc<Self>, Box<[WorkerConfig]>) {
-        // Determine which CPUs we can actually use, and cross-check that the
-        // implementation supports that
-        let cpuset = topology.cpuset() & affinity;
-        let num_workers = cpuset.weight().unwrap();
+        // Collect the PU objects that fit in our affinity mask, and cross-check
+        // that the count is valid
+        let mut pus = topology
+            .pus_from_cpuset(affinity.borrow())
+            .collect::<Vec<_>>();
+        let num_workers = pus.len();
         assert_ne!(
             num_workers, 0,
             "a thread pool without threads can't make progress and will deadlock on first request"
@@ -62,10 +64,19 @@ impl SharedState {
             "unsupported number of worker threads"
         );
 
+        // Order worker PUs by logical index, which minimize topological
+        // distance between nearest neighbors and makes it monotonic: as you go
+        // away from a worker's index in one direction (up or down), the
+        // topological distance between the worker you're looking at and the
+        // reference worker may only increase.
+        pus.sort_unstable_by_key(|pu| pu.logical_index());
+
         // Set up worker-local state
         let mut worker_configs = Vec::with_capacity(num_workers);
         let mut worker_interfaces = Vec::with_capacity(num_workers);
-        for cpu in cpuset {
+        for pu in pus {
+            let cpu = BitmapIndex::try_from(pu.os_index().expect("PUs should have an OS index"))
+                .expect("PU OS indices should fit in a BitmapIndex (since they fit in a CpuSet)");
             let (config, interface) = new_worker(cpu);
             worker_configs.push(config);
             worker_interfaces.push(CachePadded::new(interface));
