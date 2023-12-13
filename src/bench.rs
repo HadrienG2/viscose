@@ -230,7 +230,8 @@ pub fn bench_local_floats<const BLOCK_LEN: usize>(
     mut bench_impl: impl FnMut(&mut Bencher, &mut LocalFloatsSlice<'_, BLOCK_LEN>),
 ) {
     assert!(BLOCK_LEN.is_power_of_two());
-    let block_size_pow2 = (BLOCK_LEN * std::mem::size_of::<f32>()).trailing_zeros();
+    let elem_size = std::mem::size_of::<f32>();
+    let block_size_pow2 = (BLOCK_LEN * elem_size).trailing_zeros();
     let mut group = c.benchmark_group(&format!("{backend_name}/{benchmark_name}"));
     for num_blocks_pow2 in 0..=max_data_size_pow2() - block_size_pow2 {
         let num_blocks = 1usize << num_blocks_pow2;
@@ -238,7 +239,8 @@ pub fn bench_local_floats<const BLOCK_LEN: usize>(
         group.throughput(criterion::Throughput::Elements(
             (num_blocks * BLOCK_LEN) as _,
         ));
-        group.bench_function(&format!("{num_blocks}x{BLOCK_LEN}"), |b| {
+        let block_size_kib = BLOCK_LEN * elem_size / 1024;
+        group.bench_function(&format!("{num_blocks}x{block_size_kib}KiB"), |b| {
             bench_impl(b, &mut data.as_slice())
         });
     }
