@@ -7,19 +7,19 @@ fn criterion_benchmark(c: &mut Criterion) {
             macro_rules! bench_sum {
             () => {
                 // I picked these values because...
-                // - 4 is the sweet spot for hyperthreaded SSE
-                // - 8 is the sweet spot for non-HT SSE and HT AVX
-                // - 16 is the sweet spot for non-HT AVX
-                bench_sum!(ilp[4, 8, 16]);
+                // - 8 is the sweet spot for two SSE ALUs
+                // - 16 is the sweet spot for two AVX ALUs
+                bench_sum!(ilp[8, 16]);
             };
             (
                 ilp[$($ilp_streams:literal),*]
             ) => {$(
                 // I picked these values because...
-                // - Each float is 4 bytes
-                // - The hyperthreaded sweet spot is <=16 KiB/thread -> 4096 floats
-                // - The non-HT sweet spot is <=32 KiB/thread -> 8192 floats
-                bench_sum!(ilp$ilp_streams/block_pow2[11, 12, 13]);
+                // - Each f32 is 4 bytes
+                // - Hyperthreads share the L1 cache, so the theoretical HT
+                //   sweet spot is to use half of it: 16 KiB/thread -> 4096 f32s
+                // - The non-HT sweet spot is 32 KiB/thread -> 8192 f32s
+                bench_sum!(ilp$ilp_streams/block_pow2[12, 13]);
             )*};
             (
                 ilp$ilp_streams:literal/block_pow2[$($block_size_pow2:literal),*]

@@ -1,8 +1,11 @@
+#![allow(unused)]
+
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use std::sync::atomic::Ordering;
 use viscose::bench::{AtomicFlags, BitRef};
 
 fn criterion_benchmark(c: &mut Criterion) {
+    #[cfg(feature = "bench-flags")]
     for len_pow2 in 0..=8 {
         let len = 2usize.pow(len_pow2);
         let flags = AtomicFlags::new(len);

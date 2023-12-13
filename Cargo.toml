@@ -41,6 +41,13 @@ log = ["dep:log"]
 # Enable benchmarking code (must be enabled for benchmarks to compile)
 bench = ["dep:criterion", "dep:env_logger", "dep:iterator_ilp", "dep:pessimize", "dep:rayon"]
 
+# Enable benchmarking of flags
+#
+# Since flags are a lower-level building block, the need to benchmark them comes
+# up less often, and the massive amout of flags benchmarks slows down Criterion
+# runs significantly even when the benchmarks are not run.
+bench-flags = ["bench"]
+
 # Enable unsafe join concurrency detection and benchmarking by default
 default = ["detect-excessive-joins", "bench"]
 
