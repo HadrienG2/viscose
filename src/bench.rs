@@ -112,20 +112,20 @@ pub fn fibonacci_ours(scope: &Scope<'_>, n: u64) -> u64 {
 /// Array of floats that can be split into blocks, where each block tracks which
 /// thread pool worker it is local to
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct LocalFloats<const BLOCK_SIZE: usize> {
-    /// Inner floating-point data (size must be a multiple of BLOCK_SIZE)
+pub struct LocalFloats<const BLOCK_LEN: usize> {
+    /// Inner floating-point data (size must be a multiple of BLOCK_LEN)
     data: Box<[f32]>,
 
     /// Per-block tracking of which worker processes data is local to
     locality: Box<[CachePadded<Option<usize>>]>,
 }
 //
-impl<const BLOCK_SIZE: usize> LocalFloats<BLOCK_SIZE> {
+impl<const BLOCK_LEN: usize> LocalFloats<BLOCK_LEN> {
     /// Set up storage for N data blocks
     pub fn new(num_blocks: usize) -> Self {
         Self {
             data: std::iter::repeat(0.0)
-                .take(num_blocks * BLOCK_SIZE)
+                .take(num_blocks * BLOCK_LEN)
                 .collect(),
             locality: std::iter::repeat(CachePadded::new(None))
                 .take(num_blocks)
@@ -134,7 +134,7 @@ impl<const BLOCK_SIZE: usize> LocalFloats<BLOCK_SIZE> {
     }
 
     /// Acquire a slice covering the whole dataset
-    pub fn as_slice(&mut self) -> LocalFloatsSlice<'_, BLOCK_SIZE> {
+    pub fn as_slice(&mut self) -> LocalFloatsSlice<'_, BLOCK_LEN> {
         LocalFloatsSlice {
             data: &mut self.data[..],
             locality: &mut self.locality[..],
@@ -144,7 +144,7 @@ impl<const BLOCK_SIZE: usize> LocalFloats<BLOCK_SIZE> {
 //
 /// Slice to some LocalFloats
 #[derive(Debug, PartialEq)]
-pub struct LocalFloatsSlice<'target, const BLOCK_SIZE: usize> {
+pub struct LocalFloatsSlice<'target, const BLOCK_LEN: usize> {
     /// Slice of the underlying LocalFloats::data
     data: &'target mut [f32],
 
@@ -152,20 +152,20 @@ pub struct LocalFloatsSlice<'target, const BLOCK_SIZE: usize> {
     locality: &'target mut [CachePadded<Option<usize>>],
 }
 //
-impl<'target, const BLOCK_SIZE: usize> LocalFloatsSlice<'target, BLOCK_SIZE> {
+impl<'target, const BLOCK_LEN: usize> LocalFloatsSlice<'target, BLOCK_LEN> {
     /// Split into two halves and process the halves if this slice more than one
     /// block long, otherwise process that single block sequentially
     pub fn process<R: Send>(
         &mut self,
-        parallel: impl FnOnce([LocalFloatsSlice<'_, BLOCK_SIZE>; 2]) -> R,
-        sequential: impl FnOnce(&mut [f32; BLOCK_SIZE], &mut Option<usize>) -> R,
+        parallel: impl FnOnce([LocalFloatsSlice<'_, BLOCK_LEN>; 2]) -> R,
+        sequential: impl FnOnce(&mut [f32; BLOCK_LEN], &mut Option<usize>) -> R,
         default: R,
     ) -> R {
         match self.locality.len() {
             0 => default,
             1 => {
-                debug_assert_eq!(self.data.len(), BLOCK_SIZE);
-                let data: *mut [f32; BLOCK_SIZE] = self.data.as_mut_ptr().cast();
+                debug_assert_eq!(self.data.len(), BLOCK_LEN);
+                let data: *mut [f32; BLOCK_LEN] = self.data.as_mut_ptr().cast();
                 sequential(unsafe { &mut *data }, &mut self.locality[0])
             }
             _ => parallel(self.split()),
@@ -173,7 +173,7 @@ impl<'target, const BLOCK_SIZE: usize> LocalFloatsSlice<'target, BLOCK_SIZE> {
     }
 
     /// Split this slice into two halves (second half may be empty)
-    fn split<'self_, 'borrow>(&'self_ mut self) -> [LocalFloatsSlice<'borrow, BLOCK_SIZE>; 2]
+    fn split<'self_, 'borrow>(&'self_ mut self) -> [LocalFloatsSlice<'borrow, BLOCK_LEN>; 2]
     where
         'self_: 'borrow,
         'target: 'borrow, // Probably redundant, but clarifies the safety proof
@@ -200,7 +200,7 @@ impl<'target, const BLOCK_SIZE: usize> LocalFloatsSlice<'target, BLOCK_SIZE> {
                 Self {
                     data: std::slice::from_raw_parts_mut(
                         self.data.as_mut_ptr(),
-                        left_blocks * BLOCK_SIZE,
+                        left_blocks * BLOCK_LEN,
                     ),
                     locality: std::slice::from_raw_parts_mut(
                         self.locality.as_mut_ptr(),
@@ -209,8 +209,8 @@ impl<'target, const BLOCK_SIZE: usize> LocalFloatsSlice<'target, BLOCK_SIZE> {
                 },
                 Self {
                     data: std::slice::from_raw_parts_mut(
-                        self.data.as_mut_ptr().add(left_blocks * BLOCK_SIZE),
-                        right_blocks * BLOCK_SIZE,
+                        self.data.as_mut_ptr().add(left_blocks * BLOCK_LEN),
+                        right_blocks * BLOCK_LEN,
                     ),
                     locality: std::slice::from_raw_parts_mut(
                         self.locality.as_mut_ptr().add(left_blocks),
@@ -223,22 +223,22 @@ impl<'target, const BLOCK_SIZE: usize> LocalFloatsSlice<'target, BLOCK_SIZE> {
 }
 
 /// Run a LocalFloats-based benchmark at a given block size
-pub fn bench_local_floats<const BLOCK_SIZE: usize>(
+pub fn bench_local_floats<const BLOCK_LEN: usize>(
     c: &mut Criterion,
     benchmark_name: &str,
     backend_name: &str,
-    mut bench_impl: impl FnMut(&mut Bencher, &mut LocalFloatsSlice<'_, BLOCK_SIZE>),
+    mut bench_impl: impl FnMut(&mut Bencher, &mut LocalFloatsSlice<'_, BLOCK_LEN>),
 ) {
-    assert!(BLOCK_SIZE.is_power_of_two());
-    let block_size_pow2 = BLOCK_SIZE.trailing_zeros();
+    assert!(BLOCK_LEN.is_power_of_two());
+    let block_size_pow2 = (BLOCK_LEN * std::mem::size_of::<f32>()).trailing_zeros();
     let mut group = c.benchmark_group(&format!("{backend_name}/{benchmark_name}"));
     for num_blocks_pow2 in 0..=max_data_size_pow2() - block_size_pow2 {
         let num_blocks = 1usize << num_blocks_pow2;
-        let mut data = LocalFloats::<BLOCK_SIZE>::new(num_blocks);
+        let mut data = LocalFloats::<BLOCK_LEN>::new(num_blocks);
         group.throughput(criterion::Throughput::Elements(
-            (num_blocks * BLOCK_SIZE) as _,
+            (num_blocks * BLOCK_LEN) as _,
         ));
-        group.bench_function(&format!("{num_blocks}x{BLOCK_SIZE}"), |b| {
+        group.bench_function(&format!("{num_blocks}x{BLOCK_LEN}"), |b| {
             bench_impl(b, &mut data.as_slice())
         });
     }
@@ -254,7 +254,7 @@ fn max_data_size_pow2() -> u32 {
     *RESULT.get_or_init(|| {
         let cache_stats = crate::topology().cpu_cache_stats().unwrap();
         let total_l3_capacity = cache_stats.total_data_cache_sizes().last().unwrap();
-        let mut max_size = 2 * total_l3_capacity;
+        let mut max_size = 8 * total_l3_capacity;
         if !max_size.is_power_of_two() {
             max_size = max_size.next_power_of_two();
         }
@@ -267,7 +267,7 @@ fn max_data_size_pow2() -> u32 {
 /// This is our simplest memory-bound microbenchmark with a load-to-store memory
 /// access pattern and zero dependency chains between loop iterations.
 #[inline]
-pub fn square_rayon<const BLOCK_SIZE: usize>(slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>) {
+pub fn square_rayon<const BLOCK_LEN: usize>(slice: &mut LocalFloatsSlice<'_, BLOCK_LEN>) {
     slice.process(
         |[mut left, mut right]| {
             rayon::join(|| square_rayon(&mut left), || square_rayon(&mut right));
@@ -281,9 +281,9 @@ pub fn square_rayon<const BLOCK_SIZE: usize>(slice: &mut LocalFloatsSlice<'_, BL
 
 /// Like `square_rayon()`, but using a `ThreadPool`
 #[inline]
-pub fn square_ours<const BLOCK_SIZE: usize>(
+pub fn square_ours<const BLOCK_LEN: usize>(
     scope: &Scope<'_>,
-    slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
+    slice: &mut LocalFloatsSlice<'_, BLOCK_LEN>,
 ) {
     slice.process(
         |[mut left, mut right]| {
@@ -307,14 +307,14 @@ pub fn square_ours<const BLOCK_SIZE: usize>(
 /// dependencies between loop iterations and is thus more strongly affected by
 /// increasing memory access latencies.
 #[inline]
-pub fn sum_rayon<const BLOCK_SIZE: usize, const ILP_STREAMS: usize>(
-    slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
+pub fn sum_rayon<const BLOCK_LEN: usize, const ILP_STREAMS: usize>(
+    slice: &mut LocalFloatsSlice<'_, BLOCK_LEN>,
 ) -> f32 {
     slice.process(
         |[mut left, mut right]| {
             let (left, right) = rayon::join(
-                || sum_rayon::<BLOCK_SIZE, ILP_STREAMS>(&mut left),
-                || sum_rayon::<BLOCK_SIZE, ILP_STREAMS>(&mut right),
+                || sum_rayon::<BLOCK_LEN, ILP_STREAMS>(&mut left),
+                || sum_rayon::<BLOCK_LEN, ILP_STREAMS>(&mut right),
             );
             left + right
         },
@@ -325,15 +325,15 @@ pub fn sum_rayon<const BLOCK_SIZE: usize, const ILP_STREAMS: usize>(
 
 /// Like `sum_rayon()`, but uses a `ThreadPool`
 #[inline]
-pub fn sum_ours<const BLOCK_SIZE: usize, const ILP_STREAMS: usize>(
+pub fn sum_ours<const BLOCK_LEN: usize, const ILP_STREAMS: usize>(
     scope: &Scope<'_>,
-    slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
+    slice: &mut LocalFloatsSlice<'_, BLOCK_LEN>,
 ) -> f32 {
     slice.process(
         |[mut left, mut right]| {
             let (left, right) = scope.join(
-                || sum_ours::<BLOCK_SIZE, ILP_STREAMS>(scope, &mut left),
-                move |scope| sum_ours::<BLOCK_SIZE, ILP_STREAMS>(scope, &mut right),
+                || sum_ours::<BLOCK_LEN, ILP_STREAMS>(scope, &mut left),
+                move |scope| sum_ours::<BLOCK_LEN, ILP_STREAMS>(scope, &mut right),
             );
             left + right
         },
@@ -356,15 +356,15 @@ pub fn sum_ours<const BLOCK_SIZE: usize, const ILP_STREAMS: usize>(
 /// computations, where the result of each computation step is written down to a
 /// temporary array and later re-read by a later computation step.
 #[inline]
-pub fn norm_sqr_rayon<const BLOCK_SIZE: usize, const REDUCE_ILP_STREAMS: usize>(
-    slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
+pub fn norm_sqr_rayon<const BLOCK_LEN: usize, const REDUCE_ILP_STREAMS: usize>(
+    slice: &mut LocalFloatsSlice<'_, BLOCK_LEN>,
 ) -> f32 {
     slice.process(
         |[mut left, mut right]| {
             rayon::join(|| square_rayon(&mut left), || square_rayon(&mut right));
             let (left, right) = rayon::join(
-                || sum_rayon::<BLOCK_SIZE, REDUCE_ILP_STREAMS>(&mut left),
-                || sum_rayon::<BLOCK_SIZE, REDUCE_ILP_STREAMS>(&mut right),
+                || sum_rayon::<BLOCK_LEN, REDUCE_ILP_STREAMS>(&mut left),
+                || sum_rayon::<BLOCK_LEN, REDUCE_ILP_STREAMS>(&mut right),
             );
             left + right
         },
@@ -379,9 +379,9 @@ pub fn norm_sqr_rayon<const BLOCK_SIZE: usize, const REDUCE_ILP_STREAMS: usize>(
 
 /// Like `norm_sqr_rayon()`, but uses a `ThreadPool`
 #[inline]
-pub fn norm_sqr_ours<const BLOCK_SIZE: usize, const REDUCE_ILP_STREAMS: usize>(
+pub fn norm_sqr_ours<const BLOCK_LEN: usize, const REDUCE_ILP_STREAMS: usize>(
     scope: &Scope<'_>,
-    slice: &mut LocalFloatsSlice<'_, BLOCK_SIZE>,
+    slice: &mut LocalFloatsSlice<'_, BLOCK_LEN>,
 ) -> f32 {
     slice.process(
         |[mut left, mut right]| {
@@ -390,8 +390,8 @@ pub fn norm_sqr_ours<const BLOCK_SIZE: usize, const REDUCE_ILP_STREAMS: usize>(
                 |scope| square_ours(scope, &mut right),
             );
             let (left, right) = scope.join(
-                || sum_ours::<BLOCK_SIZE, REDUCE_ILP_STREAMS>(scope, &mut left),
-                move |scope| sum_ours::<BLOCK_SIZE, REDUCE_ILP_STREAMS>(scope, &mut right),
+                || sum_ours::<BLOCK_LEN, REDUCE_ILP_STREAMS>(scope, &mut left),
+                move |scope| sum_ours::<BLOCK_LEN, REDUCE_ILP_STREAMS>(scope, &mut right),
             );
             left + right
         },
