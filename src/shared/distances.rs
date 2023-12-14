@@ -26,15 +26,15 @@ impl Distances {
     ///
     /// Workers will be sorted in a way that minimizes the distance between
     /// nearest neighbors.
-    pub fn measure_and_sort(workers: &mut [&TopologyObject]) -> Self {
+    pub fn measure_and_sort(worker_pus: &mut [&TopologyObject]) -> Self {
         // Check preconditions on worker objects
         assert!(
-            workers
+            worker_pus
                 .iter()
                 .all(|worker| worker.object_type() == ObjectType::PU),
             "workers should be identified via PU objects"
         );
-        let num_workers = workers.len();
+        let num_workers = worker_pus.len();
         assert!(
             num_workers < usize::from(Distance::MAX),
             "CPUs with >{} cores aren't supported yet, time to switch to the next integer width?",
@@ -42,25 +42,30 @@ impl Distances {
         );
 
         // Order workers to put nearest neighbors close to each other
-        workers.sort_unstable_by_key(|pu| pu.logical_index());
+        worker_pus.sort_unstable_by_key(|pu| pu.logical_index());
 
         // Compute distance matrix
         let mut data = vec![Distance::MAX; num_workers * num_workers].into_boxed_slice();
         for worker_idx in 0..num_workers {
+            // Access distances from current worker and define distance metric
             let distances = &mut data[worker_idx * num_workers..(worker_idx + 1) * num_workers];
-            let mut curr_distance = 0;
-            let mut left_idx = worker_idx;
-            let mut right_idx = worker_idx;
-            let last_right_idx = num_workers - 1;
             let topological_distance = |neighbor_idx: usize| {
-                let worker = &workers[worker_idx];
-                let common = worker.common_ancestor(workers[neighbor_idx]).unwrap();
+                let worker = &worker_pus[worker_idx];
+                let common = worker.common_ancestor(worker_pus[neighbor_idx]).unwrap();
                 worker
                     .ancestors()
                     .take_while(|ancestor| !ptr::eq(common, *ancestor))
                     .count()
             };
+
+            // Initialize distance computation
+            let mut curr_distance = 0;
+            let mut left_idx = worker_idx;
+            let mut right_idx = worker_idx;
+            let last_right_idx = num_workers - 1;
             distances[worker_idx] = 0;
+
+            // Do bidirectional iteration as long as relevant
             while left_idx > 0 && right_idx < last_right_idx {
                 curr_distance += 1;
                 let topological_distance_left = topological_distance(left_idx - 1);
@@ -74,6 +79,8 @@ impl Distances {
                     distances[right_idx] = curr_distance;
                 }
             }
+
+            // Finish with unidirectional iteration
             loop {
                 curr_distance += 1;
                 if left_idx > 0 {
