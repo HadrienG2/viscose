@@ -5,6 +5,7 @@ pub mod scope;
 use self::scope::Scope;
 use crate::{
     shared::{
+        distances::Distance,
         flags::bitref::BitRef,
         futex::{StealLocation, WorkerFutex, WorkerFutexState},
         job::DynJob,
@@ -42,6 +43,9 @@ pub(crate) struct Worker<'pool> {
     /// `join()` finished...).
     futex: &'pool WorkerFutex,
 
+    /// Quick access to distances from this worker to other workers
+    distances: &'pool [Distance],
+
     /// State used when the worker thread is waiting for work
     waiting_state: Cell<Option<WaitingState>>,
 
@@ -61,6 +65,7 @@ impl<'pool> Worker<'pool> {
             work_queue,
             work_available: WorkAvailabilityBit::new(shared, idx),
             futex: &shared.workers[idx].futex,
+            distances: shared.distances.from(idx),
             waiting_state: Cell::new(None),
             work_over: Cell::new(false),
         };
@@ -271,7 +276,9 @@ impl<'pool> Worker<'pool> {
     /// of `self.futex`, so that `self.futex` can be updated if appropriate.
     fn steal_from_anyone(&self) -> Option<StealLocation> {
         // Are there other workers we could steal work from?
-        if let Some(neighbors_with_work) = self.shared.find_workers_to_rob(&self.work_available.bit)
+        if let Some(neighbors_with_work) = self
+            .shared
+            .find_workers_to_rob(&self.work_available.bit, self.distances)
         {
             // Try to steal from other workers at increasing distances
             for idx in neighbors_with_work {

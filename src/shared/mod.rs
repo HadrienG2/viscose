@@ -1,10 +1,12 @@
 //! State shared between the thread pool and all of its workers
 
+pub(crate) mod distances;
 pub(crate) mod flags;
 pub(crate) mod futex;
 pub(crate) mod job;
 
 use self::{
+    distances::{Distance, Distances},
     flags::{bitref::BitRef, AtomicFlags},
     futex::{StealLocation, WorkerFutex},
     job::DynJob,
@@ -21,7 +23,7 @@ use std::{
 
 /// State that is shared between users of the thread pool and all thread pool
 /// workers
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct SharedState {
     /// Global work injector
     injector: Injector<DynJob>,
@@ -41,6 +43,9 @@ pub(crate) struct SharedState {
     /// is performed with Acquire ordering or followed by an Acquire barrier,
     /// the pushed work should be observable.
     pub work_availability: AtomicFlags,
+
+    /// Distances between workers
+    pub distances: Distances,
 }
 //
 impl SharedState {
@@ -64,12 +69,8 @@ impl SharedState {
             "unsupported number of worker threads"
         );
 
-        // Order worker PUs by logical index, which minimize topological
-        // distance between nearest neighbors and makes it monotonic: as you go
-        // away from a worker's index in one direction (up or down), the
-        // topological distance between the worker you're looking at and the
-        // reference worker may only increase.
-        pus.sort_unstable_by_key(|pu| pu.logical_index());
+        // Compute and display distances between workers
+        let distances = Distances::measure_and_sort(&mut pus[..]);
 
         // Set up worker-local state
         let mut worker_configs = Vec::with_capacity(num_workers);
@@ -87,6 +88,7 @@ impl SharedState {
             injector: Injector::new(),
             workers: worker_interfaces.into(),
             work_availability: AtomicFlags::new(num_workers),
+            distances,
         });
         (result, worker_configs.into())
     }
@@ -96,7 +98,8 @@ impl SharedState {
     pub fn find_workers_to_rob<'self_, const CACHE_SEARCH_MASKS: bool>(
         &'self_ self,
         thief: &BitRef<'self_, CACHE_SEARCH_MASKS>,
-    ) -> Option<impl Iterator<Item = usize> + '_> {
+        distances_from_worker: &'self_ [Distance],
+    ) -> Option<impl Iterator<Item = usize> + 'self_> {
         let work_availability = &self.work_availability;
         work_availability
             // Need at least Acquire ordering to ensure that the work we
@@ -108,7 +111,11 @@ impl SharedState {
             //   in sync with our current state.
             // - Don't need SeqCst since there is no need for everyone to
             //   agree on the global order in which workers look for work.
-            .iter_set_around::<false, CACHE_SEARCH_MASKS>(thief, Ordering::Acquire)
+            .iter_set_around::<false, CACHE_SEARCH_MASKS>(
+                thief,
+                distances_from_worker,
+                Ordering::Acquire,
+            )
             .map(|iter| iter.map(|bit| bit.linear_idx(work_availability)))
     }
 
@@ -125,10 +132,12 @@ impl SharedState {
     pub fn suggest_stealing_from_worker<'self_>(
         &'self_ self,
         local_worker: &BitRef<'self_, true>,
+        distances_from_worker: &'self_ [Distance],
         update: Ordering,
     ) {
         self.suggest_stealing::<false, true>(
             local_worker,
+            distances_from_worker,
             StealLocation::Worker(local_worker.linear_idx(&self.work_availability)),
             update,
         );
@@ -146,6 +155,7 @@ impl SharedState {
         self.injector.push(job);
         self.suggest_stealing::<true, false>(
             &self.work_availability.bit(local_worker_idx),
+            self.distances.from(local_worker_idx),
             StealLocation::Injector,
             // Need at least Release ordering to ensure injected job is visible
             // to the target and don't need anything stronger:
@@ -183,6 +193,7 @@ impl SharedState {
     fn suggest_stealing<'self_, const INCLUDE_CENTER: bool, const CACHE_SEARCH_MASKS: bool>(
         &'self_ self,
         local_worker: &BitRef<'self_, CACHE_SEARCH_MASKS>,
+        distances_from_worker: &'self_ [Distance],
         task_location: StealLocation,
         update: Ordering,
     ) {
@@ -195,6 +206,7 @@ impl SharedState {
             .work_availability
             .iter_unset_around::<INCLUDE_CENTER, CACHE_SEARCH_MASKS>(
                 local_worker,
+                distances_from_worker,
                 Ordering::Acquire,
             )
         else {

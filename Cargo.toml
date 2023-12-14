@@ -69,7 +69,6 @@ pessimize = { git = "https://github.com/HadrienG2/pessimize.git", optional = tru
 rayon = { version = "1.8.0", default-features = false, optional = true }
 
 [dev-dependencies]
-itertools = "0.11"
 proptest = "1.3"
 
 [lib]

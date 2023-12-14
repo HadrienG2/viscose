@@ -4,6 +4,7 @@ pub(crate) mod bitref;
 mod iter;
 
 use self::{bitref::BitRef, iter::NearestBitIterator};
+use crate::shared::distances::Distance;
 #[cfg(test)]
 use proptest::prelude::*;
 use std::{
@@ -101,18 +102,20 @@ impl AtomicFlags {
     pub fn iter_set_around<'self_, const INCLUDE_CENTER: bool, const CACHE_SEARCH_MASKS: bool>(
         &'self_ self,
         center: &BitRef<'self_, CACHE_SEARCH_MASKS>,
+        distances_from_center: &'self_ [Distance],
         order: Ordering,
     ) -> Option<impl Iterator<Item = BitRef<'self_, false>> + 'self_> {
-        NearestBitIterator::<true, INCLUDE_CENTER>::new(self, center, order)
+        NearestBitIterator::<true, INCLUDE_CENTER>::new(self, center, distances_from_center, order)
     }
 
     /// Like iter_set_around, but looks for unset flags instead of set flags
     pub fn iter_unset_around<'self_, const INCLUDE_CENTER: bool, const CACHE_SEARCH_MASKS: bool>(
         &'self_ self,
         center: &BitRef<'self_, CACHE_SEARCH_MASKS>,
+        distances_from_center: &'self_ [Distance],
         order: Ordering,
     ) -> Option<impl Iterator<Item = BitRef<'self_, false>> + 'self_> {
-        NearestBitIterator::<false, INCLUDE_CENTER>::new(self, center, order)
+        NearestBitIterator::<false, INCLUDE_CENTER>::new(self, center, distances_from_center, order)
     }
 
     /// Iterate over the value of inner words

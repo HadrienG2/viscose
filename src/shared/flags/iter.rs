@@ -1,5 +1,7 @@
 //! [`AtomicFlags`] iterator
 
+use crate::shared::distances::Distance;
+
 use super::{bitref::BitRef, AtomicFlags, Word, WORD_BITS};
 use std::{
     debug_assert,
@@ -20,6 +22,9 @@ pub(crate) struct NearestBitIterator<'flags, const FIND_SET: bool, const INCLUDE
     /// Reference to the center bit
     center: BitRef<'flags, false>,
 
+    /// Distances from the center bit to other bits
+    distances_from_center: &'flags [Distance],
+
     /// Truth that center must be yielded and hasn't been yielded yet
     yield_center: bool,
 
@@ -35,6 +40,7 @@ impl<'flags, const FIND_SET: bool, const INCLUDE_CENTER: bool>
     pub(crate) fn new<const CACHE_SEARCH_MASKS: bool>(
         flags: &'flags AtomicFlags,
         center: &BitRef<'flags, CACHE_SEARCH_MASKS>,
+        distances_from_center: &'flags [Distance],
         order: Ordering,
     ) -> Option<Self> {
         let initial_state = InitialState::new::<FIND_SET, INCLUDE_CENTER, CACHE_SEARCH_MASKS>(
@@ -47,6 +53,7 @@ impl<'flags, const FIND_SET: bool, const INCLUDE_CENTER: bool>
             flags,
             left_bits,
             center: center.without_cache(),
+            distances_from_center,
             yield_center,
             right_bits,
         })
@@ -69,12 +76,13 @@ impl<'flags, const FIND_SET: bool, const INCLUDE_CENTER: bool> Iterator
         // Otherwise, yield the closest of the next left and right bits
         match (self.left_bits.peek(), self.right_bits.peek()) {
             (Some(left), Some(right)) => {
-                let center = &self.center;
                 let flags = self.flags;
-                if left.offset_from(center, flags) <= center.offset_from(&right, flags) {
-                    self.left_bits.next()
-                } else {
+                if self.distances_from_center[right.linear_idx(flags)]
+                    <= self.distances_from_center[left.linear_idx(flags)]
+                {
                     self.right_bits.next()
+                } else {
+                    self.left_bits.next()
                 }
             }
             (Some(_), None) => self.left_bits.next(),
@@ -415,7 +423,7 @@ mod tests {
     use proptest::prelude::*;
 
     /// Check output of BitIterator
-    fn check_iterate<const FIND_SET: bool, const GOING_LEFT: bool>(
+    fn check_linear<const FIND_SET: bool, const GOING_LEFT: bool>(
         flags: &AtomicFlags,
         start_idx: usize,
     ) -> Result<(), TestCaseError> {
@@ -447,19 +455,47 @@ mod tests {
         Ok(())
     }
 
+    proptest! {
+        #[test]
+        fn iterate_linear((flags, start_idx) in flags_and_bit_idx()) {
+            check_linear::<false, false>(&flags, start_idx)?;
+            check_linear::<false, true>(&flags, start_idx)?;
+            check_linear::<true, false>(&flags, start_idx)?;
+            check_linear::<true, true>(&flags, start_idx)?;
+        }
+    }
+
     /// Check output of NearestBitIterator
     fn check_nearest<const FIND_SET: bool, const INCLUDE_CENTER: bool>(
         flags: &AtomicFlags,
         center_idx: usize,
+        distances_from_center: &[Distance],
     ) -> Result<(), TestCaseError> {
         let center = flags.bit(center_idx);
-        let iterator =
-            NearestBitIterator::<FIND_SET, INCLUDE_CENTER>::new(flags, &center, Ordering::Relaxed);
-        let left_indices = (center_idx..flags.len()).skip(1);
-        let right_indices = (0..center_idx).rev();
+        let iterator = NearestBitIterator::<FIND_SET, INCLUDE_CENTER>::new(
+            flags,
+            &center,
+            distances_from_center,
+            Ordering::Relaxed,
+        );
+        let mut left_indices = (center_idx..flags.len()).skip(1).peekable();
+        let mut right_indices = (0..center_idx).rev().peekable();
         let bit_indices = std::iter::once(center_idx)
-            .chain(itertools::interleave(left_indices, right_indices))
-            .skip(usize::from(!INCLUDE_CENTER));
+            .skip(usize::from(!INCLUDE_CENTER))
+            .chain(std::iter::from_fn(|| {
+                match (left_indices.peek(), right_indices.peek()) {
+                    (Some(left_idx), Some(right_idx)) => {
+                        if distances_from_center[*right_idx] <= distances_from_center[*left_idx] {
+                            right_indices.next()
+                        } else {
+                            left_indices.next()
+                        }
+                    }
+                    (Some(_), None) => left_indices.next(),
+                    (None, Some(_)) => right_indices.next(),
+                    (None, None) => None,
+                }
+            }));
         if let Some(mut iterator) = iterator {
             for bit_idx in bit_indices {
                 let bit = flags.bit(bit_idx);
@@ -490,18 +526,26 @@ mod tests {
         Ok(())
     }
 
+    fn flags_bit_distances() -> impl Strategy<Value = (AtomicFlags, usize, Vec<Distance>)> {
+        flags_and_bit_idx().prop_flat_map(|(flags, bit_idx)| {
+            prop::collection::vec(any::<Distance>(), flags.len()).prop_map(
+                move |mut raw_distances| {
+                    raw_distances[bit_idx] = 0;
+                    raw_distances[..bit_idx].sort_unstable_by_key(|&dist| -(dist as isize));
+                    raw_distances[bit_idx..].sort_unstable();
+                    (flags.clone(), bit_idx, raw_distances)
+                },
+            )
+        })
+    }
+
     proptest! {
         #[test]
-        fn iterate((flags, start_idx) in flags_and_bit_idx()) {
-            check_iterate::<false, false>(&flags, start_idx)?;
-            check_iterate::<false, true>(&flags, start_idx)?;
-            check_iterate::<true, false>(&flags, start_idx)?;
-            check_iterate::<true, true>(&flags, start_idx)?;
-
-            check_nearest::<false, false>(&flags, start_idx)?;
-            check_nearest::<false, true>(&flags, start_idx)?;
-            check_nearest::<true, false>(&flags, start_idx)?;
-            check_nearest::<true, true>(&flags, start_idx)?;
+        fn iterate_nearest((flags, start_idx, distances) in flags_bit_distances()) {
+            check_nearest::<false, false>(&flags, start_idx, &distances)?;
+            check_nearest::<false, true>(&flags, start_idx, &distances)?;
+            check_nearest::<true, false>(&flags, start_idx, &distances)?;
+            check_nearest::<true, true>(&flags, start_idx, &distances)?;
         }
     }
 }
