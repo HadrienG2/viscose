@@ -44,9 +44,13 @@ impl Distances {
         // must be made, and priorize those decisions
         let parent_priorities =
             Self::priorize_parents(topology, &cpuset, Self::optimize_for_compute);
+        let sorted_pus = PUIterator::new(topology, affinity, &parent_priorities).collect::<Vec<_>>();
+        assert_eq!(sorted_pus.len(), num_workers);
 
         unimplemented!(
-            "traverse topology and build a list of PUs in an order that respects user priorization"
+            "compute distance matrix using a variant of the old strategy below, \
+            the main new thing being that the ancestor chain must be re-sorted \
+            by parent priority for topological distance evaluation"
         );
 
         // Order workers to put nearest neighbors close to each other
@@ -111,16 +115,6 @@ impl Distances {
         &self.data[worker_idx * self.num_workers..(worker_idx + 1) * self.num_workers]
     }
 
-    /// Select normal children of a node that match the affinity mask
-    fn children_in_cpuset<'out>(
-        parent: &'out TopologyObject,
-        affinity: &'out CpuSet,
-    ) -> impl Iterator<Item = &'out TopologyObject> + 'out {
-        parent
-            .normal_children()
-            .filter(move |child| child.cpuset().unwrap().intersects(affinity))
-    }
-
     /// Priorize work distribution according to a certain policy
     ///
     /// A typical hwloc topology tree contains multiple branching points (NUMA
@@ -141,8 +135,8 @@ impl Distances {
     /// producing a list of priority classes in increasing priority order. Newly
     /// spawned tasks will then be distributed over parents in the highest
     /// priority class that is not full yet.
-    fn priorize_parents(
-        topology: &Topology,
+    fn priorize_parents<'topology>(
+        topology: &'topology Topology,
         affinity: &CpuSet,
         policy: impl for<'parents> FnOnce(
             &CpuSet,
@@ -159,7 +153,7 @@ impl Distances {
                     .objects_at_depth(depth)
                     .filter(|obj| {
                         obj.cpuset().unwrap().intersects(affinity)
-                            && Self::children_in_cpuset(obj, affinity).count() > 1
+                            && children_in_cpuset(obj, affinity).count() > 1
                     })
                     .inspect(|parent| {
                         initial_parents.insert(parent.global_persistent_index());
@@ -275,7 +269,7 @@ impl Distances {
         'depths: for (depth_idx, (_, _, parents)) in type_depth_parents.iter().enumerate() {
             if parents.iter().any(|parent| {
                 let parent_nodeset = parent.nodeset().unwrap();
-                Self::children_in_cpuset(parent, affinity)
+                children_in_cpuset(parent, affinity)
                     .any(|child| child.nodeset().unwrap() != parent_nodeset)
             }) {
                 numa_depths_rev.push(depth_idx);
@@ -290,6 +284,13 @@ impl Distances {
         result.extend(Self::depths_to_priorities(type_depth_parents));
         result
     }
+
+    /// Organize topologically meaningful parent objects into an iteration tree
+    ///
+    /// Compared to the hwloc tree, this tree skips all depths where nodes only
+    /// have 0 or 1 child that belongs to our affinity mask.
+    pub fn 
+
 }
 //
 impl Debug for Distances {
@@ -310,3 +311,136 @@ pub type Distance = u16;
 
 /// Priority of a node for children enumeration (higher is higher priority)
 pub type ParentPriority = usize;
+
+/// Topologically meaningful children of an hwloc "parent" object
+///
+/// Once there are no more children, a node should be deleted, and if it has a
+/// parent the matching child should be set to None.
+enum Children<'pu> {
+    /// Other nodes
+    Nodes {
+        /// Globally persistent indices of nodes that still have PUs
+        ///
+        /// Once a child no longer has PUs, it is tombstoned away as a None.
+        /// Deleting children is not a good idea because it would require
+        /// rewriting the parent links of all children that come after.
+        ///
+        /// Remember to detect once all indices are None too.
+        children_ids: Vec<Option<TopologyObjectID>>,
+
+        /// Next child to yield
+        next_child_idx: usize,
+    },
+
+    /// Processing units, ordered by decreasing logical index
+    ///
+    /// Pop vec to take next processing unit, once there are no more
+    /// delete the corresponding child in the parent
+    PUs(Vec<&'pu TopologyObject>),
+}
+
+/// Tree used to iterate over PUs in an order that matches work distribution
+/// priorities (i.e. PUs that should share work first are close)
+struct PUIterator<'caller> {
+    /// Multi-child node work distribution priorities
+    parent_priorities: &'caller HashMap<TopologyObjectID, ParentPriority>,
+
+    /// Summarized hwloc tree that only includes multi-children nodes
+    parents: HashMap<TopologyObjectID, Children<'caller>>,
+
+    /// Root of the parents tree
+    root: Option<TopologyObjectID>,
+}
+//
+impl<'caller> PUIterator<'caller> {
+    /// Set up iteration over PUs
+    fn new(topology: &'caller Topology, affinity: &CpuSet, parent_priorities: &'caller HashMap<TopologyObjectID, ParentPriority>) -> Self {
+        let mut root = None;
+        let parents = topology
+            .objects()
+            .filter(|obj| parent_priorities.contains_key(&obj.global_persistent_index()))
+            .map(|mut parent| {
+                // Find the simplified topology's root
+                if !parent.ancestors().any(|ancestor| parent_priorities.contains_key(&ancestor.global_persistent_index())) {
+                    assert!(root.is_none(), "there should only be one root");
+                    root = Some(parent.global_persistent_index());
+                }
+
+                // Enumerate children
+                let children_type = parent.normal_children().next().unwrap().object_type();
+                let children = children_in_cpuset(parent, affinity);
+                let children = if children_type == ObjectType::PU {
+                    let pus = children.rev().collect::<Vec<_>>();
+                    debug_assert!(pus.len() > 1);
+                    Children::PUs(pus)
+                } else {
+                    Children::Nodes {
+                        children_ids: children
+                            .map(|child| Some(child.global_persistent_index()))
+                            .collect(),
+                        next_child_idx: 0,
+                    }
+                };
+
+                // Collect parents in a hash map to easily find them
+                (
+                    parent.global_persistent_index(),
+                    children
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let current_pu = topology.pus_from_cpuset(affinity).min_by_key(|pu| pu.logical_index());
+        Self {
+            parent_priorities,
+            parents,
+            root,
+        }
+    }
+}
+//
+impl<'caller> Iterator for PUIterator<'caller> {
+    type Item = &'caller TopologyObject;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let root = self.root?;
+        unimplemented!(
+            "- Go to the root node of the tree
+            - Trickle down the current child chain to find the PU-bearing leaf
+                * Keep track of the (parent node, child idx) path we used to get
+                  there, along with the ID of the leaf, we'll need these later.
+            - Pop the next PU from the leaf node, this will be our result
+            - If after this the leaf node doesn't have PUs anymore...
+                * Delete the leaf node's entry in the tree
+                * Propagate this child deletion to the parent:
+                    - Look for the next child with PUs, allowing wraparound
+                    - If there is one, mark the child we just deleted as None
+                      and move to that next child
+                    - Otherwise delete parent node and recurse to ancestor
+                * For each object we delete, pop an entry in the (parent node,
+                  child idx) path we previously tracked and update the leaf ID
+                  tracker to the ID of the popped-entry, so the path keeps
+                  matching the object we're currently looking at
+                * If we end up deleting the root node, set self.root to None and yield result
+            - Complement current (parent node, child idx) path with node
+              priority information, check current object priority too.
+            - Switch each object whose priority is higher than that of the
+              current object to its next child, wrapping around as necessary.
+
+              FIXME: I think the logic is a lot more subtle than this. For one
+                     thing, the highest priority node should move on every cycle.
+                     For another, there seems to be something about avoiding
+                     wraparound at each parent until opportunities in higher
+                     priority parents have been exhausted"
+        )
+    }
+}
+
+/// Select normal children of a node that match the affinity mask
+fn children_in_cpuset<'out>(
+    parent: &'out TopologyObject,
+    affinity: &'out CpuSet,
+) -> impl DoubleEndedIterator<Item = &'out TopologyObject> + 'out {
+    parent
+        .normal_children()
+        .filter(move |child| child.cpuset().unwrap().intersects(affinity))
+}
