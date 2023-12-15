@@ -44,7 +44,8 @@ impl Distances {
         // must be made, and priorize those decisions
         let parent_priorities =
             Self::priorize_parents(topology, &cpuset, Self::optimize_for_compute);
-        let sorted_pus = PUIterator::new(topology, affinity, &parent_priorities).collect::<Vec<_>>();
+        let sorted_pus =
+            PUIterator::new(topology, affinity, &parent_priorities).collect::<Vec<_>>();
         assert_eq!(sorted_pus.len(), num_workers);
 
         unimplemented!(
@@ -142,7 +143,7 @@ impl Distances {
             &CpuSet,
             Vec<(ObjectType, NormalDepth, Vec<&'parents TopologyObject>)>,
         ) -> Vec<Vec<&'parents TopologyObject>>,
-    ) -> HashMap<TopologyObjectID, ParentPriority> {
+    ) -> HashMap<TopologyObjectID, Priority> {
         // Group multi-children nodes by increasing depth / locality
         let mut initial_parents = HashSet::new();
         let type_depth_parents = NormalDepth::iter_range(NormalDepth::MIN, topology.depth())
@@ -284,13 +285,6 @@ impl Distances {
         result.extend(Self::depths_to_priorities(type_depth_parents));
         result
     }
-
-    /// Organize topologically meaningful parent objects into an iteration tree
-    ///
-    /// Compared to the hwloc tree, this tree skips all depths where nodes only
-    /// have 0 or 1 child that belongs to our affinity mask.
-    pub fn 
-
 }
 //
 impl Debug for Distances {
@@ -310,7 +304,7 @@ impl Debug for Distances {
 pub type Distance = u16;
 
 /// Priority of a node for children enumeration (higher is higher priority)
-pub type ParentPriority = usize;
+pub type Priority = usize;
 
 /// Topologically meaningful children of an hwloc "parent" object
 ///
@@ -330,6 +324,13 @@ enum Children<'pu> {
 
         /// Next child to yield
         next_child_idx: usize,
+
+        /// For each child, we track the highest-priority task switch that ever
+        /// occured below this child. This is pre-initialized to maximal
+        /// priority, and used when iteration over a children list wraps around
+        /// (since this is not switching to a new child, but rather to a new
+        /// descendant with a certain priority below a child we've seen before).
+        children_priorities: Vec<Priority>,
     },
 
     /// Processing units, ordered by decreasing logical index
@@ -343,7 +344,7 @@ enum Children<'pu> {
 /// priorities (i.e. PUs that should share work first are close)
 struct PUIterator<'caller> {
     /// Multi-child node work distribution priorities
-    parent_priorities: &'caller HashMap<TopologyObjectID, ParentPriority>,
+    parent_priorities: &'caller HashMap<TopologyObjectID, Priority>,
 
     /// Summarized hwloc tree that only includes multi-children nodes
     parents: HashMap<TopologyObjectID, Children<'caller>>,
@@ -354,14 +355,26 @@ struct PUIterator<'caller> {
 //
 impl<'caller> PUIterator<'caller> {
     /// Set up iteration over PUs
-    fn new(topology: &'caller Topology, affinity: &CpuSet, parent_priorities: &'caller HashMap<TopologyObjectID, ParentPriority>) -> Self {
+    fn new(
+        topology: &'caller Topology,
+        affinity: &CpuSet,
+        parent_priorities: &'caller HashMap<TopologyObjectID, Priority>,
+    ) -> Self {
         let mut root = None;
         let parents = topology
             .objects()
-            .filter(|obj| parent_priorities.contains_key(&obj.global_persistent_index()))
+            .filter(|obj| {
+                parent_priorities.contains_key(&obj.global_persistent_index())
+                    || children_in_cpuset(obj, affinity)
+                        .next()
+                        .map(|obj| obj.object_type() == ObjectType::PU)
+                        .unwrap_or(false)
+            })
             .map(|mut parent| {
                 // Find the simplified topology's root
-                if !parent.ancestors().any(|ancestor| parent_priorities.contains_key(&ancestor.global_persistent_index())) {
+                if !parent.ancestors().any(|ancestor| {
+                    parent_priorities.contains_key(&ancestor.global_persistent_index())
+                }) {
                     assert!(root.is_none(), "there should only be one root");
                     root = Some(parent.global_persistent_index());
                 }
@@ -374,22 +387,25 @@ impl<'caller> PUIterator<'caller> {
                     debug_assert!(pus.len() > 1);
                     Children::PUs(pus)
                 } else {
+                    let children_ids = children
+                        .map(|child| Some(child.global_persistent_index()))
+                        .collect::<Vec<_>>();
+                    let num_children = children_ids.len();
+                    assert!(num_children >= 1);
                     Children::Nodes {
-                        children_ids: children
-                            .map(|child| Some(child.global_persistent_index()))
-                            .collect(),
+                        children_ids,
                         next_child_idx: 0,
+                        children_priorities: vec![Priority::MAX],
                     }
                 };
 
                 // Collect parents in a hash map to easily find them
-                (
-                    parent.global_persistent_index(),
-                    children
-                )
+                (parent.global_persistent_index(), children)
             })
             .collect::<HashMap<_, _>>();
-        let current_pu = topology.pus_from_cpuset(affinity).min_by_key(|pu| pu.logical_index());
+        let current_pu = topology
+            .pus_from_cpuset(affinity)
+            .min_by_key(|pu| pu.logical_index());
         Self {
             parent_priorities,
             parents,
