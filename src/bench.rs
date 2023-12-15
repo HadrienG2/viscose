@@ -3,9 +3,12 @@
 use crate::{pool::ThreadPool, worker::scope::Scope};
 use criterion::{Bencher, Criterion};
 use crossbeam::utils::CachePadded;
-use hwlocality::{cpu::binding::CpuBindingFlags, object::types::ObjectType};
+use hwlocality::{
+    cpu::binding::CpuBindingFlags,
+    object::{depth::NormalDepth, types::ObjectType},
+};
 use iterator_ilp::IteratorILP;
-use std::{collections::BTreeSet, sync::OnceLock};
+use std::{collections::BTreeSet, fmt::Write, sync::OnceLock};
 
 /// Re-export atomic flags for benchmarking
 pub use crate::shared::flags::{bitref::BitRef, AtomicFlags};
@@ -22,21 +25,18 @@ pub fn for_each_locality(
     crate::setup_logger_once();
     let topology = crate::topology();
     let mut seen_affinities = BTreeSet::new();
-    for ty in [
-        ObjectType::L1Cache,
-        ObjectType::L3Cache,
-        ObjectType::NUMANode,
-        ObjectType::Machine,
-    ] {
+    for depth in NormalDepth::iter_range(NormalDepth::MIN, topology.depth()).rev() {
         for hyperthreading in [false, true] {
-            // Pick the last object of this type
-            let Some(last) = topology.objects_with_type(ty).last() else {
-                continue;
-            };
+            // Pick the first object at this depth
+            let first = topology.objects_at_depth(depth).next().unwrap();
 
             // Compute cpuset and name for the current locality
+            let ty = first.object_type();
             let mut locality_name = ty.to_string();
-            let mut affinity = last.cpuset().unwrap().clone_target();
+            if ty == ObjectType::Group {
+                write!(locality_name, "@depth={depth}").unwrap();
+            }
+            let mut affinity = first.cpuset().unwrap().clone_target();
             if !hyperthreading {
                 affinity.singlify_per_core(topology, 0);
                 locality_name.push_str("/noSMT");
