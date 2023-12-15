@@ -54,12 +54,9 @@ impl SharedState {
         topology: &Topology,
         affinity: impl Borrow<CpuSet>,
     ) -> (Arc<Self>, Box<[WorkerConfig]>) {
-        // Collect the PU objects that fit in our affinity mask, and cross-check
-        // that the count is valid
-        let mut pus = topology
-            .pus_from_cpuset(affinity.borrow())
-            .collect::<Vec<_>>();
-        let num_workers = pus.len();
+        // Compute inter-worker distances and order workers to maximize locality
+        let (distances, cpus) = Distances::with_sorted_cpus(topology, affinity.borrow());
+        let num_workers = cpus.len();
         assert_ne!(
             num_workers, 0,
             "a thread pool without threads can't make progress and will deadlock on first request"
@@ -69,15 +66,10 @@ impl SharedState {
             "unsupported number of worker threads"
         );
 
-        // Compute and display distances between workers
-        let distances = Distances::measure_and_sort(&mut pus[..]);
-
         // Set up worker-local state
         let mut worker_configs = Vec::with_capacity(num_workers);
         let mut worker_interfaces = Vec::with_capacity(num_workers);
-        for pu in pus {
-            let cpu = BitmapIndex::try_from(pu.os_index().expect("PUs should have an OS index"))
-                .expect("PU OS indices should fit in a BitmapIndex (since they fit in a CpuSet)");
+        for cpu in cpus {
             let (config, interface) = new_worker(cpu);
             worker_configs.push(config);
             worker_interfaces.push(CachePadded::new(interface));
