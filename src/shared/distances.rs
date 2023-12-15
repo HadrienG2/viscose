@@ -7,7 +7,7 @@ use hwlocality::{
     Topology,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::{self, Debug},
     ptr,
 };
@@ -150,6 +150,7 @@ impl Distances {
         ) -> Vec<Vec<&'parents TopologyObject>>,
     ) -> HashMap<TopologyObjectID, ParentPriority> {
         // Group multi-children nodes by increasing depth / locality
+        let mut initial_parents = HashSet::new();
         let type_depth_parents = NormalDepth::iter_range(NormalDepth::MIN, topology.depth())
             .filter_map(|depth| {
                 // Pick nodes with multiple children that are covered by our
@@ -159,6 +160,9 @@ impl Distances {
                     .filter(|obj| {
                         obj.cpuset().unwrap().intersects(affinity)
                             && Self::children_in_cpuset(obj, affinity).count() > 1
+                    })
+                    .inspect(|parent| {
+                        initial_parents.insert(parent.global_persistent_index());
                     })
                     .collect::<Vec<_>>();
 
@@ -177,6 +181,15 @@ impl Distances {
 
         // Let policy callback compute priority classes accordingly
         let priority_classes = Self::optimize_for_compute(affinity, type_depth_parents);
+        let final_parents = priority_classes
+            .iter()
+            .flatten()
+            .map(|parent| parent.global_persistent_index())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            initial_parents, final_parents,
+            "priorization policies should not add or remove parents"
+        );
 
         // Give each parent node a numerical priority accordingly
         priority_classes
