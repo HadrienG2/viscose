@@ -7,7 +7,7 @@ use hwlocality::{
     Topology,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt::{self, Debug},
     ptr,
 };
@@ -44,6 +44,10 @@ impl Distances {
         // must be made, and priorize those decisions
         let parent_priorities =
             Self::priorize_parents(topology, &cpuset, Self::optimize_for_compute);
+
+        // Sort PUs in such a way that neighbor PUs have high odds of being the
+        // best targets for load balancing transactions (and indeed always are
+        // if the hardware topology is sufficiently symmetric)
         let sorted_pus =
             PUIterator::new(topology, affinity, &parent_priorities).collect::<Vec<_>>();
         assert_eq!(sorted_pus.len(), num_workers);
@@ -306,51 +310,16 @@ pub type Distance = u16;
 /// Priority of a node for children enumeration (higher is higher priority)
 pub type Priority = usize;
 
-/// Topologically meaningful children of an hwloc "parent" object
-///
-/// Once there are no more children, a node should be deleted, and if it has a
-/// parent the matching child should be set to None.
-enum Children<'pu> {
-    /// Other nodes
-    Nodes {
-        /// Globally persistent indices of nodes that still have PUs
-        ///
-        /// Once a child no longer has PUs, it is tombstoned away as a None.
-        /// Deleting children is not a good idea because it would require
-        /// rewriting the parent links of all children that come after.
-        ///
-        /// Remember to detect once all indices are None too.
-        children_ids: Vec<Option<TopologyObjectID>>,
-
-        /// Next child to yield
-        next_child_idx: usize,
-
-        /// For each child, we track the highest-priority task switch that ever
-        /// occured below this child. This is pre-initialized to maximal
-        /// priority, and used when iteration over a children list wraps around
-        /// (since this is not switching to a new child, but rather to a new
-        /// descendant with a certain priority below a child we've seen before).
-        children_priorities: Vec<Priority>,
-    },
-
-    /// Processing units, ordered by decreasing logical index
-    ///
-    /// Pop vec to take next processing unit, once there are no more
-    /// delete the corresponding child in the parent
-    PUs(Vec<&'pu TopologyObject>),
-}
-
 /// Tree used to iterate over PUs in an order that matches work distribution
 /// priorities (i.e. PUs that should share work first are close)
+#[derive(Default)]
 struct PUIterator<'caller> {
-    /// Multi-child node work distribution priorities
-    parent_priorities: &'caller HashMap<TopologyObjectID, Priority>,
+    /// Summarized hwloc tree that only includes multi-children nodes, and
+    /// priorizes the traversal of each child from each node
+    nodes: HashMap<TopologyObjectID, Node<'caller>>,
 
-    /// Summarized hwloc tree that only includes multi-children nodes
-    parents: HashMap<TopologyObjectID, Children<'caller>>,
-
-    /// Root of the parents tree
-    root: Option<TopologyObjectID>,
+    /// Path to the next PU to be yielded, if any
+    next_pu_path: Vec<TopologyObjectID>,
 }
 //
 impl<'caller> PUIterator<'caller> {
@@ -360,56 +329,93 @@ impl<'caller> PUIterator<'caller> {
         affinity: &CpuSet,
         parent_priorities: &'caller HashMap<TopologyObjectID, Priority>,
     ) -> Self {
-        let mut root = None;
-        let parents = topology
-            .objects()
-            .filter(|obj| {
-                parent_priorities.contains_key(&obj.global_persistent_index())
-                    || children_in_cpuset(obj, affinity)
-                        .next()
-                        .map(|obj| obj.object_type() == ObjectType::PU)
-                        .unwrap_or(false)
-            })
-            .map(|mut parent| {
-                // Find the simplified topology's root
-                if !parent.ancestors().any(|ancestor| {
-                    parent_priorities.contains_key(&ancestor.global_persistent_index())
-                }) {
-                    assert!(root.is_none(), "there should only be one root");
-                    root = Some(parent.global_persistent_index());
-                }
+        // This iterator will operate in a simplified hwloc topology that only
+        // includes nodes from the affinity set that have either at least one PU
+        // children or multiple non-PU children
+        let id = |obj: &TopologyObject| obj.global_persistent_index();
+        let children = |obj| children_in_cpuset(obj, affinity);
+        let has_multiple_children = |obj| {
+            let result = parent_priorities.contains_key(&id(obj));
+            if !result {
+                debug_assert!(
+                    children(obj).count() < 2,
+                    "multi-children nodes should have a priority"
+                );
+            }
+            result
+        };
+        let has_pu_children =
+            |obj| children(obj).any(|child| child.object_type() == ObjectType::PU);
+        let keep_node = |obj| !(has_multiple_children(obj) || has_pu_children(obj));
 
-                // Enumerate children
-                let children_type = parent.normal_children().next().unwrap().object_type();
-                let children = children_in_cpuset(parent, affinity);
-                let children = if children_type == ObjectType::PU {
-                    let pus = children.rev().collect::<Vec<_>>();
-                    debug_assert!(pus.len() > 1);
-                    Children::PUs(pus)
-                } else {
-                    let children_ids = children
-                        .map(|child| Some(child.global_persistent_index()))
-                        .collect::<Vec<_>>();
-                    let num_children = children_ids.len();
-                    assert!(num_children >= 1);
-                    Children::Nodes {
-                        children_ids,
-                        next_child_idx: 0,
-                        children_priorities: vec![Priority::MAX],
+        // Find the root of the simplified topology tree, if any
+        let mut root = topology.root_object();
+        while !keep_node(root) {
+            debug_assert!(
+                children(root).count() <= 1,
+                "rejected root candidate should have 0 or 1 children"
+            );
+            if let Some(only_child) = children(root).next() {
+                root = only_child;
+                continue;
+            } else {
+                // No accepted root means no PU, i.e. an empty iterator
+                return Self::default();
+            }
+        }
+
+        // Start building the topology tree by inserting the root
+        let mut nodes = HashMap::new();
+        let priority = |parent| parent_priorities.get(&id(parent)).copied();
+        nodes.insert(id(root), Node::new(priority(root)));
+
+        // Build the tree from top to bottom
+        //
+        // At each point of the tree building process, we have sets of nodes
+        // considered for inclusion in the tree, grouped by parent node.
+        let mut curr_node_candidates = vec![(id(root), children(root).collect::<Vec<_>>())];
+        let mut next_node_candidates = Vec::new();
+        let mut children_morgue = Vec::new();
+        while !curr_node_candidates.is_empty() {
+            // We grab the associated parent object of each group...
+            for (parent_id, mut curr_children) in curr_node_candidates.drain(..) {
+                let parent = &mut nodes[&parent_id];
+                // ...then process this parent object's children...
+                'children: for child in curr_children.drain(..) {
+                    // PUs always get added to parents
+                    if child.object_type() == ObjectType::PU {
+                        parent.add_child(child);
+                        assert_eq!(child.normal_arity(), 0, "PUs shouldn't have children");
+                        continue 'children;
                     }
-                };
 
-                // Collect parents in a hash map to easily find them
-                (parent.global_persistent_index(), children)
-            })
-            .collect::<HashMap<_, _>>();
-        let current_pu = topology
-            .pus_from_cpuset(affinity)
-            .min_by_key(|pu| pu.logical_index());
+                    // Nodes only get added if they pass the node filter
+                    let parent_id = if keep_node(child) {
+                        nodes.insert(id(child), Node::new(priority(child)));
+                        parent.add_child(child);
+                        id(child)
+                    } else {
+                        parent_id
+                    };
+
+                    // Grandchildren will be attached to the newly created node
+                    // if it was kept, otherwise to its last kept ancestor
+                    let mut next_children: Vec<_> = children_morgue.pop().unwrap_or_default();
+                    next_children.extend(children(child));
+                    next_node_candidates.push((parent_id, next_children));
+                }
+                children_morgue.push(curr_children);
+            }
+            std::mem::swap(&mut curr_node_candidates, &mut next_node_candidates);
+        }
+
+        // The tree is now completely built, finalize it
+        for node in nodes.values_mut() {
+            node.finalize_children();
+        }
         Self {
-            parent_priorities,
-            parents,
-            root,
+            nodes,
+            next_pu_path: vec![id(root)],
         }
     }
 }
@@ -418,44 +424,360 @@ impl<'caller> Iterator for PUIterator<'caller> {
     type Item = &'caller TopologyObject;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let root = self.root?;
-        unimplemented!(
-            "- Go to the root node of the tree
-            - Trickle down the current child chain to find the PU-bearing leaf
-                * Keep track of the (parent node, child idx) path we used to get
-                  there, along with the ID of the leaf, we'll need these later.
-            - Pop the next PU from the leaf node, this will be our result
-            - If after this the leaf node doesn't have PUs anymore...
-                * Delete the leaf node's entry in the tree
-                * Propagate this child deletion to the parent:
-                    - Look for the next child with PUs, allowing wraparound
-                    - If there is one, mark the child we just deleted as None
-                      and move to that next child
-                    - Otherwise delete parent node and recurse to ancestor
-                * For each object we delete, pop an entry in the (parent node,
-                  child idx) path we previously tracked and update the leaf ID
-                  tracker to the ID of the popped-entry, so the path keeps
-                  matching the object we're currently looking at
-                * If we end up deleting the root node, set self.root to None and yield result
-            - Complement current (parent node, child idx) path with node
-              priority information, check current object priority too.
-            - Switch each object whose priority is higher than that of the
-              current object to its next child, wrapping around as necessary.
+        // Dive down from the active node to find the next PU that we'll
+        // eventually yield
+        let mut current_node_id = self.next_pu_path.last()?;
+        let mut current_node = &mut self.nodes[current_node_id];
+        let yielded_pu;
+        loop {
+            match current_node.current_child() {
+                Child::Node(next_node_id) => {
+                    current_node_id = next_node_id;
+                    self.next_pu_path.push(*current_node_id);
+                    current_node = &mut self.nodes[next_node_id];
+                    continue;
+                }
+                Child::PU(pu) => {
+                    yielded_pu = *pu;
+                    break;
+                }
+                Child::Terminator => unreachable!(
+                    "current Node child should always be on to the path to the next PU"
+                ),
+            }
+        }
 
-              FIXME: I think the logic is a lot more subtle than this. For one
-                     thing, the highest priority node should move on every cycle.
-                     For another, there seems to be something about avoiding
-                     wraparound at each parent until opportunities in higher
-                     priority parents have been exhausted"
-        )
+        // Remove the PU and every ancestor node that it transitively emptied by
+        // this operation, until we get to an ancestor node that still has more
+        // children to yield and merely switches to the next of its children.
+        let mut downstream_priority = loop {
+            match current_node.remove_child() {
+                RemoveOutcome::NewChild(priority) => break priority,
+                RemoveOutcome::Empty => {
+                    self.nodes.remove(current_node_id);
+                    let Some(next_node_id) = self.next_pu_path.last() else {
+                        // We deleted all nodes in the path, so there is no
+                        // iteration state left to be advanced...
+                        assert!(
+                            self.nodes.is_empty(),
+                            "no path left should mean all nodes have been fully processed"
+                        );
+                        return Some(yielded_pu);
+                    };
+                    current_node_id = next_node_id;
+                    current_node = &mut self.nodes[next_node_id];
+                    continue;
+                }
+            }
+        };
+
+        // Next, walk up the remaining ancestors and figure out if any other
+        // ancestor should switch to its next child.
+        //
+        // This is needed to correctly handle situations where objects down the
+        // hierarchy have lower filling priority than the objects above them.
+        // For example, if you (wisely) think that filling up Cores below L3
+        // caches is more important than filling up PUs below Cores, then you
+        // don't want to only switch to the next PU of the current core, you
+        // want to switch to the next core as well. Similarly, if you are
+        // memory-bound and think that covering NUMA nodes is more important
+        // than covering cores below these NUMA nodes, you will not just want to
+        // switch to the next PU/Core below the active NUMA node, but also to
+        // switch to the other NUMA node on every iteration.
+        let mut final_path_len = self.next_pu_path.len();
+        for (remaining_len, ancestor_id) in self.next_pu_path.iter().enumerate().rev().skip(1) {
+            current_node_id = ancestor_id;
+            current_node = &mut self.nodes[current_node_id];
+            let current_switch_priority = current_node.child_switch_priority();
+            if current_switch_priority > downstream_priority {
+                current_node.switch_child(downstream_priority);
+                downstream_priority = current_switch_priority;
+                // Switching children here invalidates the rest of the path
+                final_path_len = remaining_len + 1;
+            }
+        }
+        self.next_pu_path.truncate(final_path_len);
+        Some(yielded_pu)
     }
+}
+
+/// Node of the [`PUIterator`] tree
+struct Node<'topology> {
+    /// Active child, or [`Terminator`] if not initialized yet
+    active_child: Child<'topology>,
+
+    /// Next children to be yieled, in logical index order
+    ///
+    /// Contains a [`Child::Terminator`], initially at the end of the list,
+    /// which is used to detect when iteration over children wraps around. When
+    /// that happens, switching back to the first child is not considered to be
+    /// a work distribution event of priority `normal_child_priority`, but a
+    /// work distribution event of priority `first_child_priority`.
+    next_children: VecDeque<Child<'topology>>,
+
+    /// How important it is to distribute work across children of this node
+    ///
+    /// Only nodes with a single PU child can and should have no priority.
+    normal_child_priority: Option<Priority>,
+
+    /// What switching back to the first child of this Node amounts to
+    ///
+    /// For example, on x86, after iterating over all the Cores of an L3 cache,
+    /// switching back to the first core amounts to switching to a new PU.
+    first_child_priority: Option<Priority>,
+}
+//
+impl<'topology> Node<'topology> {
+    /// Create an empty node with a certain priority
+    ///
+    /// You should then add a set of children with `add_children()`, then call
+    /// `finalize_children()`. Then you can use the other methods of this type
+    /// (and should not use the former methods anymore).
+    ///
+    /// Nodes should have one or more children. If they have one single child,
+    /// they don't need a child-switching priority, and should not have one.
+    /// Otherwise, they should have a child-switching priority.
+    pub fn new(priority: Option<Priority>) -> Self {
+        Self {
+            active_child: Child::Terminator,
+            next_children: VecDeque::new(),
+            normal_child_priority: priority,
+            first_child_priority: None,
+        }
+    }
+
+    /// Add a child to a node
+    pub fn add_child(&mut self, child: &'topology TopologyObject) {
+        self.check_adding_children();
+        let child = Child::from(child);
+        if self.active_child == Child::Terminator {
+            assert!(
+                self.next_children.is_empty(),
+                "should fill active_child before next_children"
+            );
+            self.active_child = child;
+        } else {
+            assert!(
+                std::iter::once(&self.active_child)
+                    .chain(&self.next_children)
+                    .all(|&obj| obj != child),
+                "attempted to add the same child twice"
+            );
+            self.next_children.push_back(child);
+        }
+    }
+
+    /// Declare that we're done adding children to a node
+    pub fn finalize_children(&mut self) {
+        self.check_adding_children();
+        assert_ne!(
+            self.active_child,
+            Child::Terminator,
+            "should have added at least one child before finalizing"
+        );
+        if self.normal_child_priority.is_some() {
+            assert!(
+                !self.next_children.is_empty(),
+                "single-child nodes don't need children priorities"
+            );
+        } else {
+            assert!(
+                self.next_children.is_empty(),
+                "multi-children nodes need children priorities"
+            );
+        }
+        self.next_children.push_back(Child::Terminator);
+    }
+
+    /// Check out the active child of this node
+    pub fn current_child(&self) -> &Child {
+        self.check_children_finalized();
+        assert_ne!(
+            self.active_child,
+            Child::Terminator,
+            "should never happen in correct usage"
+        );
+        &self.active_child
+    }
+
+    /// Remove the active child from this node
+    ///
+    /// If this returns [`RemoveOutcome::Empty`], you should stop using this
+    /// node, discard it, and remove it from the child list of ancestor nodes,
+    /// recursing if necessary.
+    ///
+    /// Otherwise, this simply amounts to switching to the next child, and you
+    /// get the priority of the associated child-switching event.
+    #[must_use]
+    pub fn remove_child(&mut self) -> RemoveOutcome {
+        self.check_children_finalized();
+        self.active_child = Child::Terminator;
+        if self.next_children.len() == 1 {
+            assert_eq!(self.next_children.front(), Some(&Child::Terminator));
+            RemoveOutcome::Empty
+        } else {
+            let priority = self.child_switch_priority();
+            self.next_child();
+            RemoveOutcome::NewChild(priority)
+        }
+    }
+
+    /// Assess the priority of switching to the next child of this node
+    pub fn child_switch_priority(&self) -> Priority {
+        self.check_children_finalized();
+        if self.on_last_child() {
+            self.first_child_priority.expect(
+                "first child priority should be set by the time we go back to the first child",
+            )
+        } else {
+            self.normal_child_priority
+                .expect("nodes with multiple children should have a child priority")
+        }
+    }
+
+    /// Switch to the next child of this node
+    ///
+    /// Called on ancestors after lower-level nodes have had children removed,
+    /// if it's determined that switching children at this layer of the tree is
+    /// higher-priority than switching children in lower layers of the tree.
+    pub fn switch_child(&mut self, downstream_priority: Priority) {
+        // Check preconditions
+        self.check_children_finalized();
+        assert!(
+            self.child_switch_priority() > downstream_priority,
+            "should not switch children here when downstream switches are more important"
+        );
+
+        // If we're on the first child, record the priority of the child switch
+        // that occured underneath so we can report it on the next wraparound
+        if self.on_first_child() {
+            self.first_child_priority = Some(downstream_priority);
+        }
+
+        // Put this child back in the queue, switch to the next one
+        self.next_children.push_back(self.active_child);
+        self.next_child();
+    }
+
+    /// Switch to the next child
+    fn next_child(&mut self) {
+        // Handle end of list: terminator handling, first child priority reset
+        if self.on_last_child() {
+            let terminator = self.next_children.pop_front();
+            assert_eq!(
+                terminator,
+                Some(Child::Terminator),
+                "true by definition of on_last_child"
+            );
+            self.next_children.push_back(Child::Terminator);
+            self.first_child_priority = None;
+        }
+
+        // Switch to the next child
+        let next_child = self
+            .next_children
+            .pop_front()
+            .expect("should always have children");
+        assert_ne!(
+            next_child,
+            Child::Terminator,
+            "there should only be one terminator + other children"
+        );
+        self.active_child = next_child;
+    }
+
+    /// Truth that the active child is our first child
+    fn on_first_child(&self) -> bool {
+        self.next_children.back() == Some(&Child::Terminator)
+    }
+
+    /// Truth that the active child is our last child
+    fn on_last_child(&self) -> bool {
+        self.next_children.front() == Some(&Child::Terminator)
+    }
+
+    /// Check that we are in the children-building stage
+    #[track_caller]
+    fn check_adding_children(&self) {
+        assert!(
+            self.adding_children(),
+            "this method should only be called before the child set is finalized"
+        );
+    }
+
+    /// Check that our child set is finalized
+    #[track_caller]
+    fn check_children_finalized(&self) {
+        assert!(
+            !self.adding_children(),
+            "this method should only be called after finalizing the child set"
+        );
+    }
+
+    /// Truth that we are in the process of adding children
+    fn adding_children(&self) -> bool {
+        self.next_children
+            .iter()
+            .all(|&existing_child| existing_child != Child::Terminator)
+    }
+}
+
+/// Child of a [`PUIterator`] tree [`Node`]
+//
+// --- Implementation notes ---
+//
+// This type doesn't work in the presence of objects from multiple topology, but
+// we're not exposing this type to the outside world and won't it ourselves.
+#[derive(Copy, Clone, Debug)]
+enum Child<'topology> {
+    /// Processing unit leaf
+    PU(&'topology TopologyObject),
+
+    /// Lower-level [`Node`]
+    Node(TopologyObjectID),
+
+    /// Child list terminator, used to detect when child iteration wraps around
+    Terminator,
+}
+//
+impl Eq for Child<'_> {}
+//
+impl<'topology> From<&'topology TopologyObject> for Child<'topology> {
+    fn from(obj: &'topology TopologyObject) -> Self {
+        if obj.object_type() == ObjectType::PU {
+            Self::PU(obj)
+        } else {
+            debug_assert!(obj.normal_arity() >= 1);
+            Self::Node(obj.global_persistent_index())
+        }
+    }
+}
+//
+impl PartialEq for Child<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::PU(pu1), Self::PU(pu2)) => ptr::eq(pu1, pu2),
+            (Self::Node(id1), Self::Node(id2)) => id1 == id2,
+            (Self::Terminator, Self::Terminator) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Outcome of removing a [`Child`] from a [`Node`]
+enum RemoveOutcome {
+    /// Switched to the next child, which has the specified priority
+    NewChild(Priority),
+
+    /// Removed the last child, this [`Node`] should be removed from the tree
+    Empty,
 }
 
 /// Select normal children of a node that match the affinity mask
 fn children_in_cpuset<'out>(
     parent: &'out TopologyObject,
     affinity: &'out CpuSet,
-) -> impl DoubleEndedIterator<Item = &'out TopologyObject> + 'out {
+) -> impl DoubleEndedIterator<Item = &'out TopologyObject> + Clone + 'out {
     parent
         .normal_children()
         .filter(move |child| child.cpuset().unwrap().intersects(affinity))
