@@ -22,6 +22,9 @@ pub struct PUIterator<'topology> {
     nodes: HashMap<TopologyObjectID, NodeIterator<'topology>>,
 
     /// Path to the next PU to be yielded, if any
+    ///
+    /// The path may not always be complete, but as long as there are PUs to be
+    /// yielded, it should always feature at least one node
     next_pu_path: Vec<TopologyObjectID>,
 }
 //
@@ -32,97 +35,78 @@ impl<'topology> PUIterator<'topology> {
         affinity: &CpuSet,
         parent_priorities: &HashMap<TopologyObjectID, Priority>,
     ) -> Self {
-        // This iterator will operate in a simplified hwloc topology that only
-        // includes nodes from the affinity set that have either at least one PU
-        // children or multiple non-PU children
-        let id = |obj: &TopologyObject| obj.global_persistent_index();
-        let children = |obj| Self::children_in_cpuset(obj, affinity);
-        let has_multiple_children = |obj| children(obj).count() >= 2;
-        let has_pu_children =
-            |obj| children(obj).any(|child| child.object_type() == ObjectType::PU);
-        let keep_node = |obj| !(has_multiple_children(obj) || has_pu_children(obj));
-
-        // Find the root of the simplified topology tree, if any
-        let mut root = topology.root_object();
-        while !keep_node(root) {
-            debug_assert!(
-                children(root).count() <= 1,
-                "rejected root candidate should have 0 or 1 children"
-            );
-            if let Some(only_child) = children(root).next() {
-                root = only_child;
-                continue;
-            } else {
-                // No accepted root means no PU, i.e. an empty iterator
-                return Self::default();
-            }
+        // Handle empty cpuset case
+        if !topology.cpuset().intersects(affinity) {
+            return Self::default();
         }
 
-        // Start building the topology tree by inserting the root
-        let mut nodes = HashMap::new();
-        let priority = |parent| parent_priorities.get(&id(parent)).copied();
-        nodes.insert(id(root), NodeIterator::new(priority(root)));
-
-        // Build the tree from top to bottom
-        //
-        // At each point of the tree building process, we have sets of nodes
-        // considered for inclusion in the tree, grouped by parent node.
-        let mut curr_node_candidates = vec![(id(root), children(root).collect::<Vec<_>>())];
-        let mut next_node_candidates = Vec::new();
-        let mut children_morgue = Vec::new();
-        while !curr_node_candidates.is_empty() {
-            // We grab the associated parent object of each group...
-            for (parent_id, mut curr_children) in curr_node_candidates.drain(..) {
-                const PARENT_SHOULD_BE_THERE: &str =
-                    "parent should already be present because traversal is top-down";
-                // ...then process this parent object's children...
-                'children: for child in curr_children.drain(..) {
-                    // PUs always get added to parents
-                    if child.object_type() == ObjectType::PU {
-                        nodes
-                            .get_mut(&parent_id)
-                            .expect(PARENT_SHOULD_BE_THERE)
-                            .add_child(child);
-                        assert_eq!(child.normal_arity(), 0, "PUs shouldn't have children");
-                        continue 'children;
-                    }
-
-                    // Nodes only get added if they pass the node filter
-                    let parent_id = if keep_node(child) {
-                        nodes.insert(id(child), NodeIterator::new(priority(child)));
-                        nodes
-                            .get_mut(&parent_id)
-                            .expect(PARENT_SHOULD_BE_THERE)
-                            .add_child(child);
-                        id(child)
-                    } else {
-                        parent_id
-                    };
-
-                    // Grandchildren will be attached to the newly created node
-                    // if it was kept, otherwise to its last kept ancestor
-                    let mut next_children: Vec<_> = children_morgue.pop().unwrap_or_default();
-                    next_children.extend(children(child));
-                    next_node_candidates.push((parent_id, next_children));
-                }
-                children_morgue.push(curr_children);
+        // We'll simplify the topology by collapsing chains of nodes with a
+        // single child into a single node
+        let children_in_cpuset = |obj| super::children_in_cpuset(obj, affinity);
+        let simplify_node = |mut obj| {
+            while children_in_cpuset(obj).count() == 1 {
+                let Some(only_child) = children_in_cpuset(obj).next() else {
+                    unreachable!("checked above that there is one child")
+                };
+                obj = only_child;
             }
-            std::mem::swap(&mut curr_node_candidates, &mut next_node_candidates);
+            obj
+        };
+
+        // Start building the topology tree by inserting the (simplified) root
+        let mut nodes = HashMap::new();
+        let id = |obj: &TopologyObject| obj.global_persistent_index();
+        let add_node = |nodes: &mut HashMap<_, _>, obj: &TopologyObject| {
+            assert!(
+                obj.cpuset()
+                    .expect("normal objects should have cpusets")
+                    .intersects(affinity),
+                "iteration tree nodes should have children"
+            );
+            let priority = parent_priorities.get(&id(obj)).copied();
+            nodes.insert(id(obj), NodeIterator::new(priority));
+        };
+        let root = simplify_node(topology.root_object());
+        add_node(&mut nodes, root);
+
+        // Finish building the tree through top-down breadth-first traversal
+        let mut curr_node_children = vec![(id(root), children_in_cpuset(root).collect::<Vec<_>>())];
+        let mut next_node_children = Vec::new();
+        let mut child_list_morgue = Vec::new();
+        while !curr_node_children.is_empty() {
+            // Iterate over parent nodes and associated lists of children...
+            for (parent_id, mut child_list) in curr_node_children.drain(..) {
+                // ...then process this parent object's children...
+                for mut child in child_list.drain(..) {
+                    // Simplify the child object, hopefully down to a PU object
+                    child = simplify_node(child);
+
+                    // Register child into parent object
+                    nodes
+                        .get_mut(&parent_id)
+                        .expect("parent should be there because traversal is top-down")
+                        .add_child(child);
+
+                    // If the child has grandchildren, make it a node and
+                    // schedule processing the grandchildren
+                    if children_in_cpuset(child).count() > 0 {
+                        add_node(&mut nodes, child);
+                        let mut grandchild_list: Vec<_> =
+                            child_list_morgue.pop().unwrap_or_default();
+                        grandchild_list.extend(children_in_cpuset(child));
+                        next_node_children.push((id(child), grandchild_list));
+                    } else {
+                        assert_eq!(child.object_type(), ObjectType::PU);
+                    }
+                }
+                child_list_morgue.push(child_list);
+            }
+            std::mem::swap(&mut curr_node_children, &mut next_node_children);
         }
         Self {
             nodes,
             next_pu_path: vec![id(root)],
         }
-    }
-
-    /// Select normal children of a node that match the affinity mask
-    fn children_in_cpuset<'iterator, 'parent: 'iterator>(
-        parent: &'parent TopologyObject,
-        affinity: &'iterator CpuSet,
-    ) -> impl DoubleEndedIterator<Item = &'parent TopologyObject> + Clone + 'iterator {
-        parent
-            .normal_children()
-            .filter(move |child| child.cpuset().unwrap().intersects(affinity))
     }
 }
 //
@@ -130,8 +114,7 @@ impl<'topology> Iterator for PUIterator<'topology> {
     type Item = &'topology TopologyObject;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Dive down from the active node to find the next PU that we'll
-        // eventually yield
+        // Dive down next_pu_path to find the next PU we'll yield
         let mut current_node_id = *self.next_pu_path.last()?;
         const PATH_ERROR: &str = "node in next_pu_path should exist";
         let mut current_node = self.nodes.get_mut(&current_node_id).expect(PATH_ERROR);
@@ -152,9 +135,9 @@ impl<'topology> Iterator for PUIterator<'topology> {
             }
         };
 
-        // Remove the PU and every ancestor node that it transitively emptied by
-        // this operation, until we get to an ancestor node that still has more
-        // children to yield and merely switches to the next of its children.
+        // Remove the PU and every ancestor node that is transitively emptied by
+        // this operation, until we reach to an ancestor that still has more
+        // children to yield and merely switches to the next of these children.
         let mut downstream_priority = loop {
             match current_node.remove_child() {
                 RemoveOutcome::NewChild(priority) => break priority,
@@ -180,20 +163,22 @@ impl<'topology> Iterator for PUIterator<'topology> {
         // Next, walk up the remaining ancestors and figure out if any other
         // ancestor should switch to its next child.
         //
-        // This is needed to correctly handle situations where objects down the
-        // hierarchy have lower filling priority than the objects above them.
+        // This is needed to handle situations where objects down the hierarchy
+        // have a lower work distribution priority than those above them.
         //
-        // For example, if you (wisely) think that filling up Cores below L3
-        // caches is more important than filling up hyperthreaded PUs below
-        // Cores, then you don't want to only switch to the next PU of the
-        // current core, you want to switch to the next core as well.
+        // For example, if you think that filling up Cores below L3 caches is
+        // more important than filling up hyperthreaded PUs below Cores, then
+        // you don't want to only switch to the next PU of the current core, you
+        // want to switch to the next core of the current L3 cache as well.
         //
         // Similarly, if you are memory-bound and think that covering NUMA nodes
         // is more important than covering cores below them, you will not just
         // want to switch to the next PU/Core below the active NUMA node, but
         // also to switch to the next NUMA node on every iteration.
         let mut valid_path_len = self.next_pu_path.len();
-        for (num_ancestors, &ancestor_id) in self.next_pu_path.iter().enumerate().rev().skip(1) {
+        for (remaining_ancestors, &ancestor_id) in
+            self.next_pu_path.iter().enumerate().rev().skip(1)
+        {
             current_node_id = ancestor_id;
             current_node = self.nodes.get_mut(&current_node_id).expect(PATH_ERROR);
             if let Some(switch_priority) =
@@ -201,7 +186,7 @@ impl<'topology> Iterator for PUIterator<'topology> {
             {
                 downstream_priority = switch_priority;
                 // Switching children here invalidates the rest of the PU path
-                valid_path_len = num_ancestors + 1;
+                valid_path_len = remaining_ancestors + 1;
             }
         }
         self.next_pu_path.truncate(valid_path_len);
@@ -232,7 +217,7 @@ mod node {
 
         /// How important it is to distribute work across children of this node
         ///
-        /// Only nodes with a single child can leave this at `None`.
+        /// Only nodes with a single child are allowed to leave this at `None`.
         normal_child_priority: Option<Priority>,
 
         /// What switching back to the first child of this Node amounts to in terms
@@ -276,20 +261,18 @@ mod node {
                 "attempted to add the same child twice"
             );
             self.current_children.push_back(child);
-            if self.current_children.len() > 1 {
-                assert!(
-                    self.normal_child_priority.is_some(),
-                    "multi-children nodes should have a child-switching priority"
-                );
-            }
+            assert!(
+                self.normal_child_priority.is_some() || self.num_children() == 1,
+                "{}",
+                Self::NEED_SWITCH_PRIORITY
+            );
         }
 
         /// Check out the active child of this node
         pub fn current_child(&self) -> &Child<'topology> {
-            self.check_child_access();
             self.current_children
                 .front()
-                .expect("enforced by check_child_access")
+                .expect("this method should not be called on a node without children")
         }
 
         /// Remove the active child from this node
@@ -303,7 +286,7 @@ mod node {
         /// get the priority of the associated child-switching event.
         #[must_use]
         pub fn remove_child(&mut self) -> RemoveOutcome {
-            // Switch to the next child, discarding the active child in the process
+            // Switch to the next child, discarding the active child
             self.check_child_access();
             let switch_priority = self.child_switch_priority();
             self.pop_child();
@@ -316,10 +299,7 @@ mod node {
                 );
                 RemoveOutcome::Empty
             } else {
-                RemoveOutcome::NewChild(
-                    switch_priority
-                        .expect("multi-children nodes should have a child-switching priority"),
-                )
+                RemoveOutcome::NewChild(switch_priority.expect(Self::NEED_SWITCH_PRIORITY))
             }
         }
 
@@ -339,9 +319,10 @@ mod node {
         ) -> Option<Priority> {
             // Check if it is time for us to switch to our next child
             self.check_child_access();
-            let switch_priority = self
-                .child_switch_priority()
-                .expect("multi-children nodes should have a child-switching priority");
+            let Some(switch_priority) = self.child_switch_priority() else {
+                assert_eq!(self.num_children(), 1, "{}", Self::NEED_SWITCH_PRIORITY);
+                return None;
+            };
             if switch_priority <= downstream_priority {
                 return None;
             }
@@ -358,14 +339,18 @@ mod node {
             Some(switch_priority)
         }
 
+        /// Current number of children below this node
+        fn num_children(&self) -> usize {
+            self.current_children.len() + self.next_children.len()
+        }
+
         /// Extract the current child of the node
         fn pop_child(&mut self) -> Child<'topology> {
             // Get the current child
-            self.check_child_access();
             let child = self
                 .current_children
                 .pop_front()
-                .expect("enforced by check_child_access");
+                .expect("this method should not be called on a node without children");
 
             // Handle wraparound from last child to first child
             if self.current_children.is_empty() {
@@ -387,6 +372,10 @@ mod node {
             }
         }
 
+        /// Error message when `normal_child_priority` should be set but isn't
+        const NEED_SWITCH_PRIORITY: &'static str =
+            "multi-children nodes should have a child-switching priority";
+
         /// Truth that the active child is our first child
         fn on_first_child(&self) -> bool {
             self.check_child_access();
@@ -400,6 +389,7 @@ mod node {
         }
 
         /// Check for methods that should only be called when a node has children
+        #[track_caller]
         fn check_child_access(&self) {
             assert!(
                 !self.current_children.is_empty(),

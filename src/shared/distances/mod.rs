@@ -44,11 +44,12 @@ impl Distances {
 
         // Look up in which place of the topology work distribution decisions
         // must be made, and priorize those decisions
-        let parent_priorities = Self::priorize_parents(topology, Self::optimize_for_compute);
+        let parent_priorities =
+            Self::priorize_parents(topology, affinity, Self::optimize_for_compute);
 
-        // Sort PUs in such a way that neighbor PUs have high odds of being the
+        // Order PUs in such a way that neighbor PUs have high odds of being the
         // best targets for load balancing transactions (and indeed always are
-        // if the hardware topology is sufficiently symmetric)
+        // when the hardware topology is symmetric)
         let pus = PUIterator::new(topology, affinity, &parent_priorities).collect::<Vec<_>>();
         assert_eq!(pus.len(), num_workers);
         let sorted_cpus = pus
@@ -67,8 +68,8 @@ impl Distances {
             let distances = &mut data[worker_idx * num_workers..(worker_idx + 1) * num_workers];
             let update_neighbor_priority = |curr_priority: &mut Priority, neighbor_idx: usize| {
                 let worker = pus[worker_idx];
-                let common = worker.first_common_ancestor(pus[neighbor_idx]).unwrap();
-                let common_priority = parent_priorities[&common.global_persistent_index()];
+                let common_ancestor = worker.first_common_ancestor(pus[neighbor_idx]).unwrap();
+                let common_priority = parent_priorities[&common_ancestor.global_persistent_index()];
                 *curr_priority = (*curr_priority).min(common_priority);
             };
 
@@ -141,6 +142,7 @@ impl Distances {
     /// highest priority class that is not fully covered yet.
     fn priorize_parents(
         topology: &Topology,
+        affinity: &CpuSet,
         make_priority_classes: impl FnOnce(
             Vec<(ObjectType, NormalDepth, Vec<&TopologyObject>)>,
         ) -> Vec<Vec<&TopologyObject>>,
@@ -152,7 +154,7 @@ impl Distances {
                 // Pick nodes with multiple children
                 let parents = topology
                     .objects_at_depth(depth)
-                    .filter(|obj| obj.normal_arity() > 1)
+                    .filter(|obj| children_in_cpuset(obj, affinity).count() > 1)
                     .inspect(|parent| {
                         initial_parents.insert(parent.global_persistent_index());
                     })
@@ -301,3 +303,16 @@ pub type Distance = u16;
 
 /// Priority of a node for children enumeration (higher is higher priority)
 pub type Priority = usize;
+
+/// Select normal children of a node that match the affinity mask
+fn children_in_cpuset<'iterator, 'parent: 'iterator>(
+    parent: &'parent TopologyObject,
+    affinity: &'iterator CpuSet,
+) -> impl DoubleEndedIterator<Item = &'parent TopologyObject> + Clone + 'iterator {
+    parent.normal_children().filter(move |child| {
+        child
+            .cpuset()
+            .expect("normal objects should have cpuset")
+            .intersects(affinity)
+    })
+}
