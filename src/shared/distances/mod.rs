@@ -12,7 +12,6 @@ use hwlocality::{
 use std::{
     collections::{HashMap, HashSet},
     fmt::{self, Debug},
-    ptr,
 };
 
 /// Distances between ThreadPool workers
@@ -45,56 +44,53 @@ impl Distances {
 
         // Look up in which place of the topology work distribution decisions
         // must be made, and priorize those decisions
-        let parent_priorities =
-            Self::priorize_parents(topology, &cpuset, Self::optimize_for_compute);
+        let parent_priorities = Self::priorize_parents(topology, Self::optimize_for_compute);
 
         // Sort PUs in such a way that neighbor PUs have high odds of being the
         // best targets for load balancing transactions (and indeed always are
         // if the hardware topology is sufficiently symmetric)
-        let sorted_pus =
-            PUIterator::new(topology, affinity, &parent_priorities).collect::<Vec<_>>();
-        assert_eq!(sorted_pus.len(), num_workers);
-
-        unimplemented!(
-            "compute distance matrix using a variant of the old strategy below, \
-            the main new thing being that the ancestor chain must be re-sorted \
-            by parent priority for topological distance evaluation"
-        );
-
-        // Order workers to put nearest neighbors close to each other
-        worker_pus.sort_unstable_by_key(|pu| pu.logical_index());
+        let pus = PUIterator::new(topology, affinity, &parent_priorities).collect::<Vec<_>>();
+        assert_eq!(pus.len(), num_workers);
+        let sorted_cpus = pus
+            .iter()
+            .map(|pu| {
+                BitmapIndex::try_from(pu.logical_index())
+                    .expect("PU logical index should fit in a cpuset")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sorted_cpus.iter().copied().collect::<CpuSet>(), cpuset);
 
         // Compute distance matrix
         let mut data = vec![Distance::MAX; num_workers * num_workers].into_boxed_slice();
         for worker_idx in 0..num_workers {
             // Access distances from current worker and define distance metric
             let distances = &mut data[worker_idx * num_workers..(worker_idx + 1) * num_workers];
-            let topological_distance = |neighbor_idx: usize| {
-                let worker = &worker_pus[worker_idx];
-                let common = worker.common_ancestor(worker_pus[neighbor_idx]).unwrap();
-                worker
-                    .ancestors()
-                    .take_while(|ancestor| !ptr::eq(common, *ancestor))
-                    .count()
+            let update_neighbor_priority = |curr_priority: &mut Priority, neighbor_idx: usize| {
+                let worker = pus[worker_idx];
+                let common = worker.first_common_ancestor(pus[neighbor_idx]).unwrap();
+                let common_priority = parent_priorities[&common.global_persistent_index()];
+                *curr_priority = (*curr_priority).min(common_priority);
             };
 
             // Initialize distance computation
             let mut curr_distance = 0;
             let mut left_idx = worker_idx;
+            let mut left_priority = Priority::MAX;
             let mut right_idx = worker_idx;
+            let mut right_priority = Priority::MAX;
             let last_right_idx = num_workers - 1;
             distances[worker_idx] = 0;
 
             // Do bidirectional iteration as long as relevant
             while left_idx > 0 && right_idx < last_right_idx {
                 curr_distance += 1;
-                let topological_distance_left = topological_distance(left_idx - 1);
-                let topological_distance_right = topological_distance(right_idx + 1);
-                if topological_distance_left <= topological_distance_right {
+                update_neighbor_priority(&mut left_priority, left_idx - 1);
+                update_neighbor_priority(&mut right_priority, right_idx - 1);
+                if left_priority >= right_priority {
                     left_idx -= 1;
                     distances[left_idx] = curr_distance;
                 }
-                if topological_distance_left >= topological_distance_right {
+                if left_priority <= right_priority {
                     right_idx += 1;
                     distances[right_idx] = curr_distance;
                 }
@@ -114,7 +110,7 @@ impl Distances {
                 }
             }
         }
-        Self { data, num_workers }
+        (Self { data, num_workers }, sorted_cpus)
     }
 
     /// Access the distances from a certain worker to others
@@ -126,43 +122,37 @@ impl Distances {
     /// Priorize work distribution according to a certain policy
     ///
     /// A typical hwloc topology tree contains multiple branching points (NUMA
-    /// nodes, L3 cache shards, multicore, hyperthreading...) and when dealing
-    /// with smaller tasks that cannot cover the full CPU, we must decide how
-    /// important it is to spread tasks over these various branching points.
+    /// nodes, L3 cache shards, multicore, hyperthreading...). To handle smaller
+    /// tasks that cannot cover the full CPU, we must decide how important it is
+    /// to spread tasks over these various branching points.
     ///
     /// The simplest policy to implement is to follow the hwloc topology tree :
     /// spread work over hyperthreads first, then cores, then L3 shards, then
     /// NUMA nodes). This policy has optimal cache locality and inter-task
-    /// communication latencies, however it is usually suboptimal in real-world
+    /// communication latency, however it is usually suboptimal in real-world
     /// use cases because hyperthreads contend over shared core ressources.
     ///
     /// The way you actually want to do it depends on the kind of work you're
     /// submitting to the thread pool. Therefore, the work distribution policy
-    /// is configurable through the `policy` callback. This callback receives
-    /// parent nodes grouped by depth as a parameter, and is in charge of
-    /// producing a list of priority classes in increasing priority order. Newly
-    /// spawned tasks will then be distributed over parents in the highest
-    /// priority class that is not full yet.
-    fn priorize_parents<'topology>(
-        topology: &'topology Topology,
-        affinity: &CpuSet,
-        policy: impl for<'parents> FnOnce(
-            &CpuSet,
-            Vec<(ObjectType, NormalDepth, Vec<&'parents TopologyObject>)>,
-        ) -> Vec<Vec<&'parents TopologyObject>>,
+    /// is configurable through the `make_priority_classes` callback. This
+    /// callback receives parent nodes grouped by depth as a parameter, and is
+    /// in charge of producing a list of priority classes in increasing priority
+    /// order. Newly spawned tasks will then be distributed over parents in the
+    /// highest priority class that is not fully covered yet.
+    fn priorize_parents(
+        topology: &Topology,
+        make_priority_classes: impl FnOnce(
+            Vec<(ObjectType, NormalDepth, Vec<&TopologyObject>)>,
+        ) -> Vec<Vec<&TopologyObject>>,
     ) -> HashMap<TopologyObjectID, Priority> {
         // Group multi-children nodes by increasing depth / locality
         let mut initial_parents = HashSet::new();
         let type_depth_parents = NormalDepth::iter_range(NormalDepth::MIN, topology.depth())
             .filter_map(|depth| {
-                // Pick nodes with multiple children that are covered by our
-                // current affinity mask
+                // Pick nodes with multiple children
                 let parents = topology
                     .objects_at_depth(depth)
-                    .filter(|obj| {
-                        obj.cpuset().unwrap().intersects(affinity)
-                            && children_in_cpuset(obj, affinity).count() > 1
-                    })
+                    .filter(|obj| obj.normal_arity() > 1)
                     .inspect(|parent| {
                         initial_parents.insert(parent.global_persistent_index());
                     })
@@ -181,8 +171,8 @@ impl Distances {
             })
             .collect::<Vec<_>>();
 
-        // Let policy callback compute priority classes accordingly
-        let priority_classes = Self::optimize_for_compute(affinity, type_depth_parents);
+        // Let policy callback compute priority classes
+        let priority_classes = make_priority_classes(type_depth_parents);
         let final_parents = priority_classes
             .iter()
             .flatten()
@@ -193,7 +183,7 @@ impl Distances {
             "priorization policies should not add or remove parents"
         );
 
-        // Give each parent node a numerical priority accordingly
+        // Give each multi node a numerical priority accordingly
         priority_classes
             .into_iter()
             .enumerate()
@@ -211,10 +201,9 @@ impl Distances {
     /// local in that hierarchy is also likely to exhibit the highest cache
     /// locality and the lowest inter-task communication latency.
     #[allow(unused)]
-    fn optimize_for_latency<'parents>(
-        _affinity: &CpuSet,
-        type_depth_parents: Vec<(ObjectType, NormalDepth, Vec<&'parents TopologyObject>)>,
-    ) -> Vec<Vec<&'parents TopologyObject>> {
+    fn optimize_for_latency(
+        type_depth_parents: Vec<(ObjectType, NormalDepth, Vec<&TopologyObject>)>,
+    ) -> Vec<Vec<&TopologyObject>> {
         Self::depths_to_priorities(type_depth_parents).collect()
     }
 
@@ -231,14 +220,13 @@ impl Distances {
     ///
     /// Deviates from the standard hwloc hierarchy by filling up hyperthreaded
     /// cores last: since each hyperthread shares compute resources with its
-    /// sibling, hyperthreading is usally very ineffective on well-optimized
-    /// compute-bound tasks, and thus the use of independent cores should
-    /// normally be priorized over that of hyperthreads.
+    /// sibling, hyperthreading is usally quite ineffective on well-optimized
+    /// compute-bound tasks, and the use of independent cores should normally be
+    /// priorized over that of hyperthreads.
     #[allow(unused)]
-    fn optimize_for_compute<'parents>(
-        _affinity: &CpuSet,
-        mut type_depth_parents: Vec<(ObjectType, NormalDepth, Vec<&'parents TopologyObject>)>,
-    ) -> Vec<Vec<&'parents TopologyObject>> {
+    fn optimize_for_compute(
+        mut type_depth_parents: Vec<(ObjectType, NormalDepth, Vec<&TopologyObject>)>,
+    ) -> Vec<Vec<&TopologyObject>> {
         let mut result = Vec::with_capacity(type_depth_parents.len());
         Self::depriorize_hyperthreads(&mut type_depth_parents, &mut result);
         result.extend(Self::depths_to_priorities(type_depth_parents));
@@ -246,9 +234,9 @@ impl Distances {
     }
 
     /// Hyperthread-depriorization part of `optimize_for_compute`
-    fn depriorize_hyperthreads(
-        type_depth_parents: &mut Vec<(ObjectType, NormalDepth, Vec<&TopologyObject>)>,
-        result: &mut Vec<Vec<&TopologyObject>>,
+    fn depriorize_hyperthreads<'topology>(
+        type_depth_parents: &mut Vec<(ObjectType, NormalDepth, Vec<&'topology TopologyObject>)>,
+        result: &mut Vec<Vec<&'topology TopologyObject>>,
     ) {
         match type_depth_parents.pop() {
             Some((ObjectType::Core, _, cores)) => result.push(cores),
@@ -264,10 +252,9 @@ impl Distances {
     /// bandwidth at the cost of reducing cache locality, which should be the
     /// right tradeoff for memory-bound tasks that cannot fit in caches.
     #[allow(unused)]
-    fn optimize_for_bandwidth<'parents>(
-        affinity: &CpuSet,
-        mut type_depth_parents: Vec<(ObjectType, NormalDepth, Vec<&'parents TopologyObject>)>,
-    ) -> Vec<Vec<&'parents TopologyObject>> {
+    fn optimize_for_bandwidth(
+        mut type_depth_parents: Vec<(ObjectType, NormalDepth, Vec<&TopologyObject>)>,
+    ) -> Vec<Vec<&TopologyObject>> {
         // Start like optimize_for_compute
         let mut result = Vec::with_capacity(type_depth_parents.len());
         Self::depriorize_hyperthreads(&mut type_depth_parents, &mut result);
@@ -276,9 +263,11 @@ impl Distances {
         let mut numa_depths_rev = Vec::new();
         'depths: for (depth_idx, (_, _, parents)) in type_depth_parents.iter().enumerate() {
             if parents.iter().any(|parent| {
-                let parent_nodeset = parent.nodeset().unwrap();
-                children_in_cpuset(parent, affinity)
-                    .any(|child| child.nodeset().unwrap() != parent_nodeset)
+                const NORMAL_NODESET_ERROR: &str = "normal objects should have a nodeset";
+                let parent_nodeset = parent.nodeset().expect(NORMAL_NODESET_ERROR);
+                parent
+                    .normal_children()
+                    .any(|child| child.nodeset().expect(NORMAL_NODESET_ERROR) != parent_nodeset)
             }) {
                 numa_depths_rev.push(depth_idx);
             }
@@ -312,13 +301,3 @@ pub type Distance = u16;
 
 /// Priority of a node for children enumeration (higher is higher priority)
 pub type Priority = usize;
-
-/// Select normal children of a node that match the affinity mask
-fn children_in_cpuset<'out>(
-    parent: &'out TopologyObject,
-    affinity: &'out CpuSet,
-) -> impl DoubleEndedIterator<Item = &'out TopologyObject> + Clone + 'out {
-    parent
-        .normal_children()
-        .filter(move |child| child.cpuset().unwrap().intersects(affinity))
-}

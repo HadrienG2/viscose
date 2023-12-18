@@ -16,37 +16,28 @@ use std::{
 /// Tree used to iterate over PUs in an order that matches work distribution
 /// priorities (i.e. PUs that should share work first are close)
 #[derive(Default)]
-pub struct PUIterator<'caller> {
+pub struct PUIterator<'topology> {
     /// Summarized hwloc tree that only includes multi-children nodes, and
     /// priorizes the traversal of each child from each node
-    nodes: HashMap<TopologyObjectID, NodeIterator<'caller>>,
+    nodes: HashMap<TopologyObjectID, NodeIterator<'topology>>,
 
     /// Path to the next PU to be yielded, if any
     next_pu_path: Vec<TopologyObjectID>,
 }
 //
-impl<'caller> PUIterator<'caller> {
+impl<'topology> PUIterator<'topology> {
     /// Set up iteration over PUs
     pub fn new(
-        topology: &'caller Topology,
+        topology: &'topology Topology,
         affinity: &CpuSet,
-        parent_priorities: &'caller HashMap<TopologyObjectID, Priority>,
+        parent_priorities: &HashMap<TopologyObjectID, Priority>,
     ) -> Self {
         // This iterator will operate in a simplified hwloc topology that only
         // includes nodes from the affinity set that have either at least one PU
         // children or multiple non-PU children
         let id = |obj: &TopologyObject| obj.global_persistent_index();
-        let children = |obj| super::children_in_cpuset(obj, affinity);
-        let has_multiple_children = |obj| {
-            let result = parent_priorities.contains_key(&id(obj));
-            if !result {
-                debug_assert!(
-                    children(obj).count() < 2,
-                    "multi-children nodes should have a priority"
-                );
-            }
-            result
-        };
+        let children = |obj| Self::children_in_cpuset(obj, affinity);
+        let has_multiple_children = |obj| children(obj).count() >= 2;
         let has_pu_children =
             |obj| children(obj).any(|child| child.object_type() == ObjectType::PU);
         let keep_node = |obj| !(has_multiple_children(obj) || has_pu_children(obj));
@@ -82,12 +73,16 @@ impl<'caller> PUIterator<'caller> {
         while !curr_node_candidates.is_empty() {
             // We grab the associated parent object of each group...
             for (parent_id, mut curr_children) in curr_node_candidates.drain(..) {
-                let parent = &mut nodes[&parent_id];
+                const PARENT_SHOULD_BE_THERE: &str =
+                    "parent should already be present because traversal is top-down";
                 // ...then process this parent object's children...
                 'children: for child in curr_children.drain(..) {
                     // PUs always get added to parents
                     if child.object_type() == ObjectType::PU {
-                        parent.add_child(child);
+                        nodes
+                            .get_mut(&parent_id)
+                            .expect(PARENT_SHOULD_BE_THERE)
+                            .add_child(child);
                         assert_eq!(child.normal_arity(), 0, "PUs shouldn't have children");
                         continue 'children;
                     }
@@ -95,7 +90,10 @@ impl<'caller> PUIterator<'caller> {
                     // Nodes only get added if they pass the node filter
                     let parent_id = if keep_node(child) {
                         nodes.insert(id(child), NodeIterator::new(priority(child)));
-                        parent.add_child(child);
+                        nodes
+                            .get_mut(&parent_id)
+                            .expect(PARENT_SHOULD_BE_THERE)
+                            .add_child(child);
                         id(child)
                     } else {
                         parent_id
@@ -116,22 +114,36 @@ impl<'caller> PUIterator<'caller> {
             next_pu_path: vec![id(root)],
         }
     }
+
+    /// Select normal children of a node that match the affinity mask
+    fn children_in_cpuset<'iterator, 'parent: 'iterator>(
+        parent: &'parent TopologyObject,
+        affinity: &'iterator CpuSet,
+    ) -> impl DoubleEndedIterator<Item = &'parent TopologyObject> + Clone + 'iterator {
+        parent
+            .normal_children()
+            .filter(move |child| child.cpuset().unwrap().intersects(affinity))
+    }
 }
 //
-impl<'caller> Iterator for PUIterator<'caller> {
-    type Item = &'caller TopologyObject;
+impl<'topology> Iterator for PUIterator<'topology> {
+    type Item = &'topology TopologyObject;
 
     fn next(&mut self) -> Option<Self::Item> {
         // Dive down from the active node to find the next PU that we'll
         // eventually yield
-        let mut current_node_id = self.next_pu_path.last()?;
-        let mut current_node = &mut self.nodes[current_node_id];
+        let mut current_node_id = *self.next_pu_path.last()?;
+        const PATH_ERROR: &str = "node in next_pu_path should exist";
+        let mut current_node = self.nodes.get_mut(&current_node_id).expect(PATH_ERROR);
         let yielded_pu = loop {
             match current_node.current_child() {
                 Child::Node(next_node_id) => {
-                    current_node_id = next_node_id;
-                    self.next_pu_path.push(*current_node_id);
-                    current_node = &mut self.nodes[next_node_id];
+                    current_node_id = *next_node_id;
+                    self.next_pu_path.push(current_node_id);
+                    current_node = self
+                        .nodes
+                        .get_mut(&current_node_id)
+                        .expect("child node should exist");
                     continue;
                 }
                 Child::PU(pu) => {
@@ -148,7 +160,7 @@ impl<'caller> Iterator for PUIterator<'caller> {
                 RemoveOutcome::NewChild(priority) => break priority,
                 RemoveOutcome::Empty => {
                     self.next_pu_path.pop();
-                    self.nodes.remove(current_node_id);
+                    self.nodes.remove(&current_node_id);
                     let Some(next_node_id) = self.next_pu_path.last() else {
                         // We deleted all nodes in the path, so there is no
                         // iteration state left to be advanced...
@@ -158,8 +170,8 @@ impl<'caller> Iterator for PUIterator<'caller> {
                         );
                         return Some(yielded_pu);
                     };
-                    current_node_id = next_node_id;
-                    current_node = &mut self.nodes[next_node_id];
+                    current_node_id = *next_node_id;
+                    current_node = self.nodes.get_mut(&current_node_id).expect(PATH_ERROR);
                     continue;
                 }
             }
@@ -181,9 +193,9 @@ impl<'caller> Iterator for PUIterator<'caller> {
         // want to switch to the next PU/Core below the active NUMA node, but
         // also to switch to the next NUMA node on every iteration.
         let mut valid_path_len = self.next_pu_path.len();
-        for (num_ancestors, ancestor_id) in self.next_pu_path.iter().enumerate().rev().skip(1) {
+        for (num_ancestors, &ancestor_id) in self.next_pu_path.iter().enumerate().rev().skip(1) {
             current_node_id = ancestor_id;
-            current_node = &mut self.nodes[current_node_id];
+            current_node = self.nodes.get_mut(&current_node_id).expect(PATH_ERROR);
             if let Some(switch_priority) =
                 current_node.switch_child_if_priorized(downstream_priority)
             {
@@ -264,6 +276,12 @@ mod node {
                 "attempted to add the same child twice"
             );
             self.current_children.push_back(child);
+            if self.current_children.len() > 1 {
+                assert!(
+                    self.normal_child_priority.is_some(),
+                    "multi-children nodes should have a child-switching priority"
+                );
+            }
         }
 
         /// Check out the active child of this node
@@ -288,7 +306,7 @@ mod node {
             // Switch to the next child, discarding the active child in the process
             self.check_child_access();
             let switch_priority = self.child_switch_priority();
-            std::mem::drop(self.pop_child());
+            self.pop_child();
 
             // Check if we removed the last child of this node
             if self.current_children.is_empty() {
