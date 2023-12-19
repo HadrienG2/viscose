@@ -223,6 +223,7 @@ mod tests {
     #[test]
     fn lifecycle() {
         // Check that thread pool initializes and shuts down correctly
+        crate::setup_logger_once();
         ThreadPool::new();
     }
 }

@@ -35,6 +35,9 @@ impl Distances {
     pub fn with_sorted_cpus(topology: &Topology, affinity: &CpuSet) -> (Self, Vec<BitmapIndex>) {
         // Check preconditions
         let cpuset = topology.cpuset() & affinity;
+        log::info!(
+            "Building a thread pool with affinity {affinity} corresponding to cpuset {cpuset}"
+        );
         let num_workers = cpuset.weight().unwrap();
         assert!(
             num_workers < usize::from(Distance::MAX),
@@ -50,54 +53,99 @@ impl Distances {
         // Order PUs in such a way that neighbor PUs have high odds of being the
         // best targets for load balancing transactions (and indeed always are
         // when the hardware topology is symmetric)
-        let pus = PUIterator::new(topology, affinity, &parent_priorities).collect::<Vec<_>>();
-        assert_eq!(pus.len(), num_workers);
-        let sorted_cpus = pus
+        let worker_pus =
+            PUIterator::new(topology, affinity, &parent_priorities).collect::<Vec<_>>();
+        assert_eq!(worker_pus.len(), num_workers);
+        let sorted_cpus = worker_pus
             .iter()
             .map(|pu| {
-                BitmapIndex::try_from(pu.logical_index())
+                BitmapIndex::try_from(pu.os_index().expect("PUs should have an OS index"))
                     .expect("PU logical index should fit in a cpuset")
             })
             .collect::<Vec<_>>();
-        assert_eq!(sorted_cpus.iter().copied().collect::<CpuSet>(), cpuset);
+        crate::info!("Workers were assigned CPUs {sorted_cpus:?}");
+        assert_eq!(
+            sorted_cpus.iter().copied().collect::<CpuSet>(),
+            cpuset,
+            "workers should cover all requested CPUs"
+        );
 
         // Compute distance matrix
+        crate::info!("Computing inter-worker distances...");
         let mut data = vec![Distance::MAX; num_workers * num_workers].into_boxed_slice();
+        let mut neighborhood = Vec::with_capacity(num_workers);
         for worker_idx in 0..num_workers {
+            // FIXME: The following is NOT a correct way to compute inter-PU
+            //        distances. It would be better to...
+            //
+            //        - Start with a list composed of the worker + its ancestor
+            //          list
+            //        - For the worker + each ancestor except the root, iterate
+            //          over (left, right) sibling pairs, then linearly over
+            //          remainder
+            //        - Priorize iterators using a BinaryHeap keyed by parent
+            //          node priority
+            //        - For each node yielded by above iteration, yield the
+            //          children from closest to worker to furthest (right to
+            //          left for left sibling, left to right for right sibling).
+            //        - If these children are not PUs, recurse over them.
+            //        - All this recursive iteration probably means that I'll
+            //          not just need to key iterators by parent node priority,
+            //          but by some kind of hierarchical priority
+            //          (Vec<Priority>?).
+
             // Access distances from current worker and define distance metric
+            crate::debug!("Computing distances from worker {worker_idx}...");
             let distances = &mut data[worker_idx * num_workers..(worker_idx + 1) * num_workers];
-            let update_neighbor_priority = |curr_priority: &mut Priority, neighbor_idx: usize| {
-                let worker = pus[worker_idx];
-                let common_ancestor = worker.first_common_ancestor(pus[neighbor_idx]).unwrap();
-                let common_priority = parent_priorities[&common_ancestor.global_persistent_index()];
-                *curr_priority = (*curr_priority).min(common_priority);
+            let neighbor_priority = |neighborhood: &[&TopologyObject], new_neighbor_idx: usize| {
+                crate::trace!(
+                    "  * Computing priority of neighbor {new_neighbor_idx} (CPU {:?})",
+                    sorted_cpus[new_neighbor_idx]
+                );
+                let new_neighbor = worker_pus[new_neighbor_idx];
+                let priority = neighborhood.iter().map(|pu| {
+                    let common_ancestor = pu.first_common_ancestor(new_neighbor).unwrap();
+                    let common_priority = parent_priorities[&common_ancestor.global_persistent_index()];
+                    crate::trace!("  * Neighborhood ancestor {common_ancestor} has priority {common_priority}");
+                    common_priority
+                })
+                .min().unwrap();
+                crate::trace!("  * Neighbor priority is {}", priority);
+                priority
             };
 
             // Initialize distance computation
             let mut curr_distance = 0;
             let mut left_idx = worker_idx;
-            let mut left_priority = Priority::MAX;
             let mut right_idx = worker_idx;
-            let mut right_priority = Priority::MAX;
             let last_right_idx = num_workers - 1;
+            neighborhood.clear();
+            neighborhood.push(worker_pus[worker_idx]);
             distances[worker_idx] = 0;
 
             // Do bidirectional iteration as long as relevant
+            crate::debug!("Resolving left/right neighbor priorities...");
             while left_idx > 0 && right_idx < last_right_idx {
                 curr_distance += 1;
-                update_neighbor_priority(&mut left_priority, left_idx - 1);
-                update_neighbor_priority(&mut right_priority, right_idx - 1);
+                crate::trace!("- At distance {curr_distance}");
+                let left_priority = neighbor_priority(&neighborhood, left_idx - 1);
+                let right_priority = neighbor_priority(&neighborhood, right_idx + 1);
                 if left_priority >= right_priority {
                     left_idx -= 1;
+                    crate::trace!("  * Left neighbor {left_idx} is at top priority, register it at current distance {curr_distance}");
                     distances[left_idx] = curr_distance;
+                    neighborhood.push(worker_pus[left_idx]);
                 }
                 if left_priority <= right_priority {
                     right_idx += 1;
+                    crate::trace!("  * Right neighbor {right_idx} is at top priority, register it at current distance {curr_distance}");
                     distances[right_idx] = curr_distance;
+                    neighborhood.push(worker_pus[right_idx]);
                 }
             }
 
             // Finish with unidirectional iteration
+            crate::debug!("Adding remaining neighbors...");
             loop {
                 curr_distance += 1;
                 if left_idx > 0 {
@@ -110,6 +158,8 @@ impl Distances {
                     break;
                 }
             }
+            crate::debug!("Distances are ready!");
+            crate::info!("{worker_idx:>3} -> {distances:>3?}");
         }
         (Self { data, num_workers }, sorted_cpus)
     }
@@ -172,9 +222,13 @@ impl Distances {
                 })
             })
             .collect::<Vec<_>>();
+        crate::debug!("Priorizing distribution of work across multi-children parents grouped by typed depth {type_depth_parents:#?}");
 
         // Let policy callback compute priority classes
         let priority_classes = make_priority_classes(type_depth_parents);
+        crate::info!(
+            "Work distribution priority classes in increasing priority order: {priority_classes:#?}"
+        );
         let final_parents = priority_classes
             .iter()
             .flatten()

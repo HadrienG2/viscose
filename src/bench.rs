@@ -427,6 +427,7 @@ mod tests {
 
     #[test]
     fn fibonacci() {
+        crate::setup_logger_once();
         let pool = ThreadPool::new();
         pool.run(|scope| {
             for i in 0..=34 {
