@@ -29,13 +29,12 @@ pub struct Distances {
 }
 //
 impl Distances {
-    /// Given an hwloc topology and an affinity mask, order selected CPUs in a
+    /// Given an affinity-restricted hwloc topology, order selected CPUs in a
     /// manner that minimizes the distance between nearest neighbors and compute
     /// the associated matrix of inter-CPU distances
-    pub fn with_sorted_cpus(topology: &Topology, affinity: &CpuSet) -> (Self, Vec<BitmapIndex>) {
+    pub fn with_sorted_cpus(topology: &Topology) -> (Self, Vec<BitmapIndex>) {
         // Check preconditions
-        let cpuset = topology.cpuset() & affinity;
-        let num_workers = cpuset.weight().unwrap();
+        let num_workers = topology.cpuset().weight().unwrap();
         assert!(
             num_workers < usize::from(Distance::MAX),
             "CPUs with >{} cores aren't supported yet, time to switch to the next integer width?",
@@ -44,13 +43,12 @@ impl Distances {
 
         // Look up in which place of the topology work distribution decisions
         // must be made, and priorize those decisions
-        let parent_priorities =
-            Self::priorize_parents(topology, affinity, Self::optimize_for_compute);
+        let parent_priorities = Self::priorize_parents(topology, Self::optimize_for_compute);
 
         // Order PUs in such a way that neighbor PUs have high odds of being the
         // best targets for load balancing transactions (and indeed always are
         // when the hardware topology is symmetric)
-        let pus = PUIterator::new(topology, affinity, &parent_priorities).collect::<Vec<_>>();
+        let pus = PUIterator::new(topology, &parent_priorities).collect::<Vec<_>>();
         assert_eq!(pus.len(), num_workers);
         let sorted_cpus = pus
             .iter()
@@ -59,7 +57,10 @@ impl Distances {
                     .expect("PU logical index should fit in a cpuset")
             })
             .collect::<Vec<_>>();
-        assert_eq!(sorted_cpus.iter().copied().collect::<CpuSet>(), cpuset);
+        assert_eq!(
+            sorted_cpus.iter().copied().collect::<CpuSet>(),
+            topology.cpuset()
+        );
 
         // Compute distance matrix
         let mut data = vec![Distance::MAX; num_workers * num_workers].into_boxed_slice();
@@ -142,7 +143,6 @@ impl Distances {
     /// highest priority class that is not fully covered yet.
     fn priorize_parents(
         topology: &Topology,
-        affinity: &CpuSet,
         make_priority_classes: impl FnOnce(
             Vec<(ObjectType, NormalDepth, Vec<&TopologyObject>)>,
         ) -> Vec<Vec<&TopologyObject>>,
@@ -154,7 +154,7 @@ impl Distances {
                 // Pick nodes with multiple children
                 let parents = topology
                     .objects_at_depth(depth)
-                    .filter(|obj| children_in_cpuset(obj, affinity).count() > 1)
+                    .filter(|obj| obj.normal_arity() > 1)
                     .inspect(|parent| {
                         initial_parents.insert(parent.global_persistent_index());
                     })
@@ -303,16 +303,3 @@ pub type Distance = u16;
 
 /// Priority of a node for children enumeration (higher is higher priority)
 pub type Priority = usize;
-
-/// Select normal children of a node that match the affinity mask
-fn children_in_cpuset<'iterator, 'parent: 'iterator>(
-    parent: &'parent TopologyObject,
-    affinity: &'iterator CpuSet,
-) -> impl DoubleEndedIterator<Item = &'parent TopologyObject> + Clone + 'iterator {
-    parent.normal_children().filter(move |child| {
-        child
-            .cpuset()
-            .expect("normal objects should have cpuset")
-            .intersects(affinity)
-    })
-}

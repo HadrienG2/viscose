@@ -15,7 +15,10 @@ use crossbeam::{
     deque::{self, Injector, Steal, Stealer},
     utils::CachePadded,
 };
-use hwlocality::{bitmap::BitmapIndex, cpu::cpuset::CpuSet, Topology};
+use hwlocality::{
+    bitmap::BitmapIndex, cpu::cpuset::CpuSet, errors::ParameterError,
+    topology::editor::RestrictFlags, Topology,
+};
 use std::{
     borrow::Borrow,
     sync::{atomic::Ordering, Arc},
@@ -54,12 +57,25 @@ impl SharedState {
         topology: &Topology,
         affinity: impl Borrow<CpuSet>,
     ) -> (Arc<Self>, Box<[WorkerConfig]>) {
+        // Compute an affinity-restricted topology
+        let mut topology = topology.clone();
+        let mut cpuset = topology.cpuset() & affinity.borrow();
+        cpuset.unset(0);
+        if let Err(ParameterError(affinity)) =
+            topology.edit(|editor| editor.restrict(&cpuset, RestrictFlags::REMOVE_EMPTIED))
+        {
+            panic!(
+                "affinity mask {affinity} should contain at least one CPU from system cpuset {}",
+                topology.cpuset()
+            );
+        }
+
         // Compute inter-worker distances and order workers to maximize locality
-        let (distances, cpus) = Distances::with_sorted_cpus(topology, affinity.borrow());
+        let (distances, cpus) = Distances::with_sorted_cpus(&topology);
         let num_workers = cpus.len();
         assert_ne!(
             num_workers, 0,
-            "a thread pool without threads can't make progress and will deadlock on first request"
+            "should have been enforced by topology restriction command above"
         );
         assert!(
             num_workers < WorkerFutex::MAX_WORKERS,

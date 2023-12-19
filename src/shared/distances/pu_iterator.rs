@@ -3,7 +3,6 @@
 use self::node::{Child, NodeIterator, RemoveOutcome};
 use super::Priority;
 use hwlocality::{
-    cpu::cpuset::CpuSet,
     object::{types::ObjectType, TopologyObject, TopologyObjectID},
     Topology,
 };
@@ -32,36 +31,29 @@ impl<'topology> PUIterator<'topology> {
     /// Set up iteration over PUs
     pub fn new(
         topology: &'topology Topology,
-        affinity: &CpuSet,
         parent_priorities: &HashMap<TopologyObjectID, Priority>,
     ) -> Self {
-        // Handle empty cpuset case
-        if !topology.cpuset().intersects(affinity) {
-            return Self::default();
-        }
-
         // We'll simplify the topology by collapsing chains of nodes with a
         // single child into a single node
-        let children_in_cpuset = |obj| super::children_in_cpuset(obj, affinity);
-        let simplify_node = |mut obj| {
-            while children_in_cpuset(obj).count() == 1 {
-                let Some(only_child) = children_in_cpuset(obj).next() else {
+        fn simplify_node(mut obj: &TopologyObject) -> &TopologyObject {
+            while obj.normal_arity() == 1 {
+                let Some(only_child) = obj.normal_children().next() else {
                     unreachable!("checked above that there is one child")
                 };
                 obj = only_child;
             }
             obj
-        };
+        }
 
         // Start building the topology tree by inserting the (simplified) root
         let mut nodes = HashMap::new();
         let id = |obj: &TopologyObject| obj.global_persistent_index();
         let add_node = |nodes: &mut HashMap<_, _>, obj: &TopologyObject| {
             assert!(
-                obj.cpuset()
+                !obj.cpuset()
                     .expect("normal objects should have cpusets")
-                    .intersects(affinity),
-                "iteration tree nodes should have children"
+                    .is_empty(),
+                "empty objects should have been discarded by topology affinity restriction"
             );
             let priority = parent_priorities.get(&id(obj)).copied();
             nodes.insert(id(obj), NodeIterator::new(priority));
@@ -70,7 +62,7 @@ impl<'topology> PUIterator<'topology> {
         add_node(&mut nodes, root);
 
         // Finish building the tree through top-down breadth-first traversal
-        let mut curr_node_children = vec![(id(root), children_in_cpuset(root).collect::<Vec<_>>())];
+        let mut curr_node_children = vec![(id(root), root.normal_children().collect::<Vec<_>>())];
         let mut next_node_children = Vec::new();
         let mut child_list_morgue = Vec::new();
         while !curr_node_children.is_empty() {
@@ -89,11 +81,11 @@ impl<'topology> PUIterator<'topology> {
 
                     // If the child has grandchildren, make it a node and
                     // schedule processing the grandchildren
-                    if children_in_cpuset(child).count() > 0 {
+                    if child.normal_arity() > 0 {
                         add_node(&mut nodes, child);
                         let mut grandchild_list: Vec<_> =
                             child_list_morgue.pop().unwrap_or_default();
-                        grandchild_list.extend(children_in_cpuset(child));
+                        grandchild_list.extend(child.normal_children());
                         next_node_children.push((id(child), grandchild_list));
                     } else {
                         assert_eq!(child.object_type(), ObjectType::PU);
