@@ -76,7 +76,7 @@ impl Distances {
         let mut neighborhood = Vec::with_capacity(num_workers);
         for worker_idx in 0..num_workers {
             // FIXME: The following is NOT a correct way to compute inter-PU
-            //        distances. It would be better to...
+            //        distances. It would be best to...
             //
             //        - Start with a list composed of the worker + its ancestor
             //          list
@@ -93,6 +93,35 @@ impl Distances {
             //          not just need to key iterators by parent node priority,
             //          but by some kind of hierarchical priority
             //          (Vec<Priority>?).
+            //
+            //        ...but that's all very complicated and I suspect there is
+            //        a simpler way to do the computation that relies on the
+            //        fact that distances from worker 0 are trivial to compute
+            //        and distances from worker N might be computable from
+            //        distances from workers M < N.
+            //
+            //        To get there, though, I may need a multi-pass algorithm:
+            //
+            //        1. First group workers by max-priority common ancestor.
+            //           - Take first worker
+            //           - Iterate to the right to find first neighbor whose
+            //             common ancestor is not the same priority.
+            //           - Record that there's a group boundary here.
+            //           - Repeat the process, taking the first neighbor at
+            //             different priority as the new first worker of the
+            //             group
+            //           - The end result is a list of group boundaries
+            //        2. Then compute distances using group boundaries
+            //           - Iterate over groups
+            //           - Set inter-worker distance inside of the group to
+            //             linear index distance
+            //           - Decide if left and right priority are equal or
+            //             unequal priority
+            //           - If same priority, fill both distances by linear index
+            //             distance with an offset such that original group
+            //             members are priorized.
+            //           - If not the same priority, handle the closest group
+            //             first, then update to new neighbor and repeat.
 
             // Access distances from current worker and define distance metric
             crate::debug!("Computing distances from worker {worker_idx}...");
