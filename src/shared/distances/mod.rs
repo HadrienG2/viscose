@@ -70,59 +70,47 @@ impl Distances {
             "workers should cover all requested CPUs"
         );
 
+        // FIXME: The following distances computation doesn't work. Here is a
+        //        more viable alternative using a two-pass algorithm.
+        //
+        //        1. Group workers by nearest neighbor by finding boundaries
+        //           between sets of nearest neighbors and the priority of
+        //           crossing these boundaries after exploring neighbors.
+        //           - Take first worker
+        //           - Find highest priority ancestor that is registered in
+        //             parent_priorities (and thus has multiple children).
+        //           - Walk workers to find a worker whose common ancestor with
+        //             the first worker is not the highest-priority ancestor
+        //               * Here, we can only consider the first worker because
+        //                 workers have been ordered to maximize nearest
+        //                 neighbor locality with left priority
+        //           - Register boundary with the priority of that new common
+        //             ancestor.
+        //           - Reset walk, taking the worker after the boundary as the
+        //             first worker.
+        //           - Continue walking until all workers have been traversed
+        //        2. Next, compute distances using the priorized boundaries
+        //           - Find the boundaries on the left and the right of the
+        //             target worker (using binary search ?)
+        //              * If there is no boundary on either side, switch to a
+        //                simple linearly increasing distance on both sides,
+        //                which will be in any case the end of the algorithm
+        //                once either side is exhausted.
+        //           - Fill linear distances away from the worker until both
+        //             boundaries have been reached (can do it with one run of
+        //             linear iteration from the left and one run to the right,
+        //             if I get the subtraction sign right).
+        //           - Pick next boundary on lowest-priority side and continue
+        //             filling until we run out of boundaries, using the same
+        //             logic as below.
+        //           - Once we run out of boundaries on either side, finish
+        //             filling distances linearly.
+
         // Compute distance matrix
         crate::info!("Computing inter-worker distances...");
         let mut data = vec![Distance::MAX; num_workers * num_workers].into_boxed_slice();
         let mut neighborhood = Vec::with_capacity(num_workers);
         for worker_idx in 0..num_workers {
-            // FIXME: The following is NOT a correct way to compute inter-PU
-            //        distances. It would be best to...
-            //
-            //        - Start with a list composed of the worker + its ancestor
-            //          list
-            //        - For the worker + each ancestor except the root, iterate
-            //          over (left, right) sibling pairs, then linearly over
-            //          remainder
-            //        - Priorize iterators using a BinaryHeap keyed by parent
-            //          node priority
-            //        - For each node yielded by above iteration, yield the
-            //          children from closest to worker to furthest (right to
-            //          left for left sibling, left to right for right sibling).
-            //        - If these children are not PUs, recurse over them.
-            //        - All this recursive iteration probably means that I'll
-            //          not just need to key iterators by parent node priority,
-            //          but by some kind of hierarchical priority
-            //          (Vec<Priority>?).
-            //
-            //        ...but that's all very complicated and I suspect there is
-            //        a simpler way to do the computation that relies on the
-            //        fact that distances from worker 0 are trivial to compute
-            //        and distances from worker N might be computable from
-            //        distances from workers M < N.
-            //
-            //        To get there, though, I may need a multi-pass algorithm:
-            //
-            //        1. First group workers by max-priority common ancestor.
-            //           - Take first worker
-            //           - Iterate to the right to find first neighbor whose
-            //             common ancestor is not the same priority.
-            //           - Record that there's a group boundary here.
-            //           - Repeat the process, taking the first neighbor at
-            //             different priority as the new first worker of the
-            //             group
-            //           - The end result is a list of group boundaries
-            //        2. Then compute distances using group boundaries
-            //           - Iterate over groups
-            //           - Set inter-worker distance inside of the group to
-            //             linear index distance
-            //           - Decide if left and right priority are equal or
-            //             unequal priority
-            //           - If same priority, fill both distances by linear index
-            //             distance with an offset such that original group
-            //             members are priorized.
-            //           - If not the same priority, handle the closest group
-            //             first, then update to new neighbor and repeat.
-
             // Access distances from current worker and define distance metric
             crate::debug!("Computing distances from worker {worker_idx}...");
             let distances = &mut data[worker_idx * num_workers..(worker_idx + 1) * num_workers];
