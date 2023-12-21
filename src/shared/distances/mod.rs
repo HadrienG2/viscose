@@ -93,14 +93,14 @@ impl Distances {
         //
         // More precisely, we collect a list of boundaries between
         // nearest-neighbor groups, with the associated common ancestor priority
-        crate::info!("Grouping workers into nearest neighbor sets...");
+        crate::debug!("Grouping workers into nearest neighbor sets...");
         let mut indexed_pus = worker_pus.iter().enumerate();
         let mut group_boundaries = Vec::new();
         let mut leader_pu = indexed_pus
             .next()
             .expect("asserted above there are >= 2 workers")
             .1;
-        let best_ancestor_priority = |pu: &TopologyObject| {
+        let nearest_neighbor_priority = |pu: &TopologyObject| {
             pu.ancestors()
                 .filter_map(|ancestor| {
                     parent_priorities
@@ -110,17 +110,29 @@ impl Distances {
                 .max()
                 .expect("asserted above there are >= 2 workers, hence multi-children ancestors")
         };
-        let mut leader_ancestor_priority = best_ancestor_priority(leader_pu);
+        let mut leader_neighbor_priority = nearest_neighbor_priority(leader_pu);
+        crate::trace!(
+            "- Initial leader is worker #0 ({leader_pu}) with nearest neighbor priority {leader_neighbor_priority}");
         for (idx, pu) in indexed_pus {
             let common_ancestor = pu
                 .first_common_ancestor(leader_pu)
                 .expect("if there are two PUs, at least Machine can be a common ancestor");
             let common_ancestor_priority =
                 parent_priorities[&common_ancestor.global_persistent_index()];
-            if common_ancestor_priority < leader_ancestor_priority {
+            crate::trace!(
+                "- Common ancestor of worker #{idx} ({pu}) with leader \
+                is {common_ancestor} with priority {common_ancestor_priority}"
+            );
+            if common_ancestor_priority < leader_neighbor_priority {
                 group_boundaries.push((idx, common_ancestor_priority));
                 leader_pu = pu;
-                leader_ancestor_priority = best_ancestor_priority(pu);
+                leader_neighbor_priority = nearest_neighbor_priority(pu);
+                crate::trace!(
+                    "* Worker #{idx} isn't part of leader's nearest neigbors: \
+                    record a boundary with priority {common_ancestor_priority} \
+                    and make it the new leader with nearest neighbor priority \
+                    {leader_neighbor_priority}"
+                );
             }
         }
         crate::info!("Nearest neighbor set (boundaries, priorities) are {group_boundaries:?}");
