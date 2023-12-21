@@ -45,6 +45,25 @@ impl Distances {
             Distance::MAX
         );
 
+        // Handle empty and singleton cpuset edge case
+        if num_workers == 0 {
+            return (
+                Self {
+                    data: Vec::new().into_boxed_slice(),
+                    num_workers: 0,
+                },
+                Vec::new(),
+            );
+        } else if num_workers == 1 {
+            return (
+                Self {
+                    data: vec![0].into_boxed_slice(),
+                    num_workers: 1,
+                },
+                vec![cpuset.first_set().expect("should be there if weight > 0")],
+            );
+        }
+
         // Look up in which place of the topology work distribution decisions
         // must be made, and priorize those decisions
         let parent_priorities =
@@ -70,109 +89,135 @@ impl Distances {
             "workers should cover all requested CPUs"
         );
 
-        // FIXME: The following distances computation doesn't work. Here is a
-        //        more viable alternative using a two-pass algorithm.
+        // Group workers by nearest neighbor
         //
-        //        1. Group workers by nearest neighbor by finding boundaries
-        //           between sets of nearest neighbors and the priority of
-        //           crossing these boundaries after exploring neighbors.
-        //           - Take first worker
-        //           - Find highest priority ancestor that is registered in
-        //             parent_priorities (and thus has multiple children).
-        //           - Walk workers to find a worker whose common ancestor with
-        //             the first worker is not the highest-priority ancestor
-        //               * Here, we can only consider the first worker because
-        //                 workers have been ordered to maximize nearest
-        //                 neighbor locality with left priority
-        //           - Register boundary with the priority of that new common
-        //             ancestor.
-        //           - Reset walk, taking the worker after the boundary as the
-        //             first worker.
-        //           - Continue walking until all workers have been traversed
-        //        2. Next, compute distances using the priorized boundaries
-        //           - Find the boundaries on the left and the right of the
-        //             target worker (using binary search ?)
-        //              * If there is no boundary on either side, switch to a
-        //                simple linearly increasing distance on both sides,
-        //                which will be in any case the end of the algorithm
-        //                once either side is exhausted.
-        //           - Fill linear distances away from the worker until both
-        //             boundaries have been reached (can do it with one run of
-        //             linear iteration from the left and one run to the right,
-        //             if I get the subtraction sign right).
-        //           - Pick next boundary on lowest-priority side and continue
-        //             filling until we run out of boundaries, using the same
-        //             logic as below.
-        //           - Once we run out of boundaries on either side, finish
-        //             filling distances linearly.
+        // More precisely, we collect a list of boundaries between
+        // nearest-neighbor groups, with the associated common ancestor priority
+        crate::info!("Grouping workers into nearest neighbor sets...");
+        let mut indexed_pus = worker_pus.iter().enumerate();
+        let mut group_boundaries = Vec::new();
+        let mut leader_pu = indexed_pus
+            .next()
+            .expect("asserted above there are >= 2 workers")
+            .1;
+        let best_ancestor_priority = |pu: &TopologyObject| {
+            pu.ancestors()
+                .filter_map(|ancestor| {
+                    parent_priorities
+                        .get(&ancestor.global_persistent_index())
+                        .copied()
+                })
+                .max()
+                .expect("asserted above there are >= 2 workers, hence multi-children ancestors")
+        };
+        let mut leader_ancestor_priority = best_ancestor_priority(leader_pu);
+        for (idx, pu) in indexed_pus {
+            let common_ancestor = pu
+                .first_common_ancestor(leader_pu)
+                .expect("if there are two PUs, at least Machine can be a common ancestor");
+            let common_ancestor_priority =
+                parent_priorities[&common_ancestor.global_persistent_index()];
+            if common_ancestor_priority < leader_ancestor_priority {
+                group_boundaries.push((idx, common_ancestor_priority));
+                leader_pu = pu;
+                leader_ancestor_priority = best_ancestor_priority(pu);
+            }
+        }
+        crate::info!("Nearest neighbor set (boundaries, priorities) are {group_boundaries:?}");
 
         // Compute distance matrix
         crate::info!("Computing inter-worker distances...");
         let mut data = vec![Distance::MAX; num_workers * num_workers].into_boxed_slice();
-        let mut neighborhood = Vec::with_capacity(num_workers);
         for worker_idx in 0..num_workers {
             // Access distances from current worker and define distance metric
             crate::debug!("Computing distances from worker {worker_idx}...");
             let distances = &mut data[worker_idx * num_workers..(worker_idx + 1) * num_workers];
-            let neighbor_priority = |neighborhood: &[&TopologyObject], new_neighbor_idx: usize| {
-                crate::trace!(
-                    "  * Computing priority of neighbor {new_neighbor_idx} (CPU {:?})",
-                    sorted_cpus[new_neighbor_idx]
-                );
-                let new_neighbor = worker_pus[new_neighbor_idx];
-                let priority = neighborhood.iter().map(|pu| {
-                    let common_ancestor = pu.first_common_ancestor(new_neighbor).unwrap();
-                    let common_priority = parent_priorities[&common_ancestor.global_persistent_index()];
-                    crate::trace!("  * Neighborhood ancestor {common_ancestor} has priority {common_priority}");
-                    common_priority
-                })
-                .min().unwrap();
-                crate::trace!("  * Neighbor priority is {}", priority);
-                priority
-            };
 
-            // Initialize distance computation
-            let mut curr_distance = 0;
-            let mut left_idx = worker_idx;
-            let mut right_idx = worker_idx;
-            let last_right_idx = num_workers - 1;
-            neighborhood.clear();
-            neighborhood.push(worker_pus[worker_idx]);
+            // Locate the closest left and right nearest neighbor group
+            // boundaries in group_boundaries, if any, then start iterating over
+            // nearest neighbor group boundaries in both directions
+            let next_right_boundary_idx = group_boundaries
+                .binary_search_by_key(&worker_idx, |(leader_idx, _priority)| *leader_idx)
+                // - If binary_search fails, it returns the location where a new
+                //   boundary could be inserted, which is to the right of any
+                //   existing left group boundary and at the position of any
+                //   existing right group boundary
+                // - If binary_search succeeds, it returns the location of an
+                //   existing boundary positioned where the worker is. Since
+                //   boundaries mark the position of the leftmost element in a
+                //   group, this is the left boundary of the worker's group. And
+                //   the right boundary, if any, is located after it.
+                .map_or_else(|insert_idx| insert_idx, |existing_idx| existing_idx + 1);
+            let mut left_boundaries = group_boundaries
+                .iter()
+                .take(next_right_boundary_idx)
+                .rev()
+                .copied();
+            let mut right_boundaries = group_boundaries
+                .iter()
+                .skip(next_right_boundary_idx)
+                .copied();
+            let mut curr_left_bound = left_boundaries.next();
+            let mut curr_right_bound = right_boundaries.next();
+            crate::debug!(
+                "The boundaries of the worker's nearest neighbor group are \
+                {curr_left_bound:?} and {curr_right_bound:?}"
+            );
+
+            // Fill distances through nearest neighbor set iteration
             distances[worker_idx] = 0;
+            let mut left_end = worker_idx;
+            let mut left_distance_offset = 1;
+            let mut right_start = worker_idx + 1;
+            let mut right_distance_offset = 1;
+            while left_end > 0 && right_start < num_workers - 1 {
+                // Find boundaries of the next nearest neighbor sets
+                let (left_bound_idx, left_bound_priority) = curr_left_bound.unwrap_or((0, 0));
+                let (right_bound_idx, right_bound_priority) =
+                    curr_right_bound.unwrap_or((num_workers, 0));
 
-            // Do bidirectional iteration as long as relevant
-            crate::debug!("Resolving left/right neighbor priorities...");
-            while left_idx > 0 && right_idx < last_right_idx {
-                curr_distance += 1;
-                crate::trace!("- At distance {curr_distance}");
-                let left_priority = neighbor_priority(&neighborhood, left_idx - 1);
-                let right_priority = neighbor_priority(&neighborhood, right_idx + 1);
-                if left_priority >= right_priority {
-                    left_idx -= 1;
-                    crate::trace!("  * Left neighbor {left_idx} is at top priority, register it at current distance {curr_distance}");
-                    distances[left_idx] = curr_distance;
-                    neighborhood.push(worker_pus[left_idx]);
+                // Fill linear distances until the next left and right bounds
+                crate::debug!(
+                    "Filling left neighbor distances \
+                    {left_bound_idx}..{left_end} \
+                    with offset {left_distance_offset}..."
+                );
+                for (local_distance, left_idx) in (left_bound_idx..left_end).rev().enumerate() {
+                    distances[left_idx] =
+                        Distance::try_from(left_distance_offset + local_distance).unwrap();
                 }
-                if left_priority <= right_priority {
-                    right_idx += 1;
-                    crate::trace!("  * Right neighbor {right_idx} is at top priority, register it at current distance {curr_distance}");
-                    distances[right_idx] = curr_distance;
-                    neighborhood.push(worker_pus[right_idx]);
+                crate::debug!(
+                    "Filling right neighbor distances \
+                    {right_start}..{right_bound_idx} \
+                    with offset {right_distance_offset}..."
+                );
+                for (local_distance, right_idx) in (right_start..right_bound_idx).enumerate() {
+                    distances[right_idx] =
+                        Distance::try_from(right_distance_offset + local_distance).unwrap();
                 }
-            }
 
-            // Finish with unidirectional iteration
-            crate::debug!("Adding remaining neighbors...");
-            loop {
-                curr_distance += 1;
-                if left_idx > 0 {
-                    left_idx -= 1;
-                    distances[left_idx] = curr_distance;
-                } else if right_idx < last_right_idx {
-                    right_idx += 1;
-                    distances[right_idx] = curr_distance;
-                } else {
-                    break;
+                // Account for the linear distances we just filled
+                let num_left_elems = left_end - left_bound_idx;
+                let num_right_elems = right_bound_idx - right_start;
+                left_end = left_bound_idx;
+                right_start = right_bound_idx;
+
+                // Adjust subsequent left and right distances every worker
+                // outside of the local nearest neighbour group is at a higher
+                // distance than workers inside of the nearest neighbor group
+                let max_elems = num_left_elems.max(num_right_elems);
+                left_distance_offset += max_elems;
+                right_distance_offset += max_elems;
+
+                // Schedule exploring workers further away on the left and/or
+                // the right hand side, depending on relative priorities
+                if curr_left_bound.is_some() && left_bound_priority >= right_bound_priority {
+                    curr_left_bound = left_boundaries.next();
+                    crate::debug!("Will now explore left neigbors until {curr_left_bound:?}");
+                }
+                if curr_right_bound.is_some() && left_bound_priority <= right_bound_priority {
+                    curr_right_bound = right_boundaries.next();
+                    crate::debug!("Will now explore right neigbors until {curr_right_bound:?}");
                 }
             }
             crate::debug!("Distances are ready!");
