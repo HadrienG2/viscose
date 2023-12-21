@@ -170,7 +170,7 @@ impl Distances {
             let mut left_distance_offset = 1;
             let mut right_start = worker_idx + 1;
             let mut right_distance_offset = 1;
-            while left_end > 0 || right_start < num_workers - 1 {
+            while left_end > 0 || right_start < num_workers {
                 // Find boundaries of the next nearest neighbor sets
                 let (left_bound_idx, left_bound_priority) = curr_left_bound.unwrap_or((0, 0));
                 let (right_bound_idx, right_bound_priority) =
