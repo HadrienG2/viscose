@@ -8,10 +8,12 @@ fn criterion_benchmark(c: &mut Criterion) {
             () => {
                 // I picked these values because...
                 // - Each f32 is 4 bytes
-                // - Hyperthreads share the L1 cache, so the theoretical HT
-                //   sweet spot is to use half of it: 16 KiB/thread -> 4096 f32s
-                // - The non-HT sweet spot is 32 KiB/thread -> 8192 f32s
-                bench_square!(12, 13);
+                // - 2^13 = 8192 f32 = 32 KiB = capacity of L1 cache, which
+                //   would be the expected optimal sequential working set if
+                //   work distribution overheads were not an issue.
+                // - Typical L2 capacity is between 256 KiB and 1024 KiB, with
+                //   lower being most common
+                bench_square!(13, 16/*, 17, 18*/);
             };
             ($($block_size_pow2:expr),*) => {$(
                 {
