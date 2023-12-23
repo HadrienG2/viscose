@@ -393,14 +393,14 @@ impl WaitingState {
     fn wait(&mut self, blocking_wait: impl FnOnce()) {
         // Start by spinning with a bit of exponential backoff
         if self.spin_iters_since_yield <= SPIN_ITERS_BEFORE_YIELD {
-            if self.spin_iters_per_check < MAX_SPIN_ITERS_PER_CHECK {
-                self.spin_iters_per_check =
-                    (2 * self.spin_iters_per_check).min(MAX_SPIN_ITERS_PER_CHECK);
-            }
             for _ in 0..self.spin_iters_per_check {
                 std::hint::spin_loop()
             }
             self.spin_iters_since_yield += usize::from(self.spin_iters_per_check);
+            if self.spin_iters_per_check < MAX_SPIN_ITERS_PER_CHECK {
+                self.spin_iters_per_check =
+                    (2 * self.spin_iters_per_check).min(MAX_SPIN_ITERS_PER_CHECK);
+            }
         } else if OS_WAIT_DELAY > Duration::from_nanos(0)
             && self.waiting_start.elapsed() < OS_WAIT_DELAY
         {
