@@ -20,7 +20,7 @@ pub use crate::{pool::ThreadPool, worker::scope::Scope};
 ///
 /// This is a compromise between avoiding sleep and wakeup latency on one side,
 /// and keeping idle threads asleep on the other side.
-const OS_WAIT_DELAY: Duration = Duration::from_nanos(1000);
+const OS_WAIT_DELAY: Duration = Duration::from_nanos(0);
 
 /// Sleep duration used to yield the CPU to the OS
 ///
@@ -31,7 +31,7 @@ const YIELD_DURATION: Duration = Duration::from_nanos(1);
 const SPIN_ITERS_BEFORE_YIELD: usize = 1 << 7;
 
 /// Maximal number of spinning iterations between attempts to look for work
-const MAX_SPIN_ITERS_PER_CHECK: u8 = 8;
+const MAX_SPIN_ITERS_PER_CHECK: u8 = 4;
 
 /// Function that can be scheduled for execution by the thread pool
 ///

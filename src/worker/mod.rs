@@ -14,7 +14,12 @@ use crate::{
     MAX_SPIN_ITERS_PER_CHECK, OS_WAIT_DELAY, SPIN_ITERS_BEFORE_YIELD, YIELD_DURATION,
 };
 use crossbeam::deque::{self, Steal};
-use std::{cell::Cell, debug_assert, sync::atomic::Ordering, time::Instant};
+use std::{
+    cell::Cell,
+    debug_assert,
+    sync::atomic::Ordering,
+    time::{Duration, Instant},
+};
 
 /// Worker thread state
 #[derive(Debug)]
@@ -386,6 +391,7 @@ impl WaitingState {
     /// Do a spin loop iteration, periodically yielding to the kernel scheduler,
     /// until the time comes to block the thread
     fn wait(&mut self, blocking_wait: impl FnOnce()) {
+        // Start by spinning with a bit of exponential backoff
         if self.spin_iters_since_yield <= SPIN_ITERS_BEFORE_YIELD {
             if self.spin_iters_per_check < MAX_SPIN_ITERS_PER_CHECK {
                 self.spin_iters_per_check =
@@ -394,11 +400,15 @@ impl WaitingState {
             for _ in 0..self.spin_iters_per_check {
                 std::hint::spin_loop()
             }
-        } else if self.waiting_start.elapsed() < OS_WAIT_DELAY {
-            // ...periodically yielding to the kernel scheduler...
+            self.spin_iters_since_yield += usize::from(self.spin_iters_per_check);
+        } else if OS_WAIT_DELAY > Duration::from_nanos(0)
+            && self.waiting_start.elapsed() < OS_WAIT_DELAY
+        {
+            // Periodically yield to the OS scheduler if configured to do so
             std::thread::sleep(YIELD_DURATION);
             self.spin_iters_since_yield = 0;
         } else {
+            // Block on the futex once configured grace period has expired
             blocking_wait()
         }
     }
