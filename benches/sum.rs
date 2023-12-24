@@ -19,12 +19,13 @@ fn criterion_benchmark(c: &mut Criterion) {
             ) => {$(
                 // I picked these values because...
                 // - Each f32 is 4 bytes
-                // - 2^13 = 8192 f32 = 32 KiB = capacity of L1 cache, which
+                // - 2^12 = 8192 f32 = 16 KiB = 1/2 capacity of L1 cache, which
                 //   would be the expected optimal sequential working set if
                 //   work distribution overheads were not an issue.
                 // - Typical L2 capacity is between 256 KiB and 1024 KiB, with
-                //   lower being most common
-                bench_sum!(ilp$ilp_streams/block_pow2[13, 16/*, 17, 18*/]);
+                //   lower being most common, and again using half capacity is
+                //   often best.
+                bench_sum!(ilp$ilp_streams/block_pow2[12, 15/*, 16, 17, 18*/]);
             )*};
             (
                 ilp$ilp_streams:literal/block_pow2[$($block_size_pow2:literal),*]

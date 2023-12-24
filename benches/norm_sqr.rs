@@ -24,7 +24,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                 //   work distribution overheads were not an issue.
                 // - Typical L2 capacity is between 256 KiB and 1024 KiB, with
                 //   lower being most common
-                bench_norm_sqr!(ilp$ilp_streams/block_pow2[13, 16/*, 17, 18*/]);
+                bench_norm_sqr!(ilp$ilp_streams/block_pow2[12/*, 13, 15, 16, 17, 18*/]);
             )*};
             (
                 ilp$ilp_streams:literal/block_pow2[$($block_size_pow2:literal),*]
