@@ -58,22 +58,22 @@ const MAX_SPIN_ITERS_PER_CHECK: u8 = 4;
 /// order to achieve a more balanced workload.
 const DESIRED_PARALLEL_EFFICIENCY: f32 = 0.85;
 
-/// Default load-balancing margin
+/// Default oversubscription factor
 ///
 /// In an ideal world, running tasks efficiently over 16 CPU cores would only
 /// require creating 16 subtasks through 4 recursive task-splitting passes.
-/// However, the real world is messier than this: the two arms of a `join()`
-/// statement will rarely have a perfectly equal workload, the system's CPU
-/// cores may not have equal performance (think big.LITTLE ARM chips like Apple
-/// Mx), run-time issues like intermittent background tasks may slow down some
-/// workers relative to others, etc.
+/// However, the real world tends to be messier than this: the two arms of a
+/// `join()` statement will rarely have a perfectly equal workload, the system's
+/// CPU cores may not have equal performance (think big.LITTLE ARM chips like
+/// Apple Mx), run-time issues like intermittent background tasks may slow down
+/// some workers relative to others, etc.
 ///
-/// To account for this, you should usually split tasks a bit more than you
-/// need, so that CPUs which processed their tasks quickly can help other CPUs
-/// which are still struggling with their own workload, a form of load
-/// balancing. However, splitting tasks is not free, so you should not overdo it
-/// more than necessary either. Indeed, it is possible to find pathological
-/// workloads for which oversplitting is never worthwhile.
+/// To account for this, you may want to split tasks a bit more than you need,
+/// so that CPUs which processed their tasks quickly can help other CPUs which
+/// are still struggling with their own workload, a form of load balancing.
+/// However, splitting tasks is not free, so you should not overdo it more than
+/// necessary either. Indeed, it is possible to find pathological workloads for
+/// which such oversubscription is never worthwhile.
 ///
 /// The right compromise here is both system- and workload-dependent, so it
 /// should ideally be tuned on a per-`join()` and per-target-system basis. But
@@ -93,7 +93,7 @@ const DESIRED_PARALLEL_EFFICIENCY: f32 = 0.85;
 /// This is a multiplicative factor applied on top of the system's CPU count to
 /// determine the optimal number of tasks, which should be higher than or equal
 /// to 1.
-const DEFAULT_LOAD_BALANCING_MARGIN: f32 = 2.0;
+const DEFAULT_OVERSUBSCRIPTION: f32 = 1.0;
 
 /// Function that can be scheduled for execution by the thread pool
 ///

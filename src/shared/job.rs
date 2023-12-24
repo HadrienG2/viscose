@@ -1,8 +1,6 @@
 //! Thread pool job
 
-use crate::{
-    worker::scope::Scope, Work, DEFAULT_LOAD_BALANCING_MARGIN, DESIRED_PARALLEL_EFFICIENCY,
-};
+use crate::{worker::scope::Scope, Work, DEFAULT_OVERSUBSCRIPTION, DESIRED_PARALLEL_EFFICIENCY};
 use std::{cell::UnsafeCell, panic::AssertUnwindSafe};
 
 /// Aborts the process if dropped
@@ -181,10 +179,10 @@ impl Schedule {
         // safety margin to account for non-balanced joins, heterogeneous
         // hardware and non-ideal execution conditions.
         assert!(
-            DEFAULT_LOAD_BALANCING_MARGIN >= 1.0,
-            "load balancing margins are about exposing more concurrency, not less"
+            DEFAULT_OVERSUBSCRIPTION >= 1.0,
+            "oversubscription is about exposing more concurrency, not less"
         );
-        let desired_num_tasks = ((num_workers as f32) * DEFAULT_LOAD_BALANCING_MARGIN).ceil();
+        let desired_num_tasks = ((num_workers as f32) * DEFAULT_OVERSUBSCRIPTION).ceil();
         if desired_num_tasks > usize::MAX as f32 {
             return Self {
                 remaining_par_joins: u8::MAX,
