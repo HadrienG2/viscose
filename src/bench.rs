@@ -155,6 +155,7 @@ pub struct LocalFloatsSlice<'target, const BLOCK_LEN: usize> {
 impl<'target, const BLOCK_LEN: usize> LocalFloatsSlice<'target, BLOCK_LEN> {
     /// Split into two halves and process the halves if this slice more than one
     /// block long, otherwise process that single block sequentially
+    #[inline(always)]
     pub fn process<R: Send>(
         &mut self,
         parallel: impl FnOnce([LocalFloatsSlice<'_, BLOCK_LEN>; 2]) -> R,
