@@ -9,7 +9,7 @@ use self::{
     distances::{Distance, Distances},
     flags::{bitref::BitRef, AtomicFlags},
     futex::{StealLocation, WorkerFutex},
-    job::DynJob,
+    job::{Schedule, Task},
 };
 use crossbeam::{
     deque::{self, Injector, Steal, Stealer},
@@ -26,7 +26,7 @@ use std::{
 #[derive(Debug)]
 pub(crate) struct SharedState {
     /// Global work injector
-    injector: Injector<DynJob>,
+    injector: Injector<Task>,
 
     /// Worker interfaces
     pub workers: Box<[CachePadded<WorkerInterface>]>,
@@ -46,6 +46,9 @@ pub(crate) struct SharedState {
 
     /// Distances between workers
     pub distances: Distances,
+
+    /// Default task scheduling properties
+    pub default_schedule: Schedule,
 }
 //
 impl SharedState {
@@ -76,11 +79,13 @@ impl SharedState {
         }
 
         // Set up global shared state
+        let default_schedule = Schedule::new(num_workers);
         let result = Arc::new(Self {
             injector: Injector::new(),
             workers: worker_interfaces.into(),
             work_availability: AtomicFlags::new(num_workers),
             distances,
+            default_schedule,
         });
         (result, worker_configs.into())
     }
@@ -143,25 +148,25 @@ impl SharedState {
     /// notification has not been received. This entails in particular that all
     /// code including spawn_unchecked until the point where the remote task has
     /// signaled completion should translate unwinding panics to aborts.
-    pub unsafe fn inject_job(&self, job: DynJob, local_worker_idx: usize) {
-        self.injector.push(job);
+    pub unsafe fn inject_task(&self, task: Task, local_worker_idx: usize) {
+        self.injector.push(task);
         self.suggest_stealing::<true, false>(
             &self.work_availability.bit(local_worker_idx),
             self.distances.from(local_worker_idx),
             StealLocation::Injector,
-            // Need at least Release ordering to ensure injected job is visible
+            // Need at least Release ordering to ensure injected task is visible
             // to the target and don't need anything stronger:
             //
             // - Don't need AcqRel ordering since the thread that's pushing work
             //   does not want to get in sync with the target worker's state.
             // - Don't need SeqCst since there is no need for everyone to agree
-            //   on the global order of job injection events.
+            //   on the global order of task injection events.
             Ordering::Release,
         );
     }
 
-    /// Steal a job from the global work injector
-    pub fn steal_from_injector(&self) -> Steal<DynJob> {
+    /// Steal a task from the global work injector
+    pub fn steal_from_injector(&self) -> Steal<Task> {
         self.injector.steal()
     }
 
@@ -189,7 +194,7 @@ impl SharedState {
         task_location: StealLocation,
         update: Ordering,
     ) {
-        // Check if there are job-less neighbors to submit work to...
+        // Check if there are jobless neighbors to submit work to...
         //
         // Need Acquire ordering so the futex is only read/modified after a work
         // unavailability signal is observed: compilers and CPUs should not
@@ -205,7 +210,7 @@ impl SharedState {
             return;
         };
 
-        // ...and if so, tell the closest one about our newly submitted job
+        // ...and if so, tell the closest one about our newly submitted task
         #[cold]
         fn unlikely<'self_, const CACHE_SEARCH_MASKS: bool>(
             self_: &'self_ SharedState,
@@ -214,7 +219,7 @@ impl SharedState {
             task_location: StealLocation,
             update: Ordering,
         ) {
-            // Iterate over increasingly remote job-less neighbors
+            // Iterate over increasingly remote jobless neighbors
             let local_worker = local_worker.linear_idx(&self_.work_availability);
             for closest_asleep in asleep_neighbors {
                 // Update their futex recommendation as appropriate
@@ -250,7 +255,7 @@ impl SharedState {
 #[doc(hidden)]
 pub(crate) struct WorkerConfig {
     /// Work queue
-    pub work_queue: deque::Worker<DynJob>,
+    pub work_queue: deque::Worker<Task>,
 
     /// CPU which this worker should be pinned to
     pub cpu: BitmapIndex,
@@ -260,7 +265,7 @@ pub(crate) struct WorkerConfig {
 #[derive(Debug)]
 pub(crate) struct WorkerInterface {
     /// A way to steal from the worker
-    pub stealer: Stealer<DynJob>,
+    pub stealer: Stealer<Task>,
 
     /// Futex that the worker sleeps on when it has nothing to do, used to
     /// instruct it what to do when it is awakened.

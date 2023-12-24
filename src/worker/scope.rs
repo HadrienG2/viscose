@@ -7,7 +7,7 @@ use super::Worker;
 use crate::{
     shared::{
         futex::WorkerFutex,
-        job::{AbortOnUnwind, DynJob, Job, Notify},
+        job::{AbortOnUnwind, Job, Notify, Schedule, Task},
     },
     Work,
 };
@@ -20,18 +20,24 @@ use std::{
 /// Scope for executing parallel work
 ///
 /// This is a token which attests that work is executing within the context of a
-/// worker thread insid of the thread pool, and can be used to schedule work on
+/// worker thread inside of the thread pool, and can be used to schedule work on
 /// said thread pool.
 #[derive(Debug)]
-pub struct Scope<'scope>(AssertUnwindSafe<&'scope Worker<'scope>>);
+pub struct Scope<'scope> {
+    /// Worker that is executing this work
+    worker: AssertUnwindSafe<&'scope Worker<'scope>>,
+
+    /// Scheduling constraints of this job
+    schedule: Schedule,
+}
 //
 impl<'scope> Scope<'scope> {
     /// Provide an opportunity for fork-join parallelism
     ///
-    /// Run the `local` task, while leaving the `remote` task available for
-    /// other worker threads to steal. If no other thread takes over the job, do
-    /// it ourselves. Wait for both tasks to be complete before moving on, while
-    /// participating to thread pool execution in meantime.
+    /// Run the `local` work on this thread, possibly making the `remote` work
+    /// available for other threads to steal and execute. If no other thread
+    /// takes over the `remote` work, do it ourselves. Wait for both tasks to be
+    /// complete before moving on.
     pub fn join<LocalFn, LocalRes, RemoteFn, RemoteRes>(
         &self,
         local: LocalFn,
@@ -42,6 +48,17 @@ impl<'scope> Scope<'scope> {
         RemoteFn: Work<RemoteRes>,
         RemoteRes: Send,
     {
+        // Handle sequential join fast path
+        if !self.schedule.parallelize_join() {
+            return (
+                local(),
+                remote(&Self {
+                    worker: AssertUnwindSafe(self.worker.0),
+                    schedule: self.schedule.child_schedule(),
+                }),
+            );
+        }
+
         // Set up remote job and its completion notification mechanism
         //
         // The join start notification, if any, must be Acquire so it's not
@@ -50,9 +67,9 @@ impl<'scope> Scope<'scope> {
         // avoid spurious join counter overflow, there is no need to add a
         // Release barrier for this because the Acquire barrier at the end of
         // the previous join will already enforce the desired ordering.
-        let futex = &self.0.futex;
+        let futex = &self.worker.futex;
         #[cfg(feature = "detect-excessive-joins")]
-        self.0.futex.start_join(Ordering::Acquire);
+        self.worker.futex.start_join(Ordering::Acquire);
         let remote_finished = AtomicBool::new(false);
         let notify = NotifyJoin {
             futex,
@@ -63,11 +80,11 @@ impl<'scope> Scope<'scope> {
         // No unwinding panics allowed until the remote task has completed
         let local_result = {
             // Spawn remote task
-            // SAFETY: We wait for the job to complete before letting it go out
-            //         of scope or otherwise touching it in any way, and panics
-            //         are translated to aborts until it's done executing.
+            // SAFETY: We'll wait for the job to complete before letting it go
+            //         out of scope or otherwise touching it, and panics are
+            //         translated to aborts until it's done executing.
             let abort_on_unwind = AbortOnUnwind;
-            unsafe { self.spawn_unchecked(remote_job.as_dyn()) };
+            unsafe { self.spawn_unchecked(remote_job.make_task(self.schedule.child_schedule())) };
 
             // Run local task
             let local_result = std::panic::catch_unwind(AssertUnwindSafe(local));
@@ -75,7 +92,7 @@ impl<'scope> Scope<'scope> {
             // Execute thread pool work while waiting for remote task,
             // synchronize with the remote task once it completes
             while !remote_finished.load(Ordering::Relaxed) {
-                self.0.step();
+                self.worker.step();
             }
             atomic::fence(Ordering::Acquire);
             std::mem::forget(abort_on_unwind);
@@ -93,12 +110,16 @@ impl<'scope> Scope<'scope> {
 
     /// Numerical identifier of the worker thread this job runs on
     pub fn worker_id(&self) -> usize {
-        self.0.idx
+        self.worker.idx
     }
 
-    /// Set up a scope associated with a particular worker thread
-    pub(super) fn new(worker: &'scope Worker<'scope>) -> Self {
-        Self(AssertUnwindSafe(worker))
+    /// Set up a scope, associated with a particular worker thread and with
+    /// certain scheduling properties
+    pub(super) fn new(worker: &'scope Worker<'scope>, schedule: Schedule) -> Self {
+        Self {
+            worker: AssertUnwindSafe(worker),
+            schedule,
+        }
     }
 
     /// Schedule work for execution on the thread pool, without lifetime checks
@@ -113,9 +134,9 @@ impl<'scope> Scope<'scope> {
     /// code including spawn_unchecked until the point where the remote task has
     /// signaled completion should translate unwinding panics to aborts.
     #[inline(always)]
-    unsafe fn spawn_unchecked(&self, job: DynJob) {
+    unsafe fn spawn_unchecked(&self, task: Task) {
         // Schedule the work to be executed
-        self.0.work_queue.push(job);
+        self.worker.work_queue.push(task);
 
         // ...and once this push is visible...
         //
@@ -126,15 +147,15 @@ impl<'scope> Scope<'scope> {
 
         // ...tell the entire world that we now have work available to steal if
         // they didn't know about it before...
-        self.0.work_available.set(Ordering::Relaxed);
+        self.worker.work_available.set(Ordering::Relaxed);
 
         // ...and personally notify the closest starving thread about it
         // This doesn't need to be ordered after the setting of work_available
         // because workers following a direct work-stealing recommendation do
         // not check the work_availability bits.
-        self.0.shared.suggest_stealing_from_worker(
-            &self.0.work_available.bit,
-            self.0.distances,
+        self.worker.shared.suggest_stealing_from_worker(
+            &self.worker.work_available.bit,
+            self.worker.distances,
             Ordering::Relaxed,
         );
     }

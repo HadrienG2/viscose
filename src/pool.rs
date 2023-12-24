@@ -2,7 +2,7 @@
 
 use crate::{
     shared::{
-        job::{AbortOnUnwind, DynJob, Job, Notify},
+        job::{AbortOnUnwind, Job, Notify, Task},
         SharedState,
     },
     worker::Worker,
@@ -125,7 +125,7 @@ impl ThreadPool {
             //         of scope or otherwise touching it in any way, and panics
             //         are translated to aborts until it's done executing.
             let abort_on_unwind = AbortOnUnwind;
-            unsafe { self.spawn_unchecked(job.as_dyn()) };
+            unsafe { self.spawn_unchecked(job.make_task(self.shared.default_schedule)) };
 
             // Wait for the end of job execution then synchronize
             while !finished.load(Ordering::Relaxed) {
@@ -150,7 +150,7 @@ impl ThreadPool {
     /// notification has not been received. This entails in particular that all
     /// code including spawn_unchecked until the point where the remote task has
     /// signaled completion should translate unwinding panics to aborts.
-    unsafe fn spawn_unchecked(&self, job: DynJob) {
+    unsafe fn spawn_unchecked(&self, task: Task) {
         // Determine the caller's current CPU location to decide which worker
         // thread would be best placed for processing this task
         let caller_cpu = self
@@ -171,7 +171,7 @@ impl ThreadPool {
             });
 
         // Schedule the work to be executed
-        self.shared.inject_job(job, local_worker_idx);
+        self.shared.inject_task(task, local_worker_idx);
     }
 }
 //

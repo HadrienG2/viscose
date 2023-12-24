@@ -33,6 +33,68 @@ const SPIN_ITERS_BEFORE_YIELD: usize = 1 << 7;
 /// Maximal number of spinning iterations between attempts to look for work
 const MAX_SPIN_ITERS_PER_CHECK: u8 = 4;
 
+/// Desired parallel execution efficiency on odd-core-count CPUs
+///
+/// On CPUs whose number of cores is not a power of two, the convenience and
+/// scalability of binary fork-join APIs comes at the cost of some structural
+/// load imbalance. For example, assuming you have 12 CPU cores, splitting a
+/// task 3 times creates 2^3 = 8 subtasks, which is not enough to feed all 12
+/// CPU cores. But splitting it 4 times creates 2^4 = 16 subtasks, which after
+/// handing each core a subtask leaves 4 remaining subtasks, which again does
+/// not distribute evenly across 12 CPU cores.
+///
+/// Because powers of two are not divisble by any number other than smaller
+/// powers of two, and because the only scalable approach (not requiring
+/// all-to-all worker communication) to creating more subtasks in binary fork
+/// join is to split each previously spawned subtask in two, we cannot never
+/// fully eliminate this load imbalance. However, we can make the imbalance
+/// arbitrarily low by splitting tasks more and more, at the expense of spending
+/// more CPU time scheduling and awaiting subtasks, and reducing the sequential
+/// execution efficiency of individual subtasks.
+///
+/// This tuning parameter should be set between 0.5 and 1.0, exclusive on both
+/// bounds. It lets you tune the compromise between the two aforementioned
+/// concerns. Tuning it higher encourages the runtime to split tasks more in
+/// order to achieve a more balanced workload.
+const DESIRED_PARALLEL_EFFICIENCY: f32 = 0.85;
+
+/// Default load-balancing margin
+///
+/// In an ideal world, running tasks efficiently over 16 CPU cores would only
+/// require creating 16 subtasks through 4 recursive task-splitting passes.
+/// However, the real world is messier than this: the two arms of a `join()`
+/// statement will rarely have a perfectly equal workload, the system's CPU
+/// cores may not have equal performance (think big.LITTLE ARM chips like Apple
+/// Mx), run-time issues like intermittent background tasks may slow down some
+/// workers relative to others, etc.
+///
+/// To account for this, you should usually split tasks a bit more than you
+/// need, so that CPUs which processed their tasks quickly can help other CPUs
+/// which are still struggling with their own workload, a form of load
+/// balancing. However, splitting tasks is not free, so you should not overdo it
+/// more than necessary either. Indeed, it is possible to find pathological
+/// workloads for which oversplitting is never worthwhile.
+///
+/// The right compromise here is both system- and workload-dependent, so it
+/// should ideally be tuned on a per-`join()` and per-target-system basis. But
+/// of course this would have terrible ergonomics in typical use cases where
+/// trading a little inefficiency for convenience is perfectly fine. Hence we go
+/// for a tiered approach:
+///
+/// - By default, we apply a certain safety margin which is empirically tuned to
+///   work well for typical hardware and workloads.
+/// - When creating a thread pool, if you know that all your tasks are very
+///   (irr-)regular or that your hardware is heterogeneous, you can override the
+///   default margin for all tasks spawned in that thread pool.
+/// - For ultimate performance, you can fine tune individual `run()` and
+///   `join()` statements by applying a multiplicative factor to the pool's
+///   default safety margin.
+///
+/// This is a multiplicative factor applied on top of the system's CPU count to
+/// determine the optimal number of tasks, which should be higher than or equal
+/// to 1.
+const DEFAULT_LOAD_BALANCING_MARGIN: f32 = 2.0;
+
 /// Function that can be scheduled for execution by the thread pool
 ///
 /// The input [`Scope`] allows the scheduled work to interact with the thread

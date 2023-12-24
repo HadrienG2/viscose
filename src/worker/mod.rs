@@ -8,7 +8,7 @@ use crate::{
         distances::Distance,
         flags::bitref::BitRef,
         futex::{StealLocation, WorkerFutex, WorkerFutexState},
-        job::DynJob,
+        job::Task,
         SharedState,
     },
     MAX_SPIN_ITERS_PER_CHECK, OS_WAIT_DELAY, SPIN_ITERS_BEFORE_YIELD, YIELD_DURATION,
@@ -31,7 +31,7 @@ pub(crate) struct Worker<'pool> {
     idx: usize,
 
     /// Work queue tracking work privately spawned by this worker
-    work_queue: deque::Worker<DynJob>,
+    work_queue: deque::Worker<Task>,
 
     /// Bit of this thread in `SharedState::work_availability`
     ///
@@ -63,7 +63,7 @@ pub(crate) struct Worker<'pool> {
 //
 impl<'pool> Worker<'pool> {
     /// Set up and run the worker
-    pub fn run(shared: &'pool SharedState, idx: usize, work_queue: deque::Worker<DynJob>) {
+    pub fn run(shared: &'pool SharedState, idx: usize, work_queue: deque::Worker<Task>) {
         let worker = Self {
             shared,
             idx,
@@ -107,12 +107,12 @@ impl<'pool> Worker<'pool> {
     }
 
     /// Process one incoming task
-    fn process_task(&self, job: DynJob) {
-        let scope = Scope::new(self);
-        // SAFETY: All methods that push [`DynJob`]s into the thread pool ensure
+    fn process_task(&self, task: Task) {
+        let scope = Scope::new(self, task.schedule);
+        // SAFETY: All methods that push [`Task`]s into the thread pool ensure
         //         that the associated [`Job`] cannot go out of scope until it
         //         is done executing.
-        unsafe { job.run(&scope) };
+        unsafe { task.run(&scope) };
     }
 
     /// Handle absence of work in our private work queue
@@ -302,7 +302,7 @@ impl<'pool> Worker<'pool> {
     ///
     /// Return truth that a task was successfully stolen and run.
     #[inline(always)]
-    fn steal_with(&self, mut attempt: impl FnMut() -> Steal<DynJob>) -> bool {
+    fn steal_with(&self, mut attempt: impl FnMut() -> Steal<Task>) -> bool {
         loop {
             match attempt() {
                 Steal::Success(task) => {
