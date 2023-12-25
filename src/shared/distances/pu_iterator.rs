@@ -51,7 +51,7 @@ impl<'topology> PUIterator<'topology> {
 
         // We'll simplify the topology by collapsing chains of nodes with a
         // single child into a single node
-        let children_in_cpuset = |obj| super::children_in_cpuset(obj, affinity);
+        let children_in_cpuset = |obj| crate::children_in_cpuset(obj, affinity);
         let id = |obj: &TopologyObject| obj.global_persistent_index();
         let simplify_node = |mut obj| {
             crate::debug!("Simplifying topology object {obj}...");

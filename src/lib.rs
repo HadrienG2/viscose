@@ -8,9 +8,11 @@
 #[cfg(feature = "bench")]
 pub mod bench;
 mod pool;
+mod priority;
 mod shared;
 mod worker;
 
+use hwlocality::{cpu::cpuset::CpuSet, object::TopologyObject};
 use std::{sync::atomic::Ordering, time::Duration};
 
 // Re-export components that are part of the public interface
@@ -200,12 +202,26 @@ pub(crate) fn topology() -> &'static std::sync::Arc<hwlocality::Topology> {
     INSTANCE.get_or_init(|| Arc::new(Topology::new().unwrap()))
 }
 
+/// Select normal children of a node that match the affinity mask
+fn children_in_cpuset<'iterator, 'parent: 'iterator>(
+    parent: &'parent TopologyObject,
+    affinity: &'iterator CpuSet,
+) -> impl DoubleEndedIterator<Item = &'parent TopologyObject> + Clone + 'iterator {
+    parent.normal_children().filter(move |child| {
+        child
+            .cpuset()
+            .expect("normal objects should have cpuset")
+            .intersects(affinity)
+    })
+}
+
 #[allow(unused_imports)]
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use std::panic::UnwindSafe;
 
+    #[allow(unused)]
     pub(crate) fn assert_panics<R>(op: impl FnOnce() -> R + UnwindSafe) {
         assert!(std::panic::catch_unwind(op).is_err());
     }
