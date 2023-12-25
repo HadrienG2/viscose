@@ -270,6 +270,9 @@ pub fn priorize_load_balancing(
 //            sockets and instead start with the most remote _relevant_ resource
 //            within a CPU socket for the purpose of distributing work to 16 CPU
 //            cores: L3 shard, CPU core within an L3 shard...
+//          * Note that this may require tracking how many CPU cores we fail to
+//            distribute work to when we skip over a topology depth. And the
+//            answer may be worker dependent on asymmetric topologies.
 //          * If the task is expected to be memory-bound, then we use a variant
 //            of the above process where we do not drop _all_ entries at the
 //            beginning of the priority list, but instead keep topology nodes
