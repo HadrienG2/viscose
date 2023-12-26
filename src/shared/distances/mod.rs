@@ -59,8 +59,11 @@ impl Distances {
 
         // Look up in which place of the topology work distribution decisions
         // must be made, and priorize those decisions
-        let parent_priorities =
-            priority::priorize_load_balancing(topology, affinity, &JobProperties::default());
+        let parent_priorities = priority::load_balancing_priorities(
+            &priority::parents_by_typed_depth(topology, affinity),
+            // FIXME: Propagate JobProperties from the thread pool
+            &JobProperties::default(),
+        );
 
         // Order PUs in such a way that neighbor PUs have high odds of being the
         // best targets for load balancing transactions (and indeed always are

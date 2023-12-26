@@ -47,7 +47,7 @@
 //!       execution process as early as possible.
 //!     * Communication with remote CPU cores is expensive, so we want to do it
 //!       as few times as possible throughout the job execution process. By
-//!       sending the biggest possible chunks of work to remote workers, we
+//!       sending the largest possible chunks of work to remote workers, we
 //!       maximally amortize the long-distance communication overhead and ensure
 //!       that they won't need to get back to us looking for more work during
 //!       the longest possible amount of time.
@@ -88,10 +88,13 @@
 
 use hwlocality::{
     cpu::cpuset::CpuSet,
-    object::{depth::NormalDepth, types::ObjectType, TopologyObjectID},
+    object::{depth::NormalDepth, types::ObjectType, TopologyObject, TopologyObjectID},
     Topology,
 };
-use std::collections::{HashMap, VecDeque};
+use std::{
+    collections::{HashMap, VecDeque},
+    num::NonZeroUsize,
+};
 
 /// Workload properties that influence scheduling
 ///
@@ -120,9 +123,9 @@ pub struct JobProperties {
     /// split into, i.e. the maximal parallelism that a job can achieve for some
     /// subset of its execution time, assuming perfect scheduling.
     ///
-    /// By default, we optimize scheduling for jobs that can be split enough to
+    /// By default, scheduling is optimized for jobs that can be split enough to
     /// use all available CPU cores in the thread pool.
-    maximal_concurrency: Option<usize>,
+    maximal_concurrency: Option<NonZeroUsize>,
 
     /// Job benefits more from extra hyperthreads than from extra CPU cores
     ///
@@ -132,13 +135,13 @@ pub struct JobProperties {
     /// should be considered more beneficial than spreading it across CPU cores.
     ///
     /// Hyperthreading normally works best when it is used to execute unrelated
-    /// jobs, as multiple subtasks of a single job would contend for the same
-    /// shared CPU core resources. This means that distributing work from a
+    /// jobs, as multiple subtasks of a single job would likely contend for the
+    /// same shared CPU core resources. This means that distributing work from a
     /// single job across hyperthreads should be at the bottom of a CPU
     /// scheduler's work distribution priority list, which is what leaving this
     /// setting at its default `false` value achieves.
     ///
-    /// However, there are a few edge cases where distributing across
+    /// However, there are a few edge cases where distributing work across
     /// hyperthreads is more beneficial, typically involving very short-lived
     /// subtasks bound by scheduling overhead or some other kind of inter-thread
     /// communication bottleneck. When you encounter one of these edge cases,
@@ -148,13 +151,13 @@ pub struct JobProperties {
     /// Job benefits more from extra NUMA nodes than from extra CPU cores
     ///
     /// This asserts that a job's execution speed is bound by DRAM bandwidth
-    /// more than any CPU resource. As a result, the top priority when
+    /// more than any other CPU resource. As a result, the top priority when
     /// scheduling this job should be to spread its subtasks across NUMA nodes,
     /// not to optimize the use of intra-node ressources like CPU caches.
     ///
     /// While most real-world programs are memory bound, not all of them can
     /// efficiently leverage multiple NUMA nodes. Automatic OS NUMA management
-    /// tends to be unsatisfactory, requiring some degree of manual memory
+    /// tends to be highly imperfect, requiring some degree of manual memory
     /// locality tuning that typical programs do not engage in. As a result, the
     /// best default is to spread unrelated tasks across NUMA nodes, and this is
     /// what leaving this setting at its default `false` value achieves.
@@ -164,32 +167,15 @@ pub struct JobProperties {
     prefer_numa_over_cores: bool,
 }
 
-/// Priority of a topology node
+/// Enumerate multi-children hardware topology nodes, grouped by increasing
+/// depth/locality, and annotated with the object type at each depth
 ///
-/// When distributing work across CPU cores, the task scheduler will focus first
-/// on having the workload cover all children of the highest-priority nodes,
-/// then all children of the next highest-priority nodes, and so on.
-pub type Priority = usize;
-
-/// Priorize multi-children hardware topology nodes for load balancing, assuming
-/// a certain typical thread pool workload
-///
-/// This function gives topology nodes a priority for the purpose of load
-/// balancing, i.e. exchanging work between worker threads after the initial job
-/// startup to minimize the number of idle CPU threads.
-///
-/// For each PU in use, each ancestor that has other children with PUs is given
-/// a priority that differs from that of the other ancestors of that PU. At
-/// runtime, the worker associated with the PU will first try to exchange work
-/// with other children of the highest-priority ancestor node, then with other
-/// children of the next highest-priority ancestor node, and so on.
-pub fn priorize_load_balancing(
-    topology: &Topology,
+/// Remember that [`ObjectType::Group`] may appear at multiple depths.
+pub(crate) fn parents_by_typed_depth<'topology>(
+    topology: &'topology Topology,
     affinity: &CpuSet,
-    default_job_properties: &JobProperties,
-) -> HashMap<TopologyObjectID, Priority> {
-    // Group multi-children nodes by increasing depth / locality
-    let mut parents_by_typed_depth = NormalDepth::iter_range(NormalDepth::MIN, topology.depth())
+) -> Box<[ParentsAtDepth<'topology>]> {
+    let parents_by_typed_depth = NormalDepth::iter_range(NormalDepth::MIN, topology.depth())
         .filter_map(|depth| {
             // Pick nodes with multiple children
             let parents = topology
@@ -203,36 +189,90 @@ pub fn priorize_load_balancing(
                     topology
                         .type_at_depth(depth)
                         .expect("depth is valid by construction"),
-                    parents,
+                    parents.into_boxed_slice(),
                 )
             })
         })
-        .collect::<Vec<_>>();
+        .collect::<Box<[_]>>();
     crate::debug!(
-        "Priorizing distribution of work across multi-children parents \
-        grouped by typed depth {parents_by_typed_depth:#?}"
+        "Will priorize distribution of work across multi-children parents \
+            grouped by increasing typed depth {parents_by_typed_depth:#?}"
     );
+    parents_by_typed_depth
+}
 
+/// Set of multi-children parents at some topology depth, with associated type
+pub(crate) type ParentsAtDepth<'topology> = (ObjectType, Box<[&'topology TopologyObject]>);
+
+/// Extract any hyperthreaded cores from the `parents_by_typed_depth` output
+fn extract_hyperthreads<'input, 'topology: 'input>(
+    parents_by_typed_depth: &'input [ParentsAtDepth<'topology>],
+) -> Option<(
+    &'input [&'topology TopologyObject],
+    &'input [ParentsAtDepth<'topology>],
+)> {
+    if let Some(((ObjectType::Core, cores), other_parents)) = parents_by_typed_depth.split_last() {
+        assert!(
+            other_parents
+                .iter()
+                .all(|(ty, _objs)| *ty != ObjectType::Core),
+            "if present, hyperthreaded cores should be at the bottom depth of the topology"
+        );
+        Some((cores, other_parents))
+    } else {
+        None
+    }
+}
+
+/// Priority of a topology node
+///
+/// When distributing work across CPU cores, the task scheduler will focus first
+/// on having the workload cover all children of the highest-priority nodes,
+/// then all children of the next highest-priority nodes, and so on.
+pub(crate) type Priority = usize;
+
+/// Priorize multi-children hardware topology nodes for load balancing, assuming
+/// a certain typical thread pool workload
+///
+/// This function gives topology nodes a priority for the purpose of load
+/// balancing, i.e. exchanging tasks between worker threads after job startup
+/// for the purpose of minimizing the amount of unused CPU resources.
+///
+/// For each PU in use, each ancestor that has other children with PUs is given
+/// a priority that differs from that of the other ancestors of that PU. At
+/// runtime, the worker associated with the PU will first try to exchange work
+/// with other children of the highest-priority ancestor node, then with other
+/// children of the next highest-priority ancestor node, and so on.
+///
+/// `parents_by_typed_depth` should be the unmodified result of the eponymous
+/// function.
+pub(crate) fn load_balancing_priorities(
+    mut parents_by_typed_depth: &[ParentsAtDepth<'_>],
+    default_job_properties: &JobProperties,
+) -> HashMap<TopologyObjectID, Priority> {
     // Increasing depth provides a natural load balancing priority order, as
-    // higher-depth nodes have lower inter-child communication latencies and are
-    // thus a best first candidate for load balancing. But we do need to make
-    // some adjustments depending on the kind of job we're targeting.
+    // higher-depth nodes have the best inter-child communication efficiency and
+    // are thus a best first candidate for load balancing transactions. But we
+    // may need to make some adjustments for the kind of job we're targeting.
     let mut parent_priority_classes = VecDeque::with_capacity(parents_by_typed_depth.len());
 
     // Except in edge cases where hyperthreading of related tasks is known to be
     // worthwhile, hyperthreads should be lowest priority, i.e. go first
     if !default_job_properties.prefer_threads_over_cores {
-        if let Some((ObjectType::Core, cores)) = parents_by_typed_depth.pop() {
-            parent_priority_classes.push_front(cores);
+        if let Some((hyperthreads, remaining_parents)) =
+            extract_hyperthreads(parents_by_typed_depth)
+        {
+            parent_priority_classes.push_front(hyperthreads);
+            parents_by_typed_depth = remaining_parents;
         }
     }
 
     // That's all we need for local load balancing (as opposed to initial task
-    // distribution at the start of a job)
+    // distribution at the start of a job, which is more complex)
     parent_priority_classes.extend(
         parents_by_typed_depth
-            .drain(..)
-            .map(|(_ty, parents)| parents),
+            .iter()
+            .map(|(_ty, parents)| &parents[..]),
     );
 
     // Give each multi-children node a priority according to our conclusions
@@ -241,7 +281,7 @@ pub fn priorize_load_balancing(
         .enumerate()
         .flat_map(|(priority, parents)| {
             parents
-                .into_iter()
+                .iter()
                 .map(move |parent| (parent.global_persistent_index(), priority))
         })
         .collect()
@@ -256,8 +296,9 @@ pub fn priorize_load_balancing(
 //         the work across the most remote hardware locations, then distribute
 //         subsequent (smaller) shards of work to increasingly closer hardware
 //         PUs, until we get to the point where we distribute work across CPU
-//         cores within the same locality, or hyperthreads if the task benefits
-//         from internal hyperthreading.
+//         cores within the same locality, and hyperthreads too if the task
+//         benefits from internal hyperthreading (otherwise we wholly leave use
+//         of hyperthreads to load balancing after the job is running).
 //       - For a task that cannot use all of the thread pool's worker threads,
 //         what happens depends on whether the task is expected to be compute or
 //         memory-bound
