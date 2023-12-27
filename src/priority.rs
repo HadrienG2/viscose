@@ -17,7 +17,7 @@
 //!    as close a neighbor in the hardware topology tree as possible.
 //! 2. Hyperthreads share a lot of core execution resources, therefore executing
 //!    two subtasks of the same job on two hyperthreads of the same CPU core
-//!    will only be effective if the tasks' performanec critical inner loops
+//!    will only be effective if the tasks' performance critical inner loops
 //!    makes very inefficient or complex use of the core's execution resources.
 //!    Otherwise, the two hyperthreads will end up competing for the same core
 //!    execution resources, and hyperthreading will at best provide little
@@ -25,7 +25,7 @@
 //!    tasks have simple and well-tuned inner loops, which is the optimal
 //!    performance scenario, hyperthreads should ideally execute unrelated jobs,
 //!    and thus spreading the workload of a single job to multiple hyperthreads
-//!    of the same CPU core should be bottom priority for the scheduler.
+//!    of the same CPU core should be bottom priority for the task scheduler.
 //! 3. On systems with multiple NUMA nodes, the full system DRAM bandwidth may
 //!    only be leveraged by making use of CPU cores from all NUMA nodes. So if
 //!    tasks are bound by DRAM bandwidth, which is common when the code has not
