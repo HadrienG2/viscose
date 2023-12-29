@@ -1090,5 +1090,7 @@ mod tests {
     //       - From two concurrent threads, one taking the local side and one
     //         taking the remote side, reverting transactions after running them
     // TODO: Test transactions of one Worker + 2 Remote, each in own thread
-    // TODO: Also add benchmarks once tests are ready
+    // TODO: Also add benchmarks once tests are ready, and benchmark
+    //       crossbeam_deque on the same task when feasible (+ add
+    //       crossbeam/crossbeam_deque to benchmark feature)
 }
