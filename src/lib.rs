@@ -220,10 +220,14 @@ fn children_in_cpuset<'iterator, 'parent: 'iterator>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::panic::UnwindSafe;
 
-    #[allow(unused)]
-    pub(crate) fn assert_panics<R>(op: impl FnOnce() -> R + UnwindSafe) {
-        assert!(std::panic::catch_unwind(op).is_err());
+    /// Assert that some code panics in a proptest-friendly way
+    pub(crate) fn assert_panics<R>(
+        op: impl FnOnce() -> R + UnwindSafe,
+    ) -> Result<(), TestCaseError> {
+        prop_assert!(std::panic::catch_unwind(op).is_err());
+        Ok(())
     }
 }

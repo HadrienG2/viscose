@@ -34,6 +34,9 @@
 //!   lock-freedom on the "outside world" side of the queue, which should not be
 //!   under high pressure when executing non-pathological workloads.
 
+use crossbeam::utils::CachePadded;
+#[cfg(test)]
+use proptest::prelude::*;
 use std::{
     cell::UnsafeCell,
     mem::MaybeUninit,
@@ -44,25 +47,150 @@ use std::{
     },
 };
 
-use crossbeam::utils::CachePadded;
+// === High-level deque interface ===
 
-/// Error returned when attempting to push work to a work queue
+/// Maximal number of elements a work queue can hold
+pub const MAX_CAPACITY: usize = 2usize.pow(Range::INDEX_BITS) - 2;
+
+/// Worker-side interface to the work queue
+#[derive(Debug)]
+pub struct Worker<T>(Arc<SharedDeque<T>>);
+//
+impl<T> Worker<T> {
+    /// Set up the work queue
+    ///
+    /// The capacity will be rounded up a little below a power of two in order
+    /// to allow for more efficient transactions later on. It cannot be larger
+    /// than [`MAX_CAPACITY`].
+    pub fn new(capacity: usize) -> Self {
+        Self(SharedDeque::new(capacity))
+    }
+
+    /// Set up a remote interface to the work queue
+    ///
+    /// This interface enables other threads to interact with the work queue, in
+    /// order to give work to the worker or steal work from it.
+    pub fn remote(&self) -> Remote<T> {
+        Remote(self.0.clone())
+    }
+
+    /// Push work on the worker side of the deque
+    ///
+    /// If it is not stolen by other threads, this work will be executed by the
+    /// worker in a LIFO fashion, i.e. the most recently pushed task is executed
+    /// first. This optimizes cache locality and load balancing granularity at
+    /// the expense of fairness.
+    pub fn push(&mut self, work: T) -> Result<(), Full<T>> {
+        // SAFETY: Unique access to the non-clonable Worker provides momentary
+        //         unique access to the local side of the ring buffer.
+        unsafe { self.0.deque.push(work) }
+    }
+
+    /// Get the next task from the worker side of the deque, if any
+    ///
+    /// This will execute tasks from the worker in a LIFO fashion and tasks from
+    /// the outside world in a FIFO fashion. When both kinds of tasks are
+    /// present, their interleaving is unspecified and will depend on the order
+    /// in which tasks were submitted on both ends.
+    pub fn pop(&mut self) -> Option<T> {
+        // SAFETY: Unique access to the non-clonable Worker provides momentary
+        //         unique access to the local side of the ring buffer.
+        unsafe { self.0.deque.pop() }
+    }
+}
+//
+#[cfg(test)]
+impl<T: Arbitrary> Arbitrary for Worker<T>
+where
+    SharedDeque<T>: Arbitrary,
+{
+    type Parameters = <SharedDeque<T> as Arbitrary>::Parameters;
+    type Strategy =
+        prop::strategy::Map<<SharedDeque<T> as Arbitrary>::Strategy, fn(SharedDeque<T>) -> Self>;
+
+    fn arbitrary_with(args: Self::Parameters) -> Self::Strategy {
+        <SharedDeque<T> as Arbitrary>::arbitrary_with(args)
+            .prop_map(|shared| Self(Arc::new(shared)))
+    }
+}
+//
+// SAFETY: There is no risk associated with sending a Worker to another thread
+unsafe impl<T> Send for Worker<T> {}
+
+/// Error returned when attempting to push work to a full work queue
+///
+/// The submitted element that could not be pushed is provided back for reuse.
+#[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub struct Full<T>(pub T);
+
+/// External thread interface to the work queue
+#[derive(Clone, Debug)]
+pub struct Remote<T>(Arc<SharedDeque<T>>);
+//
+impl<T> Remote<T> {
+    /// Set up an external thread interface
+    pub fn new(worker: &Worker<T>) -> Self {
+        Self(worker.0.clone())
+    }
+
+    /// Add work on the remote side of the deque
+    ///
+    /// If it is not stolen by other threads, this work will be executed by the
+    /// worker in a FIFO fashion, i.e. the most recently pushed task is executed
+    /// last. This effectively priorizes work spawned by the worker against work
+    /// spawned by other threads, which is good for cache locality.
+    pub fn give(&self, work: T) -> Result<(), GiveError<T>> {
+        let mut lock = match self.0.try_lock_remote() {
+            Ok(lock) => lock,
+            Err(Locked) => {
+                return Err(GiveError {
+                    data: work,
+                    cause: GiveErrorCause::Locked,
+                })
+            }
+        };
+        Ok(lock.give(work)?)
+    }
+
+    /// Take work from the remote side of the deque
+    ///
+    /// This steals the work that the worker is least in a hurry to process at
+    /// this point in time, i.e. that should be coldest in worker thread caches.
+    pub fn steal(&self) -> Result<T, StealError> {
+        let mut lock = self.0.try_lock_remote()?;
+        lock.steal().ok_or(StealError::Empty)
+    }
+}
+//
+// SAFETY: There is no risk associated with sending a Remote to another thread
+unsafe impl<T> Send for Remote<T> {}
+//
+// SAFETY: There is no risk associated with sharing a Remote between threads
+//         because all shared state accesses are appropriately synchronized
+unsafe impl<T> Sync for Remote<T> {}
+
+/// Error returned when attempting to give work to a work queue
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-pub struct PushError<T, Reason> {
-    /// Data that one was attempting to push
+pub struct GiveError<T> {
+    /// Data that one was attempting to give away
     data: T,
 
-    /// Reason why the push failed
-    reason: Reason,
+    /// Reason why the giveaway failed
+    cause: GiveErrorCause,
 }
-
-/// Error returned when attempting to acquire a busy work queue lock
-#[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq)]
-struct Locked;
+//
+impl<T> From<Full<T>> for GiveError<T> {
+    fn from(Full(data): Full<T>) -> Self {
+        Self {
+            data,
+            cause: GiveErrorCause::Full,
+        }
+    }
+}
 
 /// Errors that can occur when giving work to a worker
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-pub enum GiveError {
+pub enum GiveErrorCause {
     /// The queue was full and could not accept any other element
     Full,
 
@@ -73,8 +201,8 @@ pub enum GiveError {
     Locked,
 }
 //
-impl From<Locked> for GiveError {
-    fn from(value: Locked) -> Self {
+impl From<Locked> for GiveErrorCause {
+    fn from(Locked: Locked) -> Self {
         Self::Locked
     }
 }
@@ -82,7 +210,7 @@ impl From<Locked> for GiveError {
 /// Errors that can occur when stealing work from a worker
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub enum StealError {
-    /// The queue was full and could not provide any element
+    /// There was no element to steal in the work queue
     Empty,
 
     /// The remote end of the queue was locked
@@ -93,22 +221,41 @@ pub enum StealError {
 }
 //
 impl From<Locked> for StealError {
-    fn from(value: Locked) -> Self {
+    fn from(Locked: Locked) -> Self {
         Self::Locked
     }
 }
 
-// TODO: High level safe ring buffer interface
+// === Shared state backing the deque ===
 
 /// [`WorkDeque`] that is shared between a worker and other "remote" threads
-struct SharedDeque<T> {
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct SharedDeque<T> {
     /// Double-ended work queue
     deque: CachePadded<WorkDeque<T>>,
 
     /// Lock on the remote end of the work queue
-    // TODO: true means locked, lock with swap and unlock with store, use
-    //       RemoteLock and maybe put the safe give/steal methods there
+    ///
+    /// Set to false when unlocked, true when locked.
     remote_lock: CachePadded<AtomicBool>,
+}
+//
+impl<T> SharedDeque<T> {
+    /// Set up the shared state
+    ///
+    /// See [`Worker::new()`] docs to know more about acceptable capacities.
+    pub fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            deque: CachePadded::new(WorkDeque::new(capacity)),
+            remote_lock: CachePadded::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Attempt to acquire the lock on the remote end of the deque
+    pub fn try_lock_remote(&self) -> Result<RemoteLock<T>, Locked> {
+        RemoteLock::new(self)
+    }
 }
 
 /// Lock on the remote end of a [`SharedDeque`]
@@ -118,49 +265,108 @@ struct SharedDeque<T> {
 /// private storage slot on that side), unless it can be guaranteed that no
 /// other thread has access to the ring buffer.
 ///
-/// Will automatically release the lock on `Drop`, unless this is inhibited
-/// using [`std::mem::forget()`].
-struct RemoteLock<'buffer> {
-    /// Status word in which the lock was acquired
-    remote_lock: &'buffer AtomicBool,
+/// Will automatically release the lock on `Drop`.
+#[derive(Debug)]
+struct RemoteLock<'shared, T>(&'shared SharedDeque<T>);
+//
+impl<'shared, T> RemoteLock<'shared, T> {
+    /// Acquire unique access to the remote side of the deque
+    pub fn new(shared: &'shared SharedDeque<T>) -> Result<Self, Locked> {
+        // We assume that there is insignificant pressure on the remote side of
+        // the deque, and thus testing the lock before attempting to acquire it
+        // is not worthwhile.
+        if shared.remote_lock.swap(true, Ordering::Acquire) {
+            return Err(Locked);
+        }
+        Ok(Self(shared))
+    }
 
-    /// Memory ordering of the implicit unlock operation on [`Drop`]
-    unlock_order: Ordering,
+    /// Add work on the remote side of the deque
+    ///
+    /// See [`Remote::give()`] for more information.
+    pub fn give(&mut self, work: T) -> Result<(), Full<T>> {
+        // SAFETY: Unique access to the non-clonable RemoteLock, which can only
+        //         be acquired by one thread at a time, provides momentary
+        //         unique access to the remote side of the ring buffer.
+        unsafe { self.0.deque.give(work) }
+    }
+
+    /// Take work from the remote side of the deque
+    ///
+    /// See [`Remote::steal()`] for more information.
+    pub fn steal(&mut self) -> Option<T> {
+        // SAFETY: Unique access to the non-clonable RemoteLock, which can only
+        //         be acquired by one thread at a time, provides momentary
+        //         unique access to the remote side of the ring buffer.
+        unsafe { self.0.deque.steal() }
+    }
 }
 //
-impl Drop for RemoteLock<'_> {
+#[cfg(test)]
+impl<T: Arbitrary> Arbitrary for SharedDeque<T>
+where
+    WorkDeque<T>: Arbitrary,
+{
+    type Parameters = <WorkDeque<T> as Arbitrary>::Parameters;
+    type Strategy = prop::strategy::Map<
+        (
+            <WorkDeque<T> as Arbitrary>::Strategy,
+            <bool as Arbitrary>::Strategy,
+        ),
+        fn((WorkDeque<T>, bool)) -> Self,
+    >;
+
+    fn arbitrary_with(args: Self::Parameters) -> Self::Strategy {
+        (
+            <WorkDeque<T> as Arbitrary>::arbitrary_with(args),
+            any::<bool>(),
+        )
+            .prop_map(|(deque, locked)| Self {
+                deque: CachePadded::new(deque),
+                remote_lock: CachePadded::new(AtomicBool::new(locked)),
+            })
+    }
+}
+//
+impl<T> Drop for RemoteLock<'_, T> {
     fn drop(&mut self) {
         if cfg!(debug_assertions) {
             assert!(
-                self.remote_lock.swap(false, self.unlock_order),
+                self.0.remote_lock.swap(false, Ordering::Release),
                 "lock was unlocked incorrectly or not forgotten when it should have been"
             );
         } else {
-            self.remote_lock.store(false, self.unlock_order);
+            self.0.remote_lock.store(false, Ordering::Release);
         }
     }
 }
 
-// === Lock-free ring buffer layer ===
+/// Error returned when attempting to acquire a busy work queue lock
+#[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq)]
+struct Locked;
+
+// === Lock-free ring buffer ===
 
 /// Lock-free ring buffer specialized for mostly-local work scheduling
 ///
 /// Like all ring buffers, this implements a bounded `VecDeque`-like container.
 /// The right-hand side or "front" of this ring buffer is meant to be owned by a
-/// worker thread and will be referred to as the local side, while the left-hand
-/// side or "front" of this ring buffer is shared with all other OS threads and
-/// will be referred to as the remote side.
+/// worker thread and will also be referred to as the local side, while the
+/// left-hand side or "front" of this ring buffer is shared with all other OS
+/// threads and will be referred to as the remote side.
 ///
 /// The performance of this ring buffer is optimized for scenarios where pushing
 /// and popping work on the local side are the most common transactions that
 /// must have the best performance, and trading work with other threads on the
-/// remote side is a less common transaction that can be a little slower.
+/// remote side is a less common transaction that can be less efficient.
 ///
 /// Concurrent access to the remote side of the ring buffer must be synchronized
 /// through a lock, which is not part of this data structure because it should
 /// be placed on a separate cache line in order to minimize interference between
 /// remote threads and the local worker.
-struct WorkDeque<T> {
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct WorkDeque<T> {
     /// Queue elements in a ring buffer layout
     ///
     /// Guaranteed to contain initialized elements from the remote index
@@ -171,11 +377,11 @@ struct WorkDeque<T> {
     /// and the queue is considered empty when `local_idx == remote_idx`.
     ///
     /// The off-by-one queue elements at the remote index and at the index after
-    /// the local index are respectively used during pushes and pops to the
-    /// remote and local ends of the queue. To avoid all possibilities of data
-    /// race UB, these two indices must never be allowed to overlap, which means
-    /// that the queue must be considered full when `remote_idx == (local_idx +
-    /// 2) % elements.len()`.
+    /// the local index are reserved for use when pushing data to the remote and
+    /// local ends of the queue. To avoid all possibilities of data race UB,
+    /// these two indices must not be allowed to overlap with other queue
+    /// elements or with each other, which means that the queue must be
+    /// considered full when `remote_idx == (local_idx + 2) % elements.len()`.
     ///
     /// Because there must be 2 unused elements at all times for the above
     /// purpose, the useful queue capacity is `elements.len() - 2`.
@@ -185,7 +391,7 @@ struct WorkDeque<T> {
     ///
     /// The compiler cannot figure out that `elements.len()` is a power of two
     /// without this help, and letting it know makes the modular computations
-    /// much more efficient (can use bit masking rather than true remainder).
+    /// much more efficient (can use bit masking instead of true remainder).
     elements_len_pow2: NonZeroU32,
 
     /// Bit field with the following layout:
@@ -204,52 +410,50 @@ struct WorkDeque<T> {
 impl<T> WorkDeque<T> {
     // === High-level interface ===
 
-    /// Maximal number of elements a `WorkDeque` can store
-    pub const MAX_CAPACITY: usize = 2usize.pow(Range::INDEX_BITS) - 2;
-
     /// Set up the ring buffer
     ///
-    /// The capacity will be rounded up a little below a power of two in order
-    /// to allow for more efficient transactions later on. It cannot be larger
-    /// than [`Self::MAX_CAPACITY`].
-    pub fn new(capacity: usize) -> Arc<Self> {
+    /// See [`Worker::new()`] docs to know more about acceptable capacities.
+    pub fn new(capacity: usize) -> Self {
+        let elements_len = Self::num_elements_from_capacity(capacity);
+        let elements = std::iter::repeat_with(|| UnsafeCell::new(MaybeUninit::uninit()))
+            .take(elements_len)
+            .collect();
+        let elements_len_pow2 = NonZeroU32::new(elements_len.trailing_zeros())
+            .expect("will have at least two elements due to push buffers on both ends");
+        Self {
+            elements,
+            elements_len_pow2,
+            range: AtomicUsize::new(0),
+        }
+    }
+
+    /// Determine internal buffer size for a certain user-desired capacity
+    fn num_elements_from_capacity(capacity: usize) -> usize {
         assert!(
-            capacity < Self::MAX_CAPACITY,
+            capacity < MAX_CAPACITY,
             "requested capacity is above implementation limit"
         );
         let mut elements_len = capacity + 2;
         if !elements_len.is_power_of_two() {
             elements_len = elements_len.next_power_of_two();
         }
-        let elements = std::iter::repeat_with(|| UnsafeCell::new(MaybeUninit::uninit()))
-            .take(elements_len)
-            .collect();
-        let elements_len_pow2 = NonZeroU32::new(elements_len.trailing_zeros())
-            .expect("will have at least two elements due to push buffers on both ends");
-        Arc::new(Self {
-            elements,
-            elements_len_pow2,
-            range: AtomicUsize::new(0),
-        })
+        elements_len
     }
 
     /// Push work on the worker side of the deque
     ///
-    /// If it is not stolen by other threads, this work will be executed by the
-    /// worker in a LIFO fashion, i.e. the most recently pushed task is executed
-    /// first, as this optimizes cache locality and load balancing granularity.
+    /// See [`Worker::push()`] for more information.
     ///
     /// # Safety
     ///
-    /// This function may only be called by the worker thread that this work
-    /// queue belongs to.
+    /// This function may only be called by the thread that owns the work queue.
     pub unsafe fn push(&self, work: T) -> Result<(), Full<T>> {
         // Make sure the queue isn't full
         //
         // Can use Relaxed ordering because at this stage, we're only using the
-        // range word to know the position of our storage slot, which is a value
-        // that only the active worker thread may have previously set.
-        // Therefore, this is just the worker thread communicating with itself,
+        // range word to know the position of our private storage slot, which is
+        // a value that only us, the active worker thread, may have previously
+        // set. Therefore, this is the worker thread communicating with itself,
         // which is one of the textbook use cases for Relaxed memory ordering.
         let mut range = self.load_range(Ordering::Relaxed);
         if self.is_full(range) {
@@ -276,7 +480,10 @@ impl<T> WorkDeque<T> {
             },
             // Need Release ordering on success to ensure our push_slot writes
             // are visible to a thread which observes the range word update.
-            Ordering::Release,
+            // Need Acquire ordering as well to ensure that our future writes to
+            // the newly acquired storage slot will be ordered after we have
+            // acquired access to it.
+            Ordering::AcqRel,
             // Can use Relaxed ordering on failure because we're not reading any
             // state set by another thread except for the range word.
             Ordering::Relaxed,
@@ -303,15 +510,11 @@ impl<T> WorkDeque<T> {
 
     /// Get the next task from the worker side of the deque, if any
     ///
-    /// This will execute tasks from the worker in a LIFO fashion and tasks from
-    /// the outside world in a FIFO fashion. When both kinds of tasks are
-    /// present, their interleaving is unspecified and will depend on the order
-    /// in which tasks were submitted on both ends.
+    /// See [`Worker::pop()`] for more information.
     ///
     /// # Safety
     ///
-    /// This function may only be called by the worker thread that this work
-    /// queue belongs to.
+    /// This function may only be called by the thread that owns the work queue.
     pub unsafe fn pop(&self) -> Option<T> {
         // Make sure the queue isn't empty
         //
@@ -335,8 +538,11 @@ impl<T> WorkDeque<T> {
                 ..range
             },
             // Need Acquire ordering on success to ensure we observe every write
-            // from the thread that added this element to the queue
-            Ordering::Acquire,
+            // from the thread that added this element to the queue.
+            // Need Release ordering as well to ensure that all writes to our
+            // former private storage slot have completed before we free up
+            // said slot for reuse by other threads.
+            Ordering::AcqRel,
             // Can use Relaxed ordering on failure because we're not reading any
             // state set by another thread except for the range word
             Ordering::Relaxed,
@@ -361,17 +567,14 @@ impl<T> WorkDeque<T> {
         //         the initialized range of the queue, so it should contain an
         //         initialized value. Double drop cannot happen because we
         //         shifted local_idx backward, so all future queue interactions
-        //         will consider this element to be uninitialized and do any
-        //         read or read-dependent operation like Drop here.
+        //         will consider this element to be uninitialized and won't do
+        //         any read or read-dependent operation like Drop there.
         Some(unsafe { pop_slot.assume_init_read() })
     }
 
     /// Add work on the remote side of the deque
     ///
-    /// If it is not stolen by other threads, this work will be executed by the
-    /// worker in a FIFO fashion, i.e. the most recently pushed task is executed
-    /// last. This effectively priorizes work spawned by the worker against work
-    /// spawned by other threads, which is good for cache locality.
+    /// See [`Remote::give()`] for more information.
     ///
     /// # Safety
     ///
@@ -382,8 +585,8 @@ impl<T> WorkDeque<T> {
         // Make sure the queue isn't full
         //
         // Can use Relaxed ordering because acquisition of the remote end's lock
-        // has already provided the necessary `Acquire` barrier for us to get a
-        // consistent view of `remote_idx` and the associated storage cell.
+        // has already provided the necessary `Acquire` memory barrier for us to
+        // get a consistent view of remote_idx and the associated storage slot.
         let mut range = self.load_range(Ordering::Relaxed);
         if self.is_full(range) {
             return Err(Full(work));
@@ -409,7 +612,10 @@ impl<T> WorkDeque<T> {
             },
             // Need Release ordering on success to ensure our give_slot writes
             // are visible to a thread which observes the range word update.
-            Ordering::Release,
+            // Need Acquire ordering as well to ensure that our future writes to
+            // the newly acquired storage slot cannot be reordered before we
+            // have acquired access to said storage slot.
+            Ordering::AcqRel,
             // Can use Relaxed ordering on failure because we're not reading any
             // state set by another thread except for the range word
             Ordering::Relaxed,
@@ -435,6 +641,8 @@ impl<T> WorkDeque<T> {
 
     /// Take work from the remote side of the deque
     ///
+    /// See [`Remote::steal()`] for more information.
+    ///
     /// # Safety
     ///
     /// Access to the remote end of the queue should be synchronized via an
@@ -450,21 +658,23 @@ impl<T> WorkDeque<T> {
             return None;
         }
 
-        // Repeatedly try to shift the remote end of the queue forwards, which
+        // Repeatedly try to shift the remote end of the queue forward, which
         // moves the next remote element to our private storage slot and thus
         // protects it from concurrent pushing and popping by the worker thread.
         // Stop once we succeed or the worker thread pops all remaining work.
         let steal_idx = self.steal_idx(range);
-        let next_idx = self.index_add(steal_idx, 1);
         while let Err(new_range) = self.try_update_range(
             range,
             Range {
-                remote_idx: next_idx,
+                remote_idx: steal_idx,
                 ..range
             },
             // Need Acquire ordering on success to ensure we observe every write
-            // from the thread that added this element to the queue
-            Ordering::Acquire,
+            // from the thread that added this element to the queue.
+            // Need Release ordering as well to ensure that any previous writes
+            // to our former storage slot have completed before we release it
+            // for re-use by the outside world.
+            Ordering::AcqRel,
             // Can use Relaxed ordering on failure because we're not reading any
             // state set by another thread except for the range word
             Ordering::Relaxed,
@@ -481,17 +691,18 @@ impl<T> WorkDeque<T> {
 
         // Now, take the element from our private storage slot
         // SAFETY: This is safe because...
-        //         - `steal_idx` is now the private remote storage slot
+        //         - steal_idx is now our private remote storage slot
         //         - The remote lock is assumed to be held as a precondition, so
-        //           `remote_idx` cannot change and we have exclusive access to
-        //           the associated private storage block.
-        //         - The synchronization protocol ensures that we have exclusive
-        //           access to the private remote storage slot.
+        //           remote_idx cannot change and we are protected from access
+        //           to the associated elements[remote_idx] private storage
+        //           block by other remote threads.
+        //         - The queue's synchronization protocol ensures that the
+        //           worker thread won't access our private storage slot either.
         let steal_slot = unsafe { &mut *self.elements[steal_idx].get() };
         // SAFETY: This storage slot was previously advertised as being part of
         //         the initialized range of the queue, so it should contain an
-        //         initialized value. Double drop cannot happen since we shifted
-        //         remote_idx forward, so all future queue interactions will
+        //         initialized value. Double drop cannot happen because we
+        //         shifted remote_idx forward, so future queue interactions will
         //         consider this element to be uninitialized and won't read it.
         Some(unsafe { steal_slot.assume_init_read() })
     }
@@ -507,7 +718,7 @@ impl<T> WorkDeque<T> {
     ///
     /// This function is just a high-level wrapper over
     /// [`AtomicUsize::compare_exchange_weak()`] and has nearly identical
-    /// semantics: it is guaranteed to return Ok() on successful replacement, it
+    /// semantics: it is guaranteed to return Ok() if replacement succeeds, it
     /// has `success` memory ordering on success and `failure` memory ordering
     /// on failure, and if it fails it gives back the new range value.
     fn try_update_range(
@@ -584,22 +795,62 @@ impl<T> WorkDeque<T> {
 
     /// Index where `give()` would insert an element
     ///
-    /// If the [`WorkDeque`] is accessible to multiple threads (i.e. at any
-    /// time except right after construction and right before the final `Drop`),
-    /// you must acquire the remote lock with [`Self::try_lock_remote()`] before
-    /// doing anything on this side of the ring buffer.
+    /// If the [`WorkDeque`]'s remote end is accessible to multiple threads
+    /// (i.e. at any time except right after construction and right before the
+    /// final `Drop`), you must acquire a lock before doing anything on this
+    /// side of the ring buffer.
     fn give_idx(&self, range: Range) -> usize {
         range.remote_idx
     }
 
     /// Index where `steal()` would take an element
     ///
-    /// If the [`WorkDeque`] is accessible to multiple threads (i.e. at any
-    /// time except right after construction and right before the final `Drop`),
-    /// you must acquire the remote lock with [`Self::try_lock_remote()`] before
-    /// doing anything on this side of the ring buffer.
+    /// If the [`WorkDeque`]'s remote end is accessible to multiple threads
+    /// (i.e. at any time except right after construction and right before the
+    /// final `Drop`), you must acquire a lock before doing anything on this
+    /// side of the ring buffer.
     fn steal_idx(&self, range: Range) -> usize {
         self.index_add(range.remote_idx, 1)
+    }
+}
+//
+#[cfg(test)]
+impl<T: Arbitrary> Arbitrary for WorkDeque<T>
+where
+    <T as Arbitrary>::Parameters: Clone + 'static,
+{
+    type Parameters = (prop::collection::SizeRange, <T as Arbitrary>::Parameters);
+    type Strategy = prop::strategy::BoxedStrategy<Self>;
+
+    fn arbitrary_with((capacity_range, value_params): Self::Parameters) -> Self::Strategy {
+        (capacity_range.start()..=capacity_range.end_incl())
+            .prop_flat_map(move |capacity| {
+                let num_elements = Self::num_elements_from_capacity(capacity);
+                let elements = prop::collection::vec(
+                    <T as Arbitrary>::arbitrary_with(value_params.clone()),
+                    num_elements,
+                );
+                let range = (0..num_elements).prop_flat_map(move |remote_idx| {
+                    (remote_idx..=(remote_idx + num_elements - 2)).prop_map(
+                        move |unwrapped_local_idx| Range {
+                            local_idx: unwrapped_local_idx % num_elements,
+                            remote_idx,
+                        },
+                    )
+                });
+                (elements, range).prop_map(move |(elements, range)| {
+                    let mut deque = Self::new(capacity);
+                    assert_eq!(deque.elements.len(), num_elements);
+                    for (element, value) in deque.elements.iter_mut().zip(elements) {
+                        element.get_mut().write(value);
+                    }
+                    deque
+                        .range
+                        .store(range.into_raw(deque.index_mask()), Ordering::Relaxed);
+                    deque
+                })
+            })
+            .boxed()
     }
 }
 //
@@ -653,18 +904,18 @@ struct Range {
     /// Remote end of the queue
     ///
     /// This is the index of [`WorkDeque::elements`] at which
-    /// [`WorkDeque::give()`] would insert a new work-item.
+    /// [`WorkDeque::give()`] would add a new work-item.
     ///
-    /// If the [`WorkDeque`] is accessible to multiple threads (i.e. at any
-    /// time except right after construction and right before the final `Drop`),
-    /// you must acquire a lock before modifying `remote_idx` and/or accessing
-    /// the private element at this location.
+    /// If the remote end of the [`WorkDeque`] is accessible to multiple threads
+    /// (i.e. at any time except right after construction and right before the
+    /// final `Drop`), you must acquire a lock before modifying `remote_idx`
+    /// and/or accessing the private element at this location.
     remote_idx: usize,
 }
 //
 impl Range {
     /// Decode the [`WorkDeque`]'s packed range
-    fn new(raw: RawRange, index_mask: RawRange) -> Self {
+    pub fn new(raw: RawRange, index_mask: RawRange) -> Self {
         let local_idx = raw & index_mask;
         let remote_idx = (raw >> Self::REMOTE_SHIFT) & index_mask;
         Self {
@@ -674,7 +925,7 @@ impl Range {
     }
 
     /// Convert back to a packed range
-    fn into_raw(self, index_mask: RawRange) -> RawRange {
+    pub fn into_raw(self, index_mask: RawRange) -> RawRange {
         let mut result = 0;
         debug_assert_eq!(self.local_idx & index_mask, self.local_idx);
         result |= self.local_idx;
@@ -683,18 +934,161 @@ impl Range {
         result
     }
 
+    /// Available bits for storing the local and remote indices
+    pub const INDEX_BITS: u32 = Self::REMOTE_SHIFT;
+
     /// Bit shift from the start of the word to the start of the end index
     const REMOTE_SHIFT: u32 = RawRange::BITS / 2;
-
-    /// Available bits for storing the local and remote indices
-    const INDEX_BITS: u32 = Self::REMOTE_SHIFT;
 }
 
-/// Error returned when attempting to push work to a full work queue
-///
-/// The submitted element that could not be pushed is provided back for reuse.
-#[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq)]
-struct Full<T>(pub T);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::assert_panics;
+    use proptest::sample::SizeRange;
+    use std::ptr;
 
-// TODO: Implement
-// TODO: Test
+    /// Buffer capacity that is usually valid, but may not be
+    fn buffer_capacity() -> impl Strategy<Value = usize> {
+        let max_size = SizeRange::default().end_incl();
+        if max_size > MAX_CAPACITY {
+            prop_oneof![
+                1 => prop_oneof![Just(0), Just(MAX_CAPACITY)],
+                2 => 1..MAX_CAPACITY,
+                2 => (MAX_CAPACITY+1)..=max_size,
+            ]
+            .boxed()
+        } else {
+            prop_oneof![
+                1 => Just(0),
+                4 => 1..=max_size,
+            ]
+            .boxed()
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn new(capacity in buffer_capacity()) {
+            if capacity > MAX_CAPACITY {
+                assert_panics(|| WorkDeque::<bool>::new(capacity))?;
+                assert_panics(|| SharedDeque::<u8>::new(capacity))?;
+                assert_panics(|| Worker::<f32>::new(capacity))?;
+                return Ok(());
+            }
+
+            fn check_initial_deque<T>(deque: &WorkDeque<T>, capacity: usize) -> Result<(), TestCaseError> {
+                let expected_elements = WorkDeque::<T>::num_elements_from_capacity(capacity);
+                prop_assert_eq!(deque.elements.len(), expected_elements);
+                prop_assert_eq!(2usize.pow(deque.elements_len_pow2.get()), expected_elements);
+                prop_assert_eq!(deque.range.load(Ordering::Relaxed), 0);
+                Ok(())
+            }
+            check_initial_deque(&WorkDeque::<i16>::new(capacity), capacity)?;
+
+            fn check_initial_shared<T>(shared: &SharedDeque<T>, capacity: usize) -> Result<(), TestCaseError> {
+                check_initial_deque(&shared.deque, capacity)?;
+                prop_assert!(!shared.remote_lock.load(Ordering::Relaxed));
+                Ok(())
+            }
+            let shared = SharedDeque::<isize>::new(capacity);
+            check_initial_shared(&shared, capacity)?;
+
+            let worker = Worker::<u128>::new(capacity);
+            check_initial_shared(&worker.0, capacity)?;
+
+            let remote = worker.remote();
+            prop_assert!(ptr::eq(&*worker.0, &*remote.0));
+            check_initial_shared(&remote.0, capacity)?;
+        }
+    }
+
+    /// Test read-only properties of WorkDeque
+    fn check_deque_state<T>(deque: &WorkDeque<T>) -> Result<(), TestCaseError> {
+        // Fast path to power-of-2 elements len and associated bitmask
+        prop_assert_eq!(deque.elements_len(), deque.elements.len());
+        prop_assert!(deque.elements_len().is_power_of_two());
+        prop_assert_eq!(deque.index_mask(), deque.elements_len() - 1);
+
+        // Range upholds invariants
+        let range = deque.load_range(Ordering::Relaxed);
+        prop_assert!(range.local_idx < deque.elements_len());
+        prop_assert!(range.remote_idx < deque.elements_len());
+        prop_assert_eq!(
+            range.into_raw(deque.index_mask()),
+            deque.range.load(Ordering::Relaxed)
+        );
+        prop_assert_eq!(deque.is_empty(range), range.local_idx == range.remote_idx);
+        prop_assert_eq!(
+            deque.is_full(range),
+            range.remote_idx == (range.local_idx + 2) % deque.elements_len()
+        );
+        prop_assert_eq!(deque.pop_idx(range), range.local_idx);
+        prop_assert_eq!(
+            deque.push_idx(range),
+            (range.local_idx + 1) % deque.elements_len()
+        );
+        prop_assert_eq!(deque.give_idx(range), range.remote_idx);
+        prop_assert_eq!(
+            deque.steal_idx(range),
+            (range.remote_idx + 1) % deque.elements_len()
+        );
+        prop_assert_ne!(
+            deque.push_idx(range),
+            deque.give_idx(range),
+            "private push should nver overlap"
+        );
+        Ok(())
+    }
+    //
+    proptest! {
+        #[test]
+        fn work_state(deque: WorkDeque<isize>) {
+            check_deque_state(&deque)?;
+        }
+        //
+        #[test]
+        fn read_only_shared(shared: SharedDeque<u32>) {
+            check_deque_state(&shared.deque)?;
+        }
+        //
+        #[test]
+        fn read_only_worker(worker: Worker<f64>) {
+            check_deque_state(&worker.0.deque)?;
+        }
+    }
+
+    /// Test inputs for ring buffer indexing
+    fn indexing_test_params() -> impl Strategy<Value = (WorkDeque<isize>, usize, usize)> {
+        buffer_capacity().prop_flat_map(|capacity| {
+            let num_elems = WorkDeque::<isize>::num_elements_from_capacity(capacity);
+            (0..num_elems, 0..=num_elems)
+                .prop_map(move |(idx, offset)| (WorkDeque::new(capacity), idx, offset))
+        })
+    }
+    //
+    proptest! {
+        #[test]
+        fn index_ops((deque, idx, offset) in indexing_test_params()) {
+            prop_assert_eq!(
+                deque.index_add(idx, offset),
+                (idx + offset) % deque.elements.len()
+            );
+            let sub = deque.index_sub(idx, offset);
+            let offset = offset % deque.elements.len();
+            if idx >= offset {
+                prop_assert_eq!(sub, idx - offset);
+            } else {
+                let expected = deque.elements.len() - offset + idx;
+                prop_assert_eq!(sub, expected);
+            }
+        }
+    }
+
+    // TODO: Test basic transactions of RingBuffer from arbitrary state...
+    //       - From a single thread
+    //       - From two concurrent threads, one taking the local side and one
+    //         taking the remote side, reverting transactions after running them
+    // TODO: Test transactions of one Worker + 2 Remote, each in own thread
+    // TODO: Also add benchmarks once tests are ready
+}
