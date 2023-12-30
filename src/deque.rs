@@ -964,8 +964,12 @@ mod tests {
     use proptest::sample::SizeRange;
     use std::{
         cell::{Cell, RefCell},
+        fmt::Debug,
+        hash::Hash,
         ptr,
     };
+
+    // === Common tests ===
 
     /// Test properties of WorkDeque that should always be true
     fn check_deque_state<T>(deque: &WorkDeque<T>) -> Result<(), TestCaseError> {
@@ -1022,6 +1026,8 @@ mod tests {
         );
         Ok(())
     }
+
+    // === Constructor tests ===
 
     /// Generate a buffer capacity that is usually valid, but may not be
     fn buffer_capacity() -> impl Strategy<Value = usize> {
@@ -1085,6 +1091,8 @@ mod tests {
         }
     }
 
+    // === Type invariant tests ===
+
     // Test arbitrary deque generation
     proptest! {
         #[test]
@@ -1132,18 +1140,148 @@ mod tests {
         }
     }
 
-    /* /// Test basic transactions in a single-threaded environment, which does not
-    /// verify concurrent correctness but enables maximal end state checking
-    proptest! {
-        #[test]
-        fn push(deque: WorkDeque<isize>, value: isize) {
-            let was_full = deque.is_full(deque.load_range(Ordering::Relaxed));
-            let result
+    // === Single-threaded transactions ===
+
+    /// Saved state of a [`WorkDeque`]
+    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+    struct WorkDequeState<T: Copy + Eq + Hash> {
+        elements: Box<[T]>,
+        remote_idx: usize,
+        local_idx: usize,
+    }
+    //
+    impl<T: Copy + Eq + Hash> WorkDequeState<T> {
+        /// Save the state of a [`WorkDeque`]
+        ///
+        /// # Safety
+        ///
+        /// Must only be called on [`WorkDeque`]s from the [`Arbitrary`] impl,
+        /// which have all of their elements pre-initialized.
+        unsafe fn copy_from(deque: &mut WorkDeque<T>) -> Self {
+            let Range {
+                local_idx,
+                remote_idx,
+            } = deque.load_range(Ordering::Relaxed);
+            let elements = deque
+                .elements
+                .iter_mut()
+                // SAFETY: T initialized per function precondition + Copy
+                .map(|element| unsafe { element.get_mut().assume_init_read() })
+                .collect();
+            Self {
+                elements,
+                remote_idx,
+                local_idx,
+            }
         }
-    } */
+    }
+
+    /// Check the effect of a [`WorkQueue`] transaction
+    ///
+    /// # Safety
+    ///
+    /// Must only be called on [`WorkDeque`]s from the [`Arbitrary`] impl,
+    /// which have all of their elements pre-initialized.
+    unsafe fn check_transaction<T: Copy + Debug + Eq + Hash, R: Debug + Eq>(
+        deque: &mut WorkDeque<T>,
+        transaction: impl FnOnce(&WorkDeque<T>) -> R,
+        predict_effect: impl FnOnce(&WorkDeque<T>, &mut WorkDequeState<T>) -> R,
+    ) -> Result<(), TestCaseError> {
+        // SAFETY: deque is from the Arbitrary impl
+        let mut expected_state = unsafe { WorkDequeState::copy_from(deque) };
+        let expected_result = predict_effect(deque, &mut expected_state);
+        let actual_result = transaction(deque);
+        prop_assert_eq!(actual_result, expected_result);
+        // SAFETY: deque is from the Arbitrary impl
+        let actual_state = unsafe { WorkDequeState::copy_from(deque) };
+        prop_assert_eq!(actual_state, expected_state);
+        Ok(())
+    }
+
+    // Test basic transactions in a single-threaded environment, which does not
+    // verify concurrent correctness but enables maximal end state checking
+    proptest! {
+        #[allow(unused_unsafe)]
+        #[test]
+        fn push(mut deque: WorkDeque<isize>, value: isize) {
+            // SAFETY: Called on a deque from the Arbitrary impl
+            unsafe { check_transaction(
+                &mut deque,
+                // SAFETY: Called from a single-threaded environment
+                |deque| unsafe { deque.push(value) },
+                |deque, expected_state| {
+                    if deque.is_full(deque.load_range(Ordering::Relaxed)) {
+                        Err(Full(value))
+                    } else {
+                        expected_state.local_idx = (expected_state.local_idx.wrapping_add(1)) % expected_state.elements.len();
+                        expected_state.elements[expected_state.local_idx] = value;
+                        Ok(())
+                    }
+                }
+            )?; }
+        }
+        //
+        #[allow(unused_unsafe)]
+        #[test]
+        fn pop(mut deque: WorkDeque<u128>) {
+            // SAFETY: Called on a deque from the Arbitrary impl
+            unsafe { check_transaction(
+                &mut deque,
+                // SAFETY: Called from a single-threaded environment
+                |deque| unsafe { deque.pop() },
+                |deque, expected_state| {
+                    if deque.is_empty(deque.load_range(Ordering::Relaxed)) {
+                        None
+                    } else {
+                        let result = expected_state.elements[expected_state.local_idx];
+                        expected_state.local_idx = (expected_state.local_idx.wrapping_sub(1)) % expected_state.elements.len();
+                        Some(result)
+                    }
+                }
+            )?; }
+        }
+        //
+        #[allow(unused_unsafe)]
+        #[test]
+        fn give(mut deque: WorkDeque<i64>, value: i64) {
+            // SAFETY: Called on a deque from the Arbitrary impl
+            unsafe { check_transaction(
+                &mut deque,
+                // SAFETY: Called from a single-threaded environment
+                |deque| unsafe { deque.give(value) },
+                |deque, expected_state| {
+                    if deque.is_full(deque.load_range(Ordering::Relaxed)) {
+                        Err(Full(value))
+                    } else {
+                        expected_state.elements[expected_state.remote_idx] = value;
+                        expected_state.remote_idx = (expected_state.remote_idx.wrapping_sub(1)) % expected_state.elements.len();
+                        Ok(())
+                    }
+                }
+            )?; }
+        }
+        //
+        #[allow(unused_unsafe)]
+        #[test]
+        fn steal(mut deque: WorkDeque<u8>) {
+            // SAFETY: Called on a deque from the Arbitrary impl
+            unsafe { check_transaction(
+                &mut deque,
+                // SAFETY: Called from a single-threaded environment
+                |deque| unsafe { deque.steal() },
+                |deque, expected_state| {
+                    if deque.is_empty(deque.load_range(Ordering::Relaxed)) {
+                        None
+                    } else {
+                        expected_state.remote_idx = (expected_state.remote_idx.wrapping_add(1)) % expected_state.elements.len();
+                        Some(expected_state.elements[expected_state.remote_idx])
+                    }
+                }
+            )?; }
+        }
+    }
 
     // TODO: Test basic transactions of RingBuffer from arbitrary state...
-    //       - From a single thread
     //       - From two concurrent threads, one taking the local side and one
     //         taking the remote side, reverting transactions after running
     //         them. Take inspiration from triple-buffer tests and use RaceCell
