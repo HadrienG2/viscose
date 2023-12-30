@@ -1152,6 +1152,75 @@ mod tests {
         }
     }
 
+    // === Make sure the right queue elements get dropped ===
+
+    thread_local! {
+        /// Tracks dropped [`WorkDeque`] elements, use via [`DropTracker`]
+        static DROP_TRACKER: RefCell<Option<Vec<usize>>> = RefCell::new(None);
+    }
+
+    /// As long as an instance of this struct is live, WorkDeque drops are being
+    /// tracked
+    #[derive(Debug)]
+    pub(super) struct DropTracker(());
+    //
+    impl DropTracker {
+        /// Start tracking drops
+        fn new() -> Self {
+            DROP_TRACKER.set(Some(Vec::new()));
+            Self(())
+        }
+
+        /// Track some drops, if enabled
+        pub(super) fn track_drops(indices: impl IntoIterator<Item = usize>) {
+            DROP_TRACKER.with_borrow_mut(move |tracker| {
+                if let Some(tracker) = &mut *tracker {
+                    tracker.extend(indices)
+                }
+            })
+        }
+
+        /// Collect drops that occured since `new()` or last `collect_drops()`
+        fn collect_drops(&self) -> Vec<usize> {
+            DROP_TRACKER.replace(Some(Vec::new())).unwrap()
+        }
+    }
+    //
+    impl Drop for DropTracker {
+        fn drop(&mut self) {
+            DROP_TRACKER.set(None);
+        }
+    }
+
+    #[test]
+    fn drop() {
+        let drop_tracker = DropTracker::new();
+        let next_drops = Cell::new(Vec::new());
+        fn predict_drops<T>(deque: &WorkDeque<T>) -> Vec<usize> {
+            let mut result = Vec::with_capacity(deque.len());
+            let range = deque.load_range(Ordering::Relaxed);
+            let mut curr_idx = deque.steal_idx(range);
+            while curr_idx != deque.push_idx(range) {
+                result.push(curr_idx);
+                curr_idx = (curr_idx + 1) % deque.elements_len();
+            }
+            result
+        }
+        proptest!(|(deque: WorkDeque<isize>)| {
+            assert_eq!(drop_tracker.collect_drops(), next_drops.take());
+            next_drops.set(predict_drops(&deque));
+        });
+        proptest!(|(shared: SharedDeque<u64>)| {
+            prop_assert_eq!(drop_tracker.collect_drops(), next_drops.take());
+            next_drops.set(predict_drops(&shared.deque));
+        });
+        proptest!(|(worker: Worker<i32>)| {
+            prop_assert_eq!(drop_tracker.collect_drops(), next_drops.take());
+            next_drops.set(predict_drops(&worker.0.deque));
+        });
+        assert_eq!(drop_tracker.collect_drops(), next_drops.take());
+    }
+
     // === Single-threaded transactions ===
 
     /// Saved state of a [`WorkDeque`]
@@ -1578,73 +1647,4 @@ mod tests {
     // TODO: Also add benchmarks once tests are ready, and benchmark
     //       crossbeam_deque on the same task when feasible (+ add
     //       crossbeam/crossbeam_deque to benchmark feature)
-
-    // === Make sure the right queue elements get dropped ===
-
-    thread_local! {
-        /// Tracks dropped [`WorkDeque`] elements, use via [`DropTracker`]
-        static DROP_TRACKER: RefCell<Option<Vec<usize>>> = RefCell::new(None);
-    }
-
-    /// As long as an instance of this struct is live, WorkDeque drops are being
-    /// tracked
-    #[derive(Debug)]
-    pub(super) struct DropTracker(());
-    //
-    impl DropTracker {
-        /// Start tracking drops
-        fn new() -> Self {
-            DROP_TRACKER.set(Some(Vec::new()));
-            Self(())
-        }
-
-        /// Track some drops, if enabled
-        pub(super) fn track_drops(indices: impl IntoIterator<Item = usize>) {
-            DROP_TRACKER.with_borrow_mut(move |tracker| {
-                if let Some(tracker) = &mut *tracker {
-                    tracker.extend(indices)
-                }
-            })
-        }
-
-        /// Collect drops that occured since `new()` or last `collect_drops()`
-        fn collect_drops(&self) -> Vec<usize> {
-            DROP_TRACKER.replace(Some(Vec::new())).unwrap()
-        }
-    }
-    //
-    impl Drop for DropTracker {
-        fn drop(&mut self) {
-            DROP_TRACKER.set(None);
-        }
-    }
-
-    #[test]
-    fn drop() {
-        let drop_tracker = DropTracker::new();
-        let next_drops = Cell::new(Vec::new());
-        fn predict_drops<T>(deque: &WorkDeque<T>) -> Vec<usize> {
-            let mut result = Vec::with_capacity(deque.len());
-            let range = deque.load_range(Ordering::Relaxed);
-            let mut curr_idx = deque.steal_idx(range);
-            while curr_idx != deque.push_idx(range) {
-                result.push(curr_idx);
-                curr_idx = (curr_idx + 1) % deque.elements_len();
-            }
-            result
-        }
-        proptest!(|(deque: WorkDeque<isize>)| {
-            assert_eq!(drop_tracker.collect_drops(), next_drops.take());
-            next_drops.set(predict_drops(&deque));
-        });
-        proptest!(|(shared: SharedDeque<u64>)| {
-            prop_assert_eq!(drop_tracker.collect_drops(), next_drops.take());
-            next_drops.set(predict_drops(&shared.deque));
-        });
-        proptest!(|(worker: Worker<i32>)| {
-            prop_assert_eq!(drop_tracker.collect_drops(), next_drops.take());
-            next_drops.set(predict_drops(&worker.0.deque));
-        });
-        assert_eq!(drop_tracker.collect_drops(), next_drops.take());
-    }
 }
