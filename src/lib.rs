@@ -7,7 +7,7 @@
 
 #[cfg(feature = "bench")]
 pub mod bench;
-mod deque;
+pub mod deque;
 mod pool;
 mod priority;
 mod shared;

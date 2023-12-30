@@ -447,6 +447,7 @@ impl<T> WorkDeque<T> {
     ///
     /// Should be considered immediately stale upon reading if other threads may
     /// have access to the queue.
+    #[cfg(test)]
     fn len(&self) -> usize {
         let range = self.load_range(Ordering::Relaxed);
         range.local_idx.wrapping_sub(range.remote_idx) % self.elements_len()
@@ -976,8 +977,10 @@ mod tests {
         collections::HashSet,
         fmt::Debug,
         hash::Hash,
+        num::NonZeroUsize,
+        panic::AssertUnwindSafe,
         ptr,
-        sync::Mutex,
+        sync::{Mutex, MutexGuard},
         time::Duration,
     };
 
@@ -1362,7 +1365,7 @@ mod tests {
         }
     }
 
-    // === Test [`WorkDeque`] in a dual-thread configuration ===
+    // === Dual-threaded transactions ===
 
     /// Kind of number being sent from one end to the other
     type Element = usize;
@@ -1470,12 +1473,12 @@ mod tests {
             },
         );
     }
-
+    //
     #[test]
     fn local_to_remote() {
         one_way_test(true);
     }
-
+    //
     #[test]
     fn remote_to_local() {
         one_way_test(false);
@@ -1484,166 +1487,318 @@ mod tests {
     /// Number of transactions in the bidirectional() test
     const NUM_BIDI_TRANSACTIONS: Element = 500_000;
 
-    #[test]
-    fn bidirectional() {
-        let mut deque = WorkDeque::<Element>::new(CAPACITY);
-        for elem in deque.elements.iter_mut() {
-            elem.get_mut().write(Element::MAX / 2);
-        }
-
-        static STOP: AtomicBool = AtomicBool::new(false);
-        struct PanicGuard;
-        impl Drop for PanicGuard {
-            fn drop(&mut self) {
-                STOP.store(true, Ordering::Relaxed);
+    /// Commonnalities between the `bidirectional()` and `general()` tests
+    struct BidirectionalHarness {
+        stop: AtomicBool,
+        names: Box<[Box<str>]>,
+        element_ranges: Box<[std::ops::Range<Element>]>,
+        sent: Box<[Mutex<HashSet<Element>>]>,
+        received: Box<[Mutex<HashSet<Element>>]>,
+    }
+    //
+    impl BidirectionalHarness {
+        /// Set up a test harness for bidirectional communication between a
+        /// local worker thread and N remote threads
+        pub fn new(num_remotes: NonZeroUsize, num_transactions: Element) -> Self {
+            let num_threads = num_remotes.get() + 1;
+            let stop = AtomicBool::new(false);
+            let names = std::iter::once("Local".into())
+                .chain((1..=num_remotes.get()).map(|idx| format!("Remote{idx}").into_boxed_str()))
+                .collect();
+            let element_ranges = (0..num_threads)
+                .map(|idx| {
+                    let start = num_transactions * (1 + 2 * idx);
+                    start..(start + num_transactions)
+                })
+                .collect();
+            let sent = std::iter::repeat_with(|| Mutex::new(HashSet::new()))
+                .take(num_threads)
+                .collect();
+            let received = std::iter::repeat_with(|| Mutex::new(HashSet::new()))
+                .take(num_threads * num_threads)
+                .collect();
+            Self {
+                stop,
+                names,
+                element_ranges,
+                sent,
+                received,
             }
         }
 
-        let local_range = NUM_BIDI_TRANSACTIONS..2 * NUM_BIDI_TRANSACTIONS;
-        let remote_range = 3 * NUM_BIDI_TRANSACTIONS..4 * NUM_BIDI_TRANSACTIONS;
-        let [
-            sent_local,
-            received_local_from_local,
-            received_local_from_remote,
-            sent_remote,
-            received_remote_from_local,
-            received_remote_from_remote
-        ]: [Mutex<HashSet<Element>>; 6] = std::array::from_fn(|_| Mutex::new(HashSet::new()));
+        /// Fake `worker` argument for the `setup_thread` methods
+        pub fn fake_worker() -> &'static mut () {
+            Box::leak(Box::new(()))
+        }
 
-        let thread = |local: bool| {
-            // Pick a side of the deque
-            let panic_guard = PanicGuard;
-            let (sender, receiver): (SendFn, RecvFn) = if local {
-                (WorkDeque::push, WorkDeque::pop)
-            } else {
-                (WorkDeque::give, WorkDeque::steal)
-            };
-            let (self_name, other_name) = if local {
-                ("Local", "Remote")
-            } else {
-                ("Remote", "Local")
-            };
-            let mut sent = if local {
-                sent_local.lock().unwrap()
-            } else {
-                sent_remote.lock().unwrap()
-            };
-            let mut received_from_self = if local {
-                received_local_from_local.lock().unwrap()
-            } else {
-                received_remote_from_remote.lock().unwrap()
-            };
-            let mut received_from_other = if local {
-                received_remote_from_local.lock().unwrap()
-            } else {
-                received_local_from_remote.lock().unwrap()
-            };
-            let (my_range, other_range) = if local {
-                (local_range.clone(), remote_range.clone())
-            } else {
-                (remote_range.clone(), local_range.clone())
-            };
+        /// Set up all the threads
+        pub fn setup_all_threads<'out, Worker: Send + 'out>(
+            &'out self,
+            worker: &'out mut Worker,
+            mut push: impl FnMut(&mut Worker, Element) -> Result<(), Full<Element>> + Send + 'out,
+            mut pop: impl FnMut(&mut Worker) -> Option<Element> + Send + 'out,
+            give: impl FnMut(Element) -> Result<(), GiveError<Element>> + Clone + Send + 'out,
+            steal: impl FnMut() -> Result<Element, StealError> + Clone + Send + 'out,
+        ) -> Vec<Box<dyn FnOnce() + Send + 'out>> {
+            std::iter::once(self.setup_thread(
+                0,
+                worker,
+                move |worker, elem| match push(worker, elem) {
+                    Ok(()) => true,
+                    Err(Full(returned)) => {
+                        assert_eq!(returned, elem);
+                        std::thread::sleep(YIELD_SLEEP);
+                        false
+                    }
+                },
+                move |worker| {
+                    let result = pop(worker);
+                    if result.is_none() {
+                        std::thread::sleep(YIELD_SLEEP);
+                    }
+                    result
+                },
+            ))
+            .chain((1..=self.num_remote_threads()).map(move |remote_idx| {
+                let mut give = give.clone();
+                let mut steal = steal.clone();
+                self.setup_thread(
+                    remote_idx,
+                    Self::fake_worker(),
+                    move |(), elem| match give(elem) {
+                        Ok(()) => true,
+                        Err(GiveError { data, .. }) => {
+                            assert_eq!(data, elem);
+                            std::thread::sleep(YIELD_SLEEP);
+                            false
+                        }
+                    },
+                    move |()| {
+                        let result = steal().ok();
+                        if result.is_none() {
+                            std::thread::sleep(YIELD_SLEEP);
+                        }
+                        result
+                    },
+                )
+            }))
+            .collect()
+        }
 
-            // We'll need to receive values from two different places, extract
-            // the associated logic
-            let handle_recv =
-                |value: Element,
-                 sent: &HashSet<Element>,
-                 received_from_self: &mut HashSet<Element>,
-                 received_from_other: &mut HashSet<Element>| {
-                    if my_range.contains(&value) {
-                        assert!(
-                        sent.contains(&value),
-                        "{self_name}: received {value} that should be from myself, but I didn't send it..."
-                    );
-                        assert!(
-                            received_from_self.insert(value),
-                            "{self_name}: received {value} from myself twice"
-                        );
-                    } else if other_range.contains(&value) {
-                        assert!(
-                            received_from_other.insert(value),
-                            "{self_name}: received {value} from {other_name} twice"
-                        );
-                    } else {
-                        panic!("{self_name}: received unexpected {value}");
-                    }
-                };
-
-            // Randomly switch between attempts to send and receive data
-            let mut rng = rand::thread_rng();
-            let mut next_send = my_range.start;
-            for _ in my_range.clone() {
-                if STOP.load(Ordering::Relaxed) {
-                    break;
-                }
-                if rng.gen::<bool>() {
-                    // Send monotonically increasing integers
-                    // SAFETY: Only this thread uses this side of the deque
-                    if unsafe { try_send(sender, &deque, next_send) } {
-                        assert!(
-                            sent.insert(next_send),
-                            "{self_name}: sent {next_send} twice"
-                        );
-                        next_send += 1;
-                    }
-                } else {
-                    // Receive a number from either myself or the other thread
-                    // SAFETY: Only this thread uses this side of the deque
-                    if let Some(recv) = unsafe { try_recv(receiver, &deque) } {
-                        handle_recv(
-                            recv,
-                            &sent,
-                            &mut received_from_self,
-                            &mut received_from_other,
-                        );
-                    }
-                }
-            }
-            // Drain the queue at the end
-            while let Some(recv) = unsafe { try_recv(receiver, &deque) } {
-                handle_recv(
-                    recv,
-                    &sent,
-                    &mut received_from_self,
-                    &mut received_from_other,
+        /// Check final send/receive records at end of thread execution
+        pub fn check_thread_outcome(self) {
+            for sender_idx in 0..self.num_threads() {
+                let name = &self.names[sender_idx];
+                let received_by = self.received_from(sender_idx);
+                let lost = received_by.iter().fold(
+                    self.sent[sender_idx].lock().unwrap().clone(),
+                    |mut acc, received| {
+                        for value in received.iter() {
+                            acc.remove(value);
+                        }
+                        acc
+                    },
                 );
-            }
-            std::mem::forget(panic_guard);
-        };
-        testbench::concurrent_test_2(|| thread(true), || thread(false));
-
-        // Check that data transmission went well
-        let check_transmission =
-            |sender_name: &str,
-             sent: Mutex<HashSet<Element>>,
-             received_local: Mutex<HashSet<Element>>,
-             received_remote: Mutex<HashSet<Element>>| {
-                let sent = sent.into_inner().unwrap();
-                let received_local = received_local.into_inner().unwrap();
-                let received_remote = received_remote.into_inner().unwrap();
-                let lost = &(&sent - &received_local) - &received_remote;
-                let duplicated = &received_local & &received_remote;
+                let mut seen = HashSet::new();
+                let mut duplicated = HashSet::new();
+                for received in received_by.iter() {
+                    for value in received.iter() {
+                        if !seen.insert(value) {
+                            duplicated.insert(value);
+                        }
+                    }
+                }
                 assert!(
                     lost.is_empty() && duplicated.is_empty(),
-                    "of the values sent by {sender_name}, {lost:?} were not received and {duplicated:?} were received twice"
+                    "of the values sent by {name}, {lost:?} were not received and {duplicated:?} were received by both threads"
                 );
-            };
-        check_transmission(
-            "Local",
-            sent_local,
-            received_local_from_local,
-            received_local_from_remote,
-        );
-        check_transmission(
-            "Remote",
-            sent_remote,
-            received_remote_from_local,
-            received_remote_from_remote,
-        );
+            }
+        }
+
+        /// Set up a single thread
+        fn setup_thread<'out, Worker: Send + 'out>(
+            &'out self,
+            thread_idx: usize,
+            worker: &'out mut Worker,
+            mut try_send: impl FnMut(&mut Worker, Element) -> bool + Send + 'out,
+            mut try_recv: impl FnMut(&mut Worker) -> Option<Element> + Send + 'out,
+        ) -> Box<dyn FnOnce() + Send + 'out> {
+            // Make sure all other threads stop if we panic
+            self.handle_panics(move || {
+                // Collect this thread's data structures
+                let name = &self.names[thread_idx];
+                let element_range = self.element_ranges[thread_idx].clone();
+                let mut sent = self.sent[thread_idx].lock().unwrap();
+                let mut received_from = self.received_by(thread_idx);
+            
+                // We'll need to receive values from two different places, extract
+                // the associated logic
+                let handle_recv =
+                    |value: Element,
+                     sent: &HashSet<Element>,
+                     received_from: &mut [MutexGuard<'_, HashSet<Element>>]| {
+                        for (source_idx, range) in self.element_ranges.iter().enumerate() {
+                            if !range.contains(&value) {
+                                continue;
+                            }
+                            let source_name = if source_idx == thread_idx {
+                                assert!(
+                                    sent.contains(&value),
+                                    "{name}: received {value} that should be from myself, but I didn't send it..."
+                                );
+                                "myself"
+                            } else {
+                                &self.names[source_idx]
+                            };
+                            assert!(
+                                received_from[source_idx].insert(value),
+                                "{name}: received {value} from {source_name} twice"
+                            );
+                            return;
+                        }
+                        panic!("{name}: received unexpected {value}");
+                    };
+
+                // Randomly switch between attempts to send and receive data
+                let mut rng = rand::thread_rng();
+                let mut next_send = element_range.start;
+                for _ in element_range.clone() {
+                    if self.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if rng.gen::<bool>() {
+                        // Send monotonically increasing integers
+                        if try_send(worker, next_send) {
+                            assert!(
+                                sent.insert(next_send),
+                                "{name}: sent {next_send} twice"
+                            );
+                            next_send += 1;
+                        }
+                    } else {
+                        // Receive a number from either myself or the other thread
+                        if let Some(recv) = try_recv(worker) {
+                            handle_recv(
+                                recv,
+                                &sent,
+                                &mut received_from,
+                            );
+                        }
+                    }
+                }
+                // Drain the queue at the end
+                while let Some(recv) = try_recv(worker) {
+                    handle_recv(
+                        recv,
+                        &sent,
+                        &mut received_from,
+                    );
+                }
+            })
+        }
+
+        /// Total number of threads
+        fn num_threads(&self) -> usize {
+            let result = self.names.len();
+            assert_eq!(self.element_ranges.len(), result);
+            assert_eq!(self.sent.len(), result);
+            assert_eq!(self.received.len(), result * result);
+            result
+        }
+
+        /// Number of remote threads
+        fn num_remote_threads(&self) -> usize {
+            self.num_threads() - 1
+        }
+
+        /// Wrap a callable in such a way that panics set our stop flag
+        fn handle_panics<'out>(
+            &'out self,
+            callable: impl FnOnce() + Send + 'out,
+        ) -> Box<dyn FnOnce() + Send + 'out> {
+            Box::new(move || {
+                if let Err(e) = std::panic::catch_unwind(AssertUnwindSafe(callable)) {
+                    self.stop.store(true, Ordering::Release);
+                    std::panic::resume_unwind(e);
+                }
+            })
+        }
+
+        /// HashMaps tracking data received from each thread by a certain thread
+        fn received_by(&self, thread_idx: usize) -> Box<[MutexGuard<'_, HashSet<Element>>]> {
+            let num_threads = self.num_threads();
+            let start = thread_idx * num_threads;
+            self.received[start..start + num_threads]
+                .iter()
+                .map(|received| received.lock().unwrap())
+                .collect()
+        }
+
+        /// HashMaps tracking data received from a certain thread by each thread
+        fn received_from(&self, thread_idx: usize) -> Box<[MutexGuard<'_, HashSet<Element>>]> {
+            self.received
+                .iter()
+                .skip(thread_idx)
+                .step_by(self.num_threads())
+                .map(|received| received.lock().unwrap())
+                .collect()
+        }
     }
 
-    // TODO: Test transactions of one Worker + 2 Remote, each in own thread
+    /// Test bidirectional communication between two threads
+    #[test]
+    fn bidirectional() {
+        let deque = WorkDeque::<Element>::new(CAPACITY);
+        let harness =
+            BidirectionalHarness::new(NonZeroUsize::new(1).unwrap(), NUM_BIDI_TRANSACTIONS);
+        {
+            let mut threads = harness
+                .setup_all_threads(
+                    BidirectionalHarness::fake_worker(),
+                    // SAFETY: BidirectionalHarness enforces a single local thread
+                    |(), elem| unsafe { deque.push(elem) },
+                    |()| unsafe { deque.pop() },
+                    // SAFETY: Requested a single remote thread above
+                    |elem| unsafe { deque.give(elem).map_err(Into::into) },
+                    || unsafe { deque.steal().ok_or(StealError::Empty) },
+                )
+                .into_iter();
+            testbench::concurrent_test_2(threads.next().unwrap(), threads.next().unwrap());
+        }
+        harness.check_thread_outcome();
+    }
+
+    // === Fully multi-threaded transactions with remote lock ===
+
+    /// Number of transactions in the general() test
+    const NUM_GENERAL_TRANSACTIONS: Element = 500_000;
+
+    /// Generalization of the `bidirectional()` test with three threads
+    #[test]
+    fn general() {
+        let mut worker = Worker::<Element>::new(CAPACITY);
+        let remote = worker.remote();
+        let harness =
+            BidirectionalHarness::new(NonZeroUsize::new(2).unwrap(), NUM_GENERAL_TRANSACTIONS);
+        {
+            let mut threads = harness
+                .setup_all_threads(
+                    &mut worker,
+                    |worker, elem| worker.push(elem),
+                    |worker| worker.pop(),
+                    |elem| remote.give(elem),
+                    || remote.steal(),
+                )
+                .into_iter();
+            testbench::concurrent_test_3(
+                threads.next().unwrap(),
+                threads.next().unwrap(),
+                threads.next().unwrap(),
+            );
+        }
+        harness.check_thread_outcome();
+    }
+
     // TODO: Also add benchmarks once tests are ready, and benchmark
     //       crossbeam_deque on the same task when feasible (+ add
     //       crossbeam/crossbeam_deque to benchmark feature)
