@@ -440,6 +440,15 @@ impl<T> WorkDeque<T> {
         elements_len
     }
 
+    /// Current number of enqueued elements
+    ///
+    /// Should be considered immediately stale upon reading if other threads may
+    /// have access to the queue.
+    pub fn len(&self) -> usize {
+        let range = self.load_range(Ordering::Relaxed);
+        range.local_idx.wrapping_sub(range.remote_idx) % self.elements_len()
+    }
+
     /// Push work on the worker side of the deque
     ///
     /// See [`Worker::push()`] for more information.
@@ -863,7 +872,10 @@ impl<T> Drop for WorkDeque<T> {
         let first_elem_idx = self.steal_idx(range);
         let last_elem_idx = self.pop_idx(range);
         if first_elem_idx <= last_elem_idx {
-            for element in &mut self.elements[first_elem_idx..=last_elem_idx] {
+            let elements = first_elem_idx..=last_elem_idx;
+            #[cfg(test)]
+            tests::DropTracker::track_drops(elements.clone());
+            for element in &mut self.elements[elements] {
                 // SAFETY: Queue elements from `first_elem_idx` to
                 //         `last_elem_idx` should be initialized and ready to be
                 //         popped from both ends, therefore dropping them should
@@ -872,6 +884,10 @@ impl<T> Drop for WorkDeque<T> {
                 unsafe { element.get_mut().assume_init_drop() }
             }
         } else {
+            #[cfg(test)]
+            tests::DropTracker::track_drops(
+                (first_elem_idx..self.elements_len()).chain(0..=last_elem_idx),
+            );
             let (head_elems, first_elems) = self.elements.split_at_mut(first_elem_idx);
             let last_elems = &mut head_elems[..=last_elem_idx];
             for element in first_elems.iter_mut().chain(last_elems) {
@@ -946,9 +962,68 @@ mod tests {
     use super::*;
     use crate::tests::assert_panics;
     use proptest::sample::SizeRange;
-    use std::ptr;
+    use std::{
+        cell::{Cell, RefCell},
+        ptr,
+    };
 
-    /// Buffer capacity that is usually valid, but may not be
+    /// Test properties of WorkDeque that should always be true
+    fn check_deque_state<T>(deque: &WorkDeque<T>) -> Result<(), TestCaseError> {
+        // Need at least two storage slots for private slots not to overlap
+        prop_assert!(deque.elements.len() >= 2);
+
+        // Fast path to power-of-2 buffer length and associated bitmask
+        prop_assert_eq!(deque.elements_len(), deque.elements.len());
+        prop_assert!(deque.elements_len().is_power_of_two());
+        prop_assert_eq!(deque.index_mask(), deque.elements_len() - 1);
+
+        // Range upholds basic sanity checks
+        let range = deque.load_range(Ordering::Relaxed);
+        prop_assert!(range.local_idx < deque.elements_len());
+        prop_assert!(range.remote_idx < deque.elements_len());
+        prop_assert_eq!(
+            range.into_raw(deque.index_mask()),
+            deque.range.load(Ordering::Relaxed)
+        );
+
+        // Length makes sense
+        prop_assert_eq!(
+            deque.len(),
+            range.local_idx.wrapping_sub(range.remote_idx) % deque.elements_len()
+        );
+
+        // Empty/full detection makes sense
+        prop_assert_eq!(deque.is_empty(range), range.local_idx == range.remote_idx);
+        prop_assert_eq!(deque.is_empty(range), deque.len() == 0);
+        prop_assert_eq!(
+            deque.is_full(range),
+            range.remote_idx == (range.local_idx + 2) % deque.elements_len()
+        );
+        prop_assert_eq!(
+            deque.is_full(range),
+            deque.len() == deque.elements_len() - 2
+        );
+
+        // Storage slots are allocated as expected
+        prop_assert_eq!(deque.pop_idx(range), range.local_idx);
+        prop_assert_eq!(
+            deque.push_idx(range),
+            (range.local_idx + 1) % deque.elements_len()
+        );
+        prop_assert_eq!(deque.give_idx(range), range.remote_idx);
+        prop_assert_eq!(
+            deque.steal_idx(range),
+            (range.remote_idx + 1) % deque.elements_len()
+        );
+        prop_assert_ne!(
+            deque.push_idx(range),
+            deque.give_idx(range),
+            "private storage slots must never overlap"
+        );
+        Ok(())
+    }
+
+    /// Generate a buffer capacity that is usually valid, but may not be
     fn buffer_capacity() -> impl Strategy<Value = usize> {
         let max_size = SizeRange::default().end_incl();
         if max_size > MAX_CAPACITY {
@@ -978,6 +1053,7 @@ mod tests {
             }
 
             fn check_initial_deque<T>(deque: &WorkDeque<T>, capacity: usize) -> Result<(), TestCaseError> {
+                check_deque_state(deque)?;
                 let expected_elements = WorkDeque::<T>::num_elements_from_capacity(capacity);
                 prop_assert_eq!(deque.elements.len(), expected_elements);
                 prop_assert_eq!(2usize.pow(deque.elements_len_pow2.get()), expected_elements);
@@ -1000,47 +1076,16 @@ mod tests {
             let remote = worker.remote();
             prop_assert!(ptr::eq(&*worker.0, &*remote.0));
             check_initial_shared(&remote.0, capacity)?;
+
+            let drop_tracker = DropTracker::new();
+            WorkDeque::<i8>::new(capacity);
+            SharedDeque::<u16>::new(capacity);
+            Worker::<i32>::new(capacity);
+            prop_assert!(drop_tracker.collect_drops().is_empty());
         }
     }
 
-    /// Test read-only properties of WorkDeque
-    fn check_deque_state<T>(deque: &WorkDeque<T>) -> Result<(), TestCaseError> {
-        // Fast path to power-of-2 elements len and associated bitmask
-        prop_assert_eq!(deque.elements_len(), deque.elements.len());
-        prop_assert!(deque.elements_len().is_power_of_two());
-        prop_assert_eq!(deque.index_mask(), deque.elements_len() - 1);
-
-        // Range upholds invariants
-        let range = deque.load_range(Ordering::Relaxed);
-        prop_assert!(range.local_idx < deque.elements_len());
-        prop_assert!(range.remote_idx < deque.elements_len());
-        prop_assert_eq!(
-            range.into_raw(deque.index_mask()),
-            deque.range.load(Ordering::Relaxed)
-        );
-        prop_assert_eq!(deque.is_empty(range), range.local_idx == range.remote_idx);
-        prop_assert_eq!(
-            deque.is_full(range),
-            range.remote_idx == (range.local_idx + 2) % deque.elements_len()
-        );
-        prop_assert_eq!(deque.pop_idx(range), range.local_idx);
-        prop_assert_eq!(
-            deque.push_idx(range),
-            (range.local_idx + 1) % deque.elements_len()
-        );
-        prop_assert_eq!(deque.give_idx(range), range.remote_idx);
-        prop_assert_eq!(
-            deque.steal_idx(range),
-            (range.remote_idx + 1) % deque.elements_len()
-        );
-        prop_assert_ne!(
-            deque.push_idx(range),
-            deque.give_idx(range),
-            "private push should nver overlap"
-        );
-        Ok(())
-    }
-    //
+    // Test arbitrary deque generation
     proptest! {
         #[test]
         fn work_state(deque: WorkDeque<isize>) {
@@ -1048,13 +1093,15 @@ mod tests {
         }
         //
         #[test]
-        fn read_only_shared(shared: SharedDeque<u32>) {
+        fn shared_state(shared: SharedDeque<u32>) {
             check_deque_state(&shared.deque)?;
+            // No extra invariant for SharedDeque
         }
         //
         #[test]
-        fn read_only_worker(worker: Worker<f64>) {
+        fn worker_state(worker: Worker<f64>) {
             check_deque_state(&worker.0.deque)?;
+            // No extra invariant for SharedDeque and Worker
         }
     }
 
@@ -1085,12 +1132,93 @@ mod tests {
         }
     }
 
+    /* /// Test basic transactions in a single-threaded environment, which does not
+    /// verify concurrent correctness but enables maximal end state checking
+    proptest! {
+        #[test]
+        fn push(deque: WorkDeque<isize>, value: isize) {
+            let was_full = deque.is_full(deque.load_range(Ordering::Relaxed));
+            let result
+        }
+    } */
+
     // TODO: Test basic transactions of RingBuffer from arbitrary state...
     //       - From a single thread
     //       - From two concurrent threads, one taking the local side and one
-    //         taking the remote side, reverting transactions after running them
+    //         taking the remote side, reverting transactions after running
+    //         them. Take inspiration from triple-buffer tests and use RaceCell
+    //         with a well-known initial state and a shared counter.
     // TODO: Test transactions of one Worker + 2 Remote, each in own thread
     // TODO: Also add benchmarks once tests are ready, and benchmark
     //       crossbeam_deque on the same task when feasible (+ add
     //       crossbeam/crossbeam_deque to benchmark feature)
+
+    // === Make sure the right queue elements get dropped ===
+
+    thread_local! {
+        /// Tracks dropped [`WorkDeque`] elements, use via [`DropTracker`]
+        static DROP_TRACKER: RefCell<Option<Vec<usize>>> = RefCell::new(None);
+    }
+
+    /// As long as an instance of this struct is live, WorkDeque drops are being
+    /// tracked
+    #[derive(Debug)]
+    pub(super) struct DropTracker(());
+    //
+    impl DropTracker {
+        /// Start tracking drops
+        fn new() -> Self {
+            DROP_TRACKER.set(Some(Vec::new()));
+            Self(())
+        }
+
+        /// Track some drops, if enabled
+        pub(super) fn track_drops(indices: impl IntoIterator<Item = usize>) {
+            DROP_TRACKER.with_borrow_mut(move |tracker| {
+                if let Some(tracker) = &mut *tracker {
+                    tracker.extend(indices)
+                }
+            })
+        }
+
+        /// Collect drops that occured since `new()` or last `collect_drops()`
+        fn collect_drops(&self) -> Vec<usize> {
+            DROP_TRACKER.replace(Some(Vec::new())).unwrap()
+        }
+    }
+    //
+    impl Drop for DropTracker {
+        fn drop(&mut self) {
+            DROP_TRACKER.set(None);
+        }
+    }
+
+    #[test]
+    fn drop() {
+        let drop_tracker = DropTracker::new();
+        let next_drops = Cell::new(Vec::new());
+        fn predict_drops<T>(deque: &WorkDeque<T>) -> Vec<usize> {
+            let mut result = Vec::with_capacity(deque.len());
+            let range = deque.load_range(Ordering::Relaxed);
+            let mut curr_idx = deque.steal_idx(range);
+            while curr_idx != deque.push_idx(range) {
+                result.push(curr_idx);
+                curr_idx = (curr_idx + 1) % deque.elements_len();
+            }
+            result
+        }
+        proptest!(|(deque: WorkDeque<isize>)| {
+            assert_eq!(drop_tracker.collect_drops(), next_drops.take());
+            next_drops.set(predict_drops(&deque));
+        });
+        proptest!(|(shared: SharedDeque<u64>)| {
+            prop_assert_eq!(drop_tracker.collect_drops(), next_drops.take());
+            next_drops.set(predict_drops(&shared.deque));
+        });
+        proptest!(|(worker: Worker<i32>)| {
+            prop_assert_eq!(drop_tracker.collect_drops(), next_drops.take());
+            next_drops.set(predict_drops(&worker.0.deque));
+        });
+        assert_eq!(drop_tracker.collect_drops(), next_drops.take());
+    }
 }
