@@ -38,7 +38,8 @@ use crossbeam::utils::CachePadded;
 #[cfg(test)]
 use proptest::prelude::*;
 use std::{
-    cell::UnsafeCell,
+    cell::{Cell, UnsafeCell},
+    marker::PhantomData,
     mem::MaybeUninit,
     num::NonZeroU32,
     sync::{
@@ -53,8 +54,13 @@ use std::{
 pub const MAX_CAPACITY: usize = 2usize.pow(Range::INDEX_BITS) - 2;
 
 /// Worker-side interface to the work queue
+//
+// --- Implementation notes ---
+//
+// PhantomData<Cell> is used to make this type !Sync as it's not meant to be
+// used from multiple threads.
 #[derive(Debug)]
-pub struct Worker<T>(Arc<SharedDeque<T>>);
+pub struct Worker<T>(Arc<SharedDeque<T>>, PhantomData<Cell<u8>>);
 //
 impl<T> Worker<T> {
     /// Set up the work queue
@@ -63,7 +69,7 @@ impl<T> Worker<T> {
     /// to allow for more efficient transactions later on. It cannot be larger
     /// than [`MAX_CAPACITY`].
     pub fn new(capacity: usize) -> Self {
-        Self(SharedDeque::new(capacity))
+        Self(SharedDeque::new(capacity), PhantomData)
     }
 
     /// Set up a remote interface to the work queue
@@ -110,12 +116,9 @@ where
 
     fn arbitrary_with(args: Self::Parameters) -> Self::Strategy {
         <SharedDeque<T> as Arbitrary>::arbitrary_with(args)
-            .prop_map(|shared| Self(Arc::new(shared)))
+            .prop_map(|shared| Self(Arc::new(shared), PhantomData))
     }
 }
-//
-// SAFETY: There is no risk associated with sending a Worker to another thread
-unsafe impl<T> Send for Worker<T> {}
 
 /// Error returned when attempting to push work to a full work queue
 ///
@@ -245,7 +248,7 @@ impl<T> SharedDeque<T> {
     /// Set up the shared state
     ///
     /// See [`Worker::new()`] docs to know more about acceptable capacities.
-    pub fn new(capacity: usize) -> Arc<Self> {
+    fn new(capacity: usize) -> Arc<Self> {
         Arc::new(Self {
             deque: CachePadded::new(WorkDeque::new(capacity)),
             remote_lock: CachePadded::new(AtomicBool::new(false)),
@@ -253,7 +256,7 @@ impl<T> SharedDeque<T> {
     }
 
     /// Attempt to acquire the lock on the remote end of the deque
-    pub fn try_lock_remote(&self) -> Result<RemoteLock<T>, Locked> {
+    fn try_lock_remote(&self) -> Result<RemoteLock<T>, Locked> {
         RemoteLock::new(self)
     }
 }
@@ -413,7 +416,7 @@ impl<T> WorkDeque<T> {
     /// Set up the ring buffer
     ///
     /// See [`Worker::new()`] docs to know more about acceptable capacities.
-    pub fn new(capacity: usize) -> Self {
+    fn new(capacity: usize) -> Self {
         let elements_len = Self::num_elements_from_capacity(capacity);
         let elements = std::iter::repeat_with(|| UnsafeCell::new(MaybeUninit::uninit()))
             .take(elements_len)
@@ -444,7 +447,7 @@ impl<T> WorkDeque<T> {
     ///
     /// Should be considered immediately stale upon reading if other threads may
     /// have access to the queue.
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         let range = self.load_range(Ordering::Relaxed);
         range.local_idx.wrapping_sub(range.remote_idx) % self.elements_len()
     }
@@ -456,7 +459,7 @@ impl<T> WorkDeque<T> {
     /// # Safety
     ///
     /// This function may only be called by the thread that owns the work queue.
-    pub unsafe fn push(&self, work: T) -> Result<(), Full<T>> {
+    unsafe fn push(&self, work: T) -> Result<(), Full<T>> {
         // Make sure the queue isn't full
         //
         // Can use Relaxed ordering because at this stage, we're only using the
@@ -524,7 +527,7 @@ impl<T> WorkDeque<T> {
     /// # Safety
     ///
     /// This function may only be called by the thread that owns the work queue.
-    pub unsafe fn pop(&self) -> Option<T> {
+    unsafe fn pop(&self) -> Option<T> {
         // Make sure the queue isn't empty
         //
         // Relaxed ordering is fine at this stage because we're going to re-read
@@ -560,7 +563,7 @@ impl<T> WorkDeque<T> {
                 new_range.local_idx, range.local_idx,
                 "only the worker thread is allowed to change local_idx"
             );
-            if self.is_empty(range) {
+            if self.is_empty(new_range) {
                 return None;
             }
             range = new_range;
@@ -590,7 +593,7 @@ impl<T> WorkDeque<T> {
     /// Access to the remote end of the queue should be synchronized via an
     /// external lock, which controls access to `remote_idx` and the associated
     /// private `elements[remote_idx]` storage cell.
-    pub unsafe fn give(&self, work: T) -> Result<(), Full<T>> {
+    unsafe fn give(&self, work: T) -> Result<(), Full<T>> {
         // Make sure the queue isn't full
         //
         // Can use Relaxed ordering because acquisition of the remote end's lock
@@ -657,7 +660,7 @@ impl<T> WorkDeque<T> {
     /// Access to the remote end of the queue should be synchronized via an
     /// external lock, which controls access to `remote_idx` and the associated
     /// private `elements[remote_idx]` storage cell.
-    pub unsafe fn steal(&self) -> Option<T> {
+    unsafe fn steal(&self) -> Option<T> {
         // Make sure the queue isn't empty
         //
         // Relaxed ordering is fine at this stage because we're going to re-read
@@ -692,7 +695,7 @@ impl<T> WorkDeque<T> {
                 new_range.remote_idx, range.remote_idx,
                 "only the remote lock holder is allowed to change remote_idx"
             );
-            if self.is_empty(range) {
+            if self.is_empty(new_range) {
                 return None;
             }
             range = new_range;
@@ -902,6 +905,12 @@ impl<T> Drop for WorkDeque<T> {
         }
     }
 }
+//
+// SAFETY: Moving this across threads is not risky
+unsafe impl<T> Send for WorkDeque<T> {}
+//
+// SAFETY: Only unsafe functions are dangerous with multiple threads
+unsafe impl<T> Sync for WorkDeque<T> {}
 
 /// Packed [`WorkDeque`] range
 ///
@@ -964,9 +973,12 @@ mod tests {
     use proptest::sample::SizeRange;
     use std::{
         cell::{Cell, RefCell},
+        collections::HashSet,
         fmt::Debug,
         hash::Hash,
         ptr,
+        sync::Mutex,
+        time::Duration,
     };
 
     // === Common tests ===
@@ -1281,11 +1293,287 @@ mod tests {
         }
     }
 
-    // TODO: Test basic transactions of RingBuffer from arbitrary state...
-    //       - From two concurrent threads, one taking the local side and one
-    //         taking the remote side, reverting transactions after running
-    //         them. Take inspiration from triple-buffer tests and use RaceCell
-    //         with a well-known initial state and a shared counter.
+    // === Test [`WorkDeque`] in a dual-thread configuration ===
+
+    /// Kind of number being sent from one end to the other
+    type Element = usize;
+
+    /// Queue capacity
+    ///
+    /// Should be large enough to ensure that data is spread across at least two
+    /// cache lines, but small enough to ensure that one thread will inevitably
+    /// await another from time to time.
+    const CAPACITY: usize = 200 / std::mem::size_of::<Element>();
+
+    /// Delay between one failed send/receive and the next one
+    const YIELD_SLEEP: Duration = Duration::from_nanos(1);
+
+    /// [`WorkDeque`] method that adds work on one end of the dequeue
+    type SendFn = unsafe fn(&WorkDeque<Element>, Element) -> Result<(), Full<Element>>;
+
+    /// Try to send work on one side of the deque, tell if that was successful
+    ///
+    /// # Safety
+    ///
+    /// You must have exclusive access to this side of the deque.
+    unsafe fn try_send(sender: SendFn, deque: &WorkDeque<Element>, value: Element) -> bool {
+        // SAFETY: Per function precondition
+        match unsafe { sender(deque, value) } {
+            Ok(()) => true,
+            Err(Full(returned)) => {
+                assert_eq!(returned, value);
+                std::thread::sleep(YIELD_SLEEP);
+                false
+            }
+        }
+    }
+
+    /// Send work on one side of the deque
+    ///
+    /// # Safety
+    ///
+    /// You must have exclusive access to this side of the deque.
+    unsafe fn send(sender: SendFn, deque: &WorkDeque<Element>, value: Element) {
+        // SAFETY: Per function precondition
+        while unsafe { !try_send(sender, deque, value) } {}
+    }
+
+    /// [`WorkDeque`] method that removes work from one end of the deque
+    type RecvFn = unsafe fn(&WorkDeque<Element>) -> Option<Element>;
+
+    /// Try to receive work on one side of the deque
+    ///
+    /// # Safety
+    ///
+    /// You must have exclusive access to this side of the deque.
+    unsafe fn try_recv(receiver: RecvFn, deque: &WorkDeque<Element>) -> Option<Element> {
+        // SAFETY: Per function precondition
+        let result = unsafe { receiver(deque) };
+        if result.is_none() {
+            std::thread::sleep(YIELD_SLEEP);
+        }
+        result
+    }
+
+    /// Receive work on one side of the deque
+    ///
+    /// # Safety
+    ///
+    /// You must have exclusive access to this side of the deque.
+    unsafe fn recv(receiver: RecvFn, deque: &WorkDeque<Element>) -> Element {
+        loop {
+            // SAFETY: Per function precondition
+            if let Some(value) = unsafe { try_recv(receiver, deque) } {
+                return value;
+            }
+        }
+    }
+
+    /// Number of numbers that are sent in one_way_test()
+    const NUM_ONEWAY_TRANSACTIONS: Element = 1_000_000;
+
+    /// Try sending a stream messages from one end of the deque to another
+    #[inline(always)]
+    fn one_way_test(local_to_remote: bool) {
+        // Pick a function that sends work on one end of the deque and one that
+        // receives work from the other end of the deque
+        let (sender, receiver): (SendFn, RecvFn) = if local_to_remote {
+            (WorkDeque::push, WorkDeque::steal)
+        } else {
+            (WorkDeque::give, WorkDeque::pop)
+        };
+
+        // Send NUM_TRANSACTIONS numbers from one end to the other end
+        let deque = WorkDeque::<Element>::new(CAPACITY);
+        testbench::concurrent_test_2(
+            || {
+                for value in 0..NUM_ONEWAY_TRANSACTIONS {
+                    // SAFETY: Only this thread uses this side of the deque
+                    unsafe { send(sender, &deque, value) };
+                }
+            },
+            || {
+                for expected in 0..NUM_ONEWAY_TRANSACTIONS {
+                    // SAFETY: Only this thread uses this side of the deque
+                    let actual = unsafe { recv(receiver, &deque) };
+                    assert_eq!(expected, actual);
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn local_to_remote() {
+        one_way_test(true);
+    }
+
+    #[test]
+    fn remote_to_local() {
+        one_way_test(false);
+    }
+
+    /// Number of transactions in the bidirectional() test
+    const NUM_BIDI_TRANSACTIONS: Element = 500_000;
+
+    #[test]
+    fn bidirectional() {
+        let mut deque = WorkDeque::<Element>::new(CAPACITY);
+        for elem in deque.elements.iter_mut() {
+            elem.get_mut().write(Element::MAX / 2);
+        }
+
+        static STOP: AtomicBool = AtomicBool::new(false);
+        struct PanicGuard;
+        impl Drop for PanicGuard {
+            fn drop(&mut self) {
+                STOP.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let local_range = NUM_BIDI_TRANSACTIONS..2 * NUM_BIDI_TRANSACTIONS;
+        let remote_range = 3 * NUM_BIDI_TRANSACTIONS..4 * NUM_BIDI_TRANSACTIONS;
+        let [
+            sent_local,
+            received_local_from_local,
+            received_local_from_remote,
+            sent_remote,
+            received_remote_from_local,
+            received_remote_from_remote
+        ]: [Mutex<HashSet<Element>>; 6] = std::array::from_fn(|_| Mutex::new(HashSet::new()));
+
+        let thread = |local: bool| {
+            // Pick a side of the deque
+            let panic_guard = PanicGuard;
+            let (sender, receiver): (SendFn, RecvFn) = if local {
+                (WorkDeque::push, WorkDeque::pop)
+            } else {
+                (WorkDeque::give, WorkDeque::steal)
+            };
+            let (self_name, other_name) = if local {
+                ("Local", "Remote")
+            } else {
+                ("Remote", "Local")
+            };
+            let mut sent = if local {
+                sent_local.lock().unwrap()
+            } else {
+                sent_remote.lock().unwrap()
+            };
+            let mut received_from_self = if local {
+                received_local_from_local.lock().unwrap()
+            } else {
+                received_remote_from_remote.lock().unwrap()
+            };
+            let mut received_from_other = if local {
+                received_remote_from_local.lock().unwrap()
+            } else {
+                received_local_from_remote.lock().unwrap()
+            };
+            let (my_range, other_range) = if local {
+                (local_range.clone(), remote_range.clone())
+            } else {
+                (remote_range.clone(), local_range.clone())
+            };
+
+            // We'll need to receive values from two different places, extract
+            // the associated logic
+            let handle_recv =
+                |value: Element,
+                 sent: &HashSet<Element>,
+                 received_from_self: &mut HashSet<Element>,
+                 received_from_other: &mut HashSet<Element>| {
+                    if my_range.contains(&value) {
+                        assert!(
+                        sent.contains(&value),
+                        "{self_name}: received {value} that should be from myself, but I didn't send it..."
+                    );
+                        assert!(
+                            received_from_self.insert(value),
+                            "{self_name}: received {value} from myself twice"
+                        );
+                    } else if other_range.contains(&value) {
+                        assert!(
+                            received_from_other.insert(value),
+                            "{self_name}: received {value} from {other_name} twice"
+                        );
+                    } else {
+                        panic!("{self_name}: received unexpected {value}");
+                    }
+                };
+
+            // Randomly switch between attempts to send and receive data
+            let mut rng = rand::thread_rng();
+            let mut next_send = my_range.start;
+            for _ in my_range.clone() {
+                if STOP.load(Ordering::Relaxed) {
+                    break;
+                }
+                if rng.gen::<bool>() {
+                    // Send monotonically increasing integers
+                    // SAFETY: Only this thread uses this side of the deque
+                    if unsafe { try_send(sender, &deque, next_send) } {
+                        assert!(
+                            sent.insert(next_send),
+                            "{self_name}: sent {next_send} twice"
+                        );
+                        next_send += 1;
+                    }
+                } else {
+                    // Receive a number from either myself or the other thread
+                    // SAFETY: Only this thread uses this side of the deque
+                    if let Some(recv) = unsafe { try_recv(receiver, &deque) } {
+                        handle_recv(
+                            recv,
+                            &sent,
+                            &mut received_from_self,
+                            &mut received_from_other,
+                        );
+                    }
+                }
+            }
+            // Drain the queue at the end
+            while let Some(recv) = unsafe { try_recv(receiver, &deque) } {
+                handle_recv(
+                    recv,
+                    &sent,
+                    &mut received_from_self,
+                    &mut received_from_other,
+                );
+            }
+            std::mem::forget(panic_guard);
+        };
+        testbench::concurrent_test_2(|| thread(true), || thread(false));
+
+        // Check that data transmission went well
+        let check_transmission =
+            |sender_name: &str,
+             sent: Mutex<HashSet<Element>>,
+             received_local: Mutex<HashSet<Element>>,
+             received_remote: Mutex<HashSet<Element>>| {
+                let sent = sent.into_inner().unwrap();
+                let received_local = received_local.into_inner().unwrap();
+                let received_remote = received_remote.into_inner().unwrap();
+                let lost = &(&sent - &received_local) - &received_remote;
+                let received_twice = &received_local & &received_remote;
+                assert!(
+                    lost.is_empty() && received_twice.is_empty(),
+                    "of the values sent by {sender_name}, {lost:?} were not received and {received_twice:?} were received twice"
+                );
+            };
+        check_transmission(
+            "Local",
+            sent_local,
+            received_local_from_local,
+            received_local_from_remote,
+        );
+        check_transmission(
+            "Remote",
+            sent_remote,
+            received_remote_from_local,
+            received_remote_from_remote,
+        );
+    }
+
     // TODO: Test transactions of one Worker + 2 Remote, each in own thread
     // TODO: Also add benchmarks once tests are ready, and benchmark
     //       crossbeam_deque on the same task when feasible (+ add
