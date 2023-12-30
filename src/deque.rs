@@ -1623,10 +1623,10 @@ mod tests {
                 let received_local = received_local.into_inner().unwrap();
                 let received_remote = received_remote.into_inner().unwrap();
                 let lost = &(&sent - &received_local) - &received_remote;
-                let received_twice = &received_local & &received_remote;
+                let duplicated = &received_local & &received_remote;
                 assert!(
-                    lost.is_empty() && received_twice.is_empty(),
-                    "of the values sent by {sender_name}, {lost:?} were not received and {received_twice:?} were received twice"
+                    lost.is_empty() && duplicated.is_empty(),
+                    "of the values sent by {sender_name}, {lost:?} were not received and {duplicated:?} were received twice"
                 );
             };
         check_transmission(
