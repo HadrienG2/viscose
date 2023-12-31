@@ -11,8 +11,12 @@ use self::{
     futex::{StealLocation, WorkerFutex},
     job::{Schedule, Task},
 };
+use crate::{
+    deque::{self, Remote},
+    WORK_QUEUE_CAPACITY,
+};
 use crossbeam::{
-    deque::{self, Injector, Steal, Stealer},
+    deque::{Injector, Steal},
     utils::CachePadded,
 };
 use hwlocality::{bitmap::BitmapIndex, cpu::cpuset::CpuSet, Topology};
@@ -265,7 +269,7 @@ pub(crate) struct WorkerConfig {
 #[derive(Debug)]
 pub(crate) struct WorkerInterface {
     /// A way to steal from the worker
-    pub stealer: Stealer<Task>,
+    pub remote: Remote<Task>,
 
     /// Futex that the worker sleeps on when it has nothing to do, used to
     /// instruct it what to do when it is awakened.
@@ -279,11 +283,11 @@ pub(crate) struct WorkerInterface {
 /// of the world to communicate with the worker.
 pub(crate) fn new_worker(cpu: BitmapIndex) -> (WorkerConfig, WorkerInterface) {
     let config = WorkerConfig {
-        work_queue: deque::Worker::new_lifo(),
+        work_queue: deque::Worker::new(WORK_QUEUE_CAPACITY),
         cpu,
     };
     let interface = WorkerInterface {
-        stealer: config.work_queue.stealer(),
+        remote: config.work_queue.remote(),
         futex: WorkerFutex::new(),
     };
     (config, interface)

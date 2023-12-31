@@ -4,6 +4,7 @@ pub mod scope;
 
 use self::scope::Scope;
 use crate::{
+    deque::{self, StealError},
     shared::{
         distances::Distance,
         flags::bitref::BitRef,
@@ -13,7 +14,7 @@ use crate::{
     },
     MAX_SPIN_ITERS_PER_CHECK, OS_WAIT_DELAY, SPIN_ITERS_BEFORE_YIELD, YIELD_DURATION,
 };
-use crossbeam::deque::{self, Steal};
+use crossbeam::deque::Steal;
 use std::{
     cell::Cell,
     debug_assert,
@@ -264,7 +265,11 @@ impl<'pool> Worker<'pool> {
         // while the worker finishes processing its current task, but it seems
         // like a fair price to pay in exchange for a clean synchronization
         // protocol and a cheap happy path when every worker stays fed.
-        self.steal_with(|| self.shared.workers[idx].stealer.steal())
+        self.steal_with(|| match self.shared.workers[idx].remote.steal() {
+            Ok(task) => Steal::Success(task),
+            Err(StealError::Empty) => Steal::Empty,
+            Err(StealError::Locked) => Steal::Retry,
+        })
     }
 
     /// Try to steal work from the global task injector

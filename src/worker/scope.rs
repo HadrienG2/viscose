@@ -5,6 +5,7 @@
 
 use super::Worker;
 use crate::{
+    deque::Full,
     shared::{
         futex::WorkerFutex,
         job::{AbortOnUnwind, Job, Notify, Schedule, Task},
@@ -136,7 +137,9 @@ impl<'scope> Scope<'scope> {
     #[inline(always)]
     unsafe fn spawn_unchecked(&self, task: Task) {
         // Schedule the work to be executed
-        self.worker.work_queue.push(task);
+        if let Err(Full(task)) = self.worker.work_queue.push(task) {
+            self.worker.shared.inject_task(task, self.worker.idx);
+        }
 
         // ...and once this push is visible...
         //

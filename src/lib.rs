@@ -14,6 +14,7 @@ mod shared;
 mod worker;
 
 use hwlocality::{cpu::cpuset::CpuSet, object::TopologyObject};
+use shared::job::Task;
 use std::{sync::atomic::Ordering, time::Duration};
 
 // Re-export components that are part of the public interface
@@ -97,6 +98,9 @@ const DESIRED_PARALLEL_EFFICIENCY: f32 = 0.85;
 /// determine the optimal number of tasks, which should be higher than or equal
 /// to 1.
 const DEFAULT_OVERSUBSCRIPTION: f32 = 1.0;
+
+/// Work queue capacity
+const WORK_QUEUE_CAPACITY: usize = 16_300 / std::mem::size_of::<Task>();
 
 /// Function that can be scheduled for execution by the thread pool
 ///

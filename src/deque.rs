@@ -87,9 +87,8 @@ impl<T> Worker<T> {
     /// first. This optimizes cache locality and load balancing granularity at
     /// the expense of fairness.
     #[inline(always)]
-    pub fn push(&mut self, work: T) -> Result<(), Full<T>> {
-        // SAFETY: Unique access to the non-clonable Worker provides momentary
-        //         unique access to the local side of the ring buffer.
+    pub fn push(&self, work: T) -> Result<(), Full<T>> {
+        // SAFETY: Worker is not Sync and cannot be cloned
         unsafe { self.0.deque.push(work) }
     }
 
@@ -100,9 +99,8 @@ impl<T> Worker<T> {
     /// present, their interleaving is unspecified and will depend on the order
     /// in which tasks were submitted on both ends.
     #[inline(always)]
-    pub fn pop(&mut self) -> Option<T> {
-        // SAFETY: Unique access to the non-clonable Worker provides momentary
-        //         unique access to the local side of the ring buffer.
+    pub fn pop(&self) -> Option<T> {
+        // SAFETY: Worker is not Sync and cannot be cloned
         unsafe { self.0.deque.pop() }
     }
 }

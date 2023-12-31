@@ -49,7 +49,7 @@ bench = ["dep:criterion", "dep:env_logger", "dep:iterator_ilp", "dep:pessimize",
 bench-flags = ["bench"]
 
 # Enable benchmarking of my deque vs crossbeam
-bench-deque = ["bench", "crossbeam/crossbeam-deque"]
+bench-deque = ["bench"]
 
 # Enable unsafe join concurrency detection and benchmarking by default
 default = ["detect-excessive-joins", "bench"]
@@ -57,7 +57,7 @@ default = ["detect-excessive-joins", "bench"]
 [dependencies]
 # Core dependencies
 atomic-wait = { version = "1.1.0", default-features = false }
-crossbeam = { version = "0.8.2" }
+crossbeam = { version = "0.8.2", features = ["crossbeam-deque"] }
 hwlocality = { git = "https://github.com/HadrienG2/hwlocality.git", features = ["hwloc-2_2_0"] }
 rand = "0.8"
 
