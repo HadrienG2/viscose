@@ -88,19 +88,18 @@ impl<'pool> Worker<'pool> {
     /// Single step of the main worker loop
     #[inline(always)]
     fn step(&self) {
-        // If we have recorded work in our private work queue...
-        if self.work_available.is_set() {
-            // Process work from our private work queue, if still there
-            if let Some(task) = self.work_queue.pop() {
-                self.process_task(task);
-                return;
-            } else {
-                // Otherwise notify others that our work queue is now empty
-                //
-                // Use Release ordering to make sure this is perceived to happen
-                // after we actually empty the work queue.
-                self.work_available.clear(Ordering::Release);
-            }
+        // Process any work from our private work queue
+        if let Some(task) = self.work_queue.pop() {
+            // Need Release ordering so whoever sees the flag sees the work
+            self.work_available.set(Ordering::Release);
+            self.process_task(task);
+            return;
+        } else {
+            // Otherwise notify others that our work queue is now empty
+            //
+            // Use Release ordering to make sure this is perceived to happen
+            // after we actually empty the work queue.
+            self.work_available.clear(Ordering::Release);
         }
 
         // No work in our private work queue, figure out what to do next
@@ -342,11 +341,6 @@ impl<'pool> WorkAvailabilityBit<'pool> {
         // Can be a relaxed load since no one else should be modifying this bit
         let bit_is_set = Cell::new(bit.is_set(Ordering::Relaxed));
         Self { bit, bit_is_set }
-    }
-
-    /// Truth that our work availability bit is currently set
-    fn is_set(&self) -> bool {
-        self.bit_is_set.get()
     }
 
     /// Set our work availability bit with the specific atomic ordering

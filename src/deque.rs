@@ -1527,7 +1527,7 @@ mod tests {
             mut push: impl FnMut(&mut Worker, Element) -> Result<(), Full<Element>> + Send + 'out,
             mut pop: impl FnMut(&mut Worker) -> Option<Element> + Send + 'out,
             give: impl FnMut(Element) -> Result<(), GiveError<Element>> + Clone + Send + 'out,
-            steal: impl FnMut() -> Result<Element, StealError> + Clone + Send + 'out,
+            steal: impl FnMut() -> Steal<Element> + Clone + Send + 'out,
         ) -> Vec<Box<dyn FnOnce() + Send + 'out>> {
             std::iter::once(self.setup_thread(
                 0,
@@ -1563,7 +1563,7 @@ mod tests {
                         }
                     },
                     move |()| {
-                        let result = steal().ok();
+                        let result = steal().success();
                         if result.is_none() {
                             std::thread::sleep(YIELD_SLEEP);
                         }
@@ -1749,7 +1749,13 @@ mod tests {
                     |()| unsafe { deque.pop() },
                     // SAFETY: Requested a single remote thread above
                     |elem| unsafe { deque.give(elem).map_err(Into::into) },
-                    || unsafe { deque.steal().ok_or(StealError::Empty) },
+                    || unsafe {
+                        if let Some(task) = deque.steal() {
+                            Steal::Success(task)
+                        } else {
+                            Steal::Empty
+                        }
+                    },
                 )
                 .into_iter();
             testbench::concurrent_test_2(threads.next().unwrap(), threads.next().unwrap());
