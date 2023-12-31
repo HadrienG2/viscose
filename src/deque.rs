@@ -86,6 +86,7 @@ impl<T> Worker<T> {
     /// worker in a LIFO fashion, i.e. the most recently pushed task is executed
     /// first. This optimizes cache locality and load balancing granularity at
     /// the expense of fairness.
+    #[inline(always)]
     pub fn push(&mut self, work: T) -> Result<(), Full<T>> {
         // SAFETY: Unique access to the non-clonable Worker provides momentary
         //         unique access to the local side of the ring buffer.
@@ -98,6 +99,7 @@ impl<T> Worker<T> {
     /// the outside world in a FIFO fashion. When both kinds of tasks are
     /// present, their interleaving is unspecified and will depend on the order
     /// in which tasks were submitted on both ends.
+    #[inline(always)]
     pub fn pop(&mut self) -> Option<T> {
         // SAFETY: Unique access to the non-clonable Worker provides momentary
         //         unique access to the local side of the ring buffer.
@@ -142,6 +144,7 @@ impl<T> Remote<T> {
     /// worker in a FIFO fashion, i.e. the most recently pushed task is executed
     /// last. This effectively priorizes work spawned by the worker against work
     /// spawned by other threads, which is good for cache locality.
+    #[inline(always)]
     pub fn give(&self, work: T) -> Result<(), GiveError<T>> {
         let mut lock = match self.0.try_lock_remote() {
             Ok(lock) => lock,
@@ -159,6 +162,7 @@ impl<T> Remote<T> {
     ///
     /// This steals the work that the worker is least in a hurry to process at
     /// this point in time, i.e. that should be coldest in worker thread caches.
+    #[inline(always)]
     pub fn steal(&self) -> Result<T, StealError> {
         let mut lock = self.0.try_lock_remote()?;
         lock.steal().ok_or(StealError::Empty)
@@ -460,6 +464,7 @@ impl<T> WorkDeque<T> {
     /// # Safety
     ///
     /// This function may only be called by the thread that owns the work queue.
+    #[inline(always)]
     unsafe fn push(&self, work: T) -> Result<(), Full<T>> {
         // Make sure the queue isn't full
         //
@@ -528,6 +533,7 @@ impl<T> WorkDeque<T> {
     /// # Safety
     ///
     /// This function may only be called by the thread that owns the work queue.
+    #[inline(always)]
     unsafe fn pop(&self) -> Option<T> {
         // Make sure the queue isn't empty
         //
@@ -594,6 +600,7 @@ impl<T> WorkDeque<T> {
     /// Access to the remote end of the queue should be synchronized via an
     /// external lock, which controls access to `remote_idx` and the associated
     /// private `elements[remote_idx]` storage cell.
+    #[inline(always)]
     unsafe fn give(&self, work: T) -> Result<(), Full<T>> {
         // Make sure the queue isn't full
         //
@@ -661,6 +668,7 @@ impl<T> WorkDeque<T> {
     /// Access to the remote end of the queue should be synchronized via an
     /// external lock, which controls access to `remote_idx` and the associated
     /// private `elements[remote_idx]` storage cell.
+    #[inline(always)]
     unsafe fn steal(&self) -> Option<T> {
         // Make sure the queue isn't empty
         //
@@ -758,7 +766,7 @@ impl<T> WorkDeque<T> {
     /// Like `self.elements.len()`, but optimized for use as a modulo argument
     #[inline(always)]
     fn elements_len(&self) -> usize {
-        let elements_len = 2usize.pow(self.elements_len_pow2.get());
+        let elements_len = 1usize.wrapping_shl(self.elements_len_pow2.get());
         debug_assert_eq!(elements_len, self.elements.len());
         elements_len
     }
@@ -1798,8 +1806,4 @@ mod tests {
         }
         harness.check_thread_outcome();
     }
-
-    // TODO: Also add benchmarks once tests are ready, and benchmark
-    //       crossbeam_deque on the same task when feasible (+ add
-    //       crossbeam/crossbeam_deque to benchmark feature)
 }

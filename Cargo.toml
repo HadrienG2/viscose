@@ -48,6 +48,9 @@ bench = ["dep:criterion", "dep:env_logger", "dep:iterator_ilp", "dep:pessimize",
 # runs significantly even when the benchmarks are not run.
 bench-flags = ["bench"]
 
+# Enable benchmarking of my deque vs crossbeam
+bench-deque = ["bench", "crossbeam/crossbeam-deque"]
+
 # Enable unsafe join concurrency detection and benchmarking by default
 default = ["detect-excessive-joins", "bench"]
 
@@ -75,6 +78,10 @@ testbench = "1.0"
 
 [lib]
 bench = false
+
+[[bench]]
+name = "deque"
+harness = false
 
 [[bench]]
 name = "flags"
