@@ -34,7 +34,7 @@
 //!   lock-freedom on the "outside world" side of the queue, which should not be
 //!   under high pressure when executing non-pathological workloads.
 
-use crossbeam::utils::CachePadded;
+use crossbeam::{utils::CachePadded, deque::Steal};
 #[cfg(test)]
 use proptest::prelude::*;
 use std::{
@@ -161,9 +161,11 @@ impl<T> Remote<T> {
     /// This steals the work that the worker is least in a hurry to process at
     /// this point in time, i.e. that should be coldest in worker thread caches.
     #[inline(always)]
-    pub fn steal(&self) -> Result<T, StealError> {
-        let mut lock = self.0.try_lock_remote()?;
-        lock.steal().ok_or(StealError::Empty)
+    pub fn steal(&self) -> Steal<T> {
+        let Ok(mut lock) = self.0.try_lock_remote() else {
+            return Steal::Retry;
+        };
+        lock.steal().map_or(Steal::Empty, Steal::Success)
     }
 }
 //
@@ -207,25 +209,6 @@ pub enum GiveErrorCause {
 }
 //
 impl From<Locked> for GiveErrorCause {
-    fn from(Locked: Locked) -> Self {
-        Self::Locked
-    }
-}
-
-/// Errors that can occur when stealing work from a worker
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-pub enum StealError {
-    /// There was no element to steal in the work queue
-    Empty,
-
-    /// The remote end of the queue was locked
-    ///
-    /// Locks are only held for the duration of an element memcpy, so if the
-    /// queue element type is small, spinning on the lock might be fine.
-    Locked,
-}
-//
-impl From<Locked> for StealError {
     fn from(Locked: Locked) -> Self {
         Self::Locked
     }

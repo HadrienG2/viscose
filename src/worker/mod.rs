@@ -4,7 +4,7 @@ pub mod scope;
 
 use self::scope::Scope;
 use crate::{
-    deque::{self, StealError},
+    deque,
     shared::{
         distances::Distance,
         flags::bitref::BitRef,
@@ -265,11 +265,7 @@ impl<'pool> Worker<'pool> {
         // while the worker finishes processing its current task, but it seems
         // like a fair price to pay in exchange for a clean synchronization
         // protocol and a cheap happy path when every worker stays fed.
-        self.steal_with(|| match self.shared.workers[idx].remote.steal() {
-            Ok(task) => Steal::Success(task),
-            Err(StealError::Empty) => Steal::Empty,
-            Err(StealError::Locked) => Steal::Retry,
-        })
+        self.steal_with(|| self.shared.workers[idx].remote.steal())
     }
 
     /// Try to steal work from the global task injector
