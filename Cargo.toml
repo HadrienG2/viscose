@@ -68,7 +68,7 @@ log = { version = "0.4", optional = true }
 criterion = { version = "0.5.1", default-features = false, optional = true }
 env_logger = { version = "0.10", optional = true }
 iterator_ilp = { version = "2.0", optional = true }
-pessimize = { git = "https://github.com/HadrienG2/pessimize.git", optional = true }
+pessimize = { version = "1.0", optional = true }
 rayon = { version = "1.8.0", default-features = false, optional = true }
 
 [dev-dependencies]
