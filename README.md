@@ -1,3 +1,6 @@
+**This repo is abandoned, but I'll wait for about a year (til August 2025) before
+archiving it so that any interested rayon contributor can ask questions via issues**
+
 # Viscose: Prototyping locality-aware fork-join task scheduling for rayon
 
 This project was created to answer [one
